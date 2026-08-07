@@ -82,6 +82,22 @@ enum Cmd {
     },
     /// Respawn an exited pane's command in place (scrollback kept)
     Restart { target: String },
+    /// Close a tab and its panes by id (removes the space if it empties)
+    CloseTab { id: u64 },
+    /// Close a space and all its panes by id
+    CloseSpace { id: u64 },
+    /// Reorder a tab to index TO within its space (0-based)
+    MoveTab { id: u64, to: usize },
+    /// Reorder a space to index TO in the space list (0-based)
+    MoveSpace { id: u64, to: usize },
+    /// Report an authoritative pane activity (for detectors/plugins)
+    ReportActivity {
+        pane: u64,
+        #[arg(value_parser = ["working", "waiting", "idle", "auto"])]
+        state: String,
+    },
+    /// Report the agent running in a pane (omit NAME to clear)
+    ReportAgent { pane: u64, name: Option<String> },
     /// Read or edit config.toml (comment-preserving)
     Config {
         #[command(subcommand)]
@@ -129,6 +145,22 @@ async fn main() -> Result<()> {
         Some(Cmd::Focus { target }) => focus(target).await,
         Some(Cmd::Rename { kind, id, name }) => rename(kind, id, name).await,
         Some(Cmd::Restart { target }) => restart(target).await,
+        Some(Cmd::CloseTab { id }) => simple_req(Request::CloseTab { tab: id }, "closed tab").await,
+        Some(Cmd::CloseSpace { id }) => {
+            simple_req(Request::CloseSpace { space: id }, "closed space").await
+        }
+        Some(Cmd::MoveTab { id, to }) => {
+            simple_req(Request::MoveTab { tab: id, to }, "moved tab").await
+        }
+        Some(Cmd::MoveSpace { id, to }) => {
+            simple_req(Request::MoveSpace { space: id, to }, "moved space").await
+        }
+        Some(Cmd::ReportActivity { pane, state }) => {
+            simple_req(Request::ReportActivity { pane, state }, "reported").await
+        }
+        Some(Cmd::ReportAgent { pane, name }) => {
+            simple_req(Request::ReportAgent { pane, name }, "reported").await
+        }
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
         Some(Cmd::Reload) => reload().await,
     }
@@ -139,6 +171,17 @@ async fn reload() -> Result<()> {
     let (client, _events) = connect().await?;
     client.request(Request::Reload).await?;
     println!("config reloaded");
+    Ok(())
+}
+
+/// Send a fire-and-forget request, print `ok_msg` on success or bail on error.
+async fn simple_req(req: Request, ok_msg: &str) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    match client.request(req).await? {
+        ServerMsg::Error { message } => anyhow::bail!(message),
+        _ => println!("{ok_msg}"),
+    }
     Ok(())
 }
 

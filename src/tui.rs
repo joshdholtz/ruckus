@@ -67,6 +67,10 @@ enum MenuAction {
     RenameSpace,
     CloseTab,
     CloseSpace,
+    MoveTabLeft,
+    MoveTabRight,
+    MoveSpaceUp,
+    MoveSpaceDown,
     Zoom,
     Restart,
     ClosePane,
@@ -972,6 +976,42 @@ impl App {
                     }
                 }
             }
+            MenuAction::MoveTabLeft | MenuAction::MoveTabRight => {
+                if let (Some(sp), Some(t)) = (space, tab) {
+                    let idx = self
+                        .snap
+                        .spaces
+                        .iter()
+                        .find(|s| s.id == sp)
+                        .and_then(|s| s.tabs.iter().position(|x| x.id == t));
+                    if let Some(i) = idx {
+                        let to = if action == MenuAction::MoveTabLeft {
+                            i.saturating_sub(1)
+                        } else {
+                            i + 1
+                        };
+                        if let Err(e) = self.client.request(Request::MoveTab { tab: t, to }).await {
+                            self.toast(e.to_string());
+                        }
+                    }
+                }
+            }
+            MenuAction::MoveSpaceUp | MenuAction::MoveSpaceDown => {
+                if let Some(sp) = space {
+                    if let Some(i) = self.snap.spaces.iter().position(|s| s.id == sp) {
+                        let to = if action == MenuAction::MoveSpaceUp {
+                            i.saturating_sub(1)
+                        } else {
+                            i + 1
+                        };
+                        if let Err(e) =
+                            self.client.request(Request::MoveSpace { space: sp, to }).await
+                        {
+                            self.toast(e.to_string());
+                        }
+                    }
+                }
+            }
             MenuAction::Zoom => {
                 self.zoomed = !self.zoomed;
                 self.sync().await;
@@ -1280,6 +1320,8 @@ impl App {
                                     ("new tab", MenuAction::NewTab),
                                     ("new space", MenuAction::NewSpace),
                                     ("rename space", MenuAction::RenameSpace),
+                                    ("move up", MenuAction::MoveSpaceUp),
+                                    ("move down", MenuAction::MoveSpaceDown),
                                     ("close space", MenuAction::CloseSpace),
                                 ],
                             ),
@@ -1287,6 +1329,8 @@ impl App {
                                 MenuTarget::Tab { space, tab, pane },
                                 vec![
                                     ("rename tab", MenuAction::RenameTab),
+                                    ("move left", MenuAction::MoveTabLeft),
+                                    ("move right", MenuAction::MoveTabRight),
                                     ("close tab", MenuAction::CloseTab),
                                     ("new tab", MenuAction::NewTab),
                                     ("new space", MenuAction::NewSpace),
