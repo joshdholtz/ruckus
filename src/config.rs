@@ -27,6 +27,7 @@ pub enum Action {
     ToggleSidebar,
     JumpWaiting,
     ShowHelp,
+    Zoom,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -47,6 +48,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::ToggleSidebar, "toggle_sidebar", &["alt-b"]),
     (Action::JumpWaiting, "jump_waiting", &["alt-a"]),
     (Action::ShowHelp, "show_help", &["alt-/"]),
+    (Action::Zoom, "zoom", &["alt-z"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
@@ -286,11 +288,26 @@ impl Default for UiConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct NotifyConfig {
+    /// Fire OS notifications (macOS) when a pane needs you and nobody's attached.
+    pub system: bool,
+    /// Which transitions notify: "waiting", "done".
+    pub events: Vec<String>,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig { system: true, events: vec!["waiting".to_string()] }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
+    pub notify: NotifyConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,6 +365,12 @@ struct RawGlyphs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawNotify {
+    system: Option<bool>,
+    events: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     keys: HashMap<String, KeySpec>,
@@ -357,6 +380,8 @@ struct RawConfig {
     ui: RawUi,
     #[serde(default)]
     glyphs: RawGlyphs,
+    #[serde(default)]
+    notify: RawNotify,
 }
 
 fn parse_hex(s: &str) -> Option<Color> {
@@ -379,16 +404,23 @@ fn parse_bar(s: Option<&str>, default: BarPos) -> BarPos {
     }
 }
 
+/// Path to config.toml, writing the commented default on first touch.
+pub fn ensure_config_file() -> std::path::PathBuf {
+    let path = ruckus_dir().join("config.toml");
+    if !path.exists() {
+        let _ = std::fs::write(&path, DEFAULT_CONFIG);
+    }
+    path
+}
+
 impl Config {
     pub fn load() -> Config {
-        let path = ruckus_dir().join("config.toml");
-        if !path.exists() {
-            let _ = std::fs::write(&path, DEFAULT_CONFIG);
-        }
-        let raw: RawConfig = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default();
+        let path = ensure_config_file();
+        Self::from_toml_str(&std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    pub fn from_toml_str(s: &str) -> Config {
+        let raw: RawConfig = toml::from_str(s).unwrap_or_default();
 
         let mut keys = HashMap::new();
         for (action, name, defaults) in ACTIONS {
@@ -495,7 +527,13 @@ impl Config {
             spinner,
         };
 
-        Config { keys, theme, ui, glyphs }
+        let dn = NotifyConfig::default();
+        let notify = NotifyConfig {
+            system: raw.notify.system.unwrap_or(dn.system),
+            events: raw.notify.events.unwrap_or(dn.events),
+        };
+
+        Config { keys, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -551,6 +589,7 @@ scroll_down = "alt-pagedown"
 toggle_sidebar = "alt-b"  # show/hide the sidebar (drawer on narrow screens)
 jump_waiting = "alt-a"    # jump to the next pane that needs you
 show_help = "alt-/"       # keybinding overlay
+zoom = "alt-z"            # focused pane fills the whole area (toggle)
 
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
 
@@ -574,6 +613,10 @@ mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt
 space_row = "{icon} {name}"
 tab_row = "{icon} {title}"
 queue_row = "{icon} {title}"
+
+[notify]
+system = true               # macOS notification when a pane needs you and nobody's watching
+events = ["waiting"]        # add "done" to also notify on finished panes
 
 [glyphs]
 waiting = "◉"
@@ -599,3 +642,84 @@ idle = "#5b6078"
 done_ok = "#a6da95"
 done_err = "#ed8796"
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_specs_parse() {
+        let b = parse_binding("alt-v").unwrap();
+        assert_eq!(b.code, KeyCode::Char('v'));
+        assert_eq!(b.mods, KeyModifiers::ALT);
+        let b = parse_binding("ctrl-shift-p").unwrap();
+        assert!(b.mods.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert!(parse_binding("f5").is_ok());
+        assert!(parse_binding("alt-pageup").is_ok());
+        assert!(parse_binding("bogus-key").is_err());
+    }
+
+    #[test]
+    fn mac_option_chars_map_back() {
+        assert_eq!(mac_option_char('œ'), Some('q'));
+        assert_eq!(mac_option_char('√'), Some('v'));
+        assert_eq!(mac_option_char('™'), Some('2'));
+        assert_eq!(mac_option_char('x'), None);
+    }
+
+    #[test]
+    fn config_defaults_and_overrides() {
+        let cfg = Config::from_toml_str(
+            r##"
+[keys]
+quit = ["alt-w", "ctrl-w"]
+[ui]
+sidebar = "right"
+gutter = 3
+narrow_below = 0
+header = "bottom"
+[glyphs]
+idle = "▪"
+[theme]
+accent = "#ff0000"
+[notify]
+system = false
+"##,
+        );
+        assert_eq!(cfg.keys[&Action::Quit].len(), 2);
+        assert_eq!(cfg.ui.sidebar_pos, SidebarPos::Right);
+        assert_eq!(cfg.ui.gutter, 3);
+        assert_eq!(cfg.ui.narrow_below, 0);
+        assert_eq!(cfg.ui.header, BarPos::Bottom);
+        assert_eq!(cfg.glyphs.idle, "▪");
+        assert_eq!(cfg.theme.accent, Color::Rgb(0xff, 0, 0));
+        assert!(!cfg.notify.system);
+        // untouched values fall back to defaults
+        assert_eq!(cfg.ui.footer, BarPos::Bottom);
+        assert!(cfg.ui.pane_titles);
+        assert_eq!(cfg.keys[&Action::SplitRight].len(), 1);
+    }
+
+    #[test]
+    fn ctrl_q_escape_hatch_survives_user_config() {
+        let cfg = Config::from_toml_str("[keys]\nquit = \"alt-q\"\n");
+        let ev = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert_eq!(cfg.action_for(&ev), Some(Action::Quit));
+    }
+
+    #[test]
+    fn option_typed_char_triggers_alt_binding() {
+        let cfg = Config::from_toml_str("");
+        let ev = KeyEvent::new(KeyCode::Char('œ'), KeyModifiers::NONE);
+        assert_eq!(cfg.action_for(&ev), Some(Action::Quit));
+        let ev = KeyEvent::new(KeyCode::Char('√'), KeyModifiers::NONE);
+        assert_eq!(cfg.action_for(&ev), Some(Action::SplitRight));
+    }
+
+    #[test]
+    fn bad_config_falls_back_to_defaults() {
+        let cfg = Config::from_toml_str("this is not [valid toml");
+        assert_eq!(cfg.ui.sidebar_width, 26);
+        assert!(!cfg.keys[&Action::Quit].is_empty());
+    }
+}

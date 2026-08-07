@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 pub const SCROLLBACK_MAX: usize = 2 * 1024 * 1024;
 
 pub fn ruckus_dir() -> PathBuf {
-    let dir = dirs::home_dir().expect("no home directory").join(".ruckus");
+    let dir = match std::env::var("RUCKUS_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => dirs::home_dir().expect("no home directory").join(".ruckus"),
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -23,6 +26,10 @@ pub enum Request {
     Split { pane: u64, dir: Dir, cmd: Vec<String>, cwd: Option<String> },
     /// Replace a tab's layout (same set of panes, new arrangement/weights).
     SetLayout { tab: u64, layout: Node },
+    RenameSpace { space: u64, name: String },
+    RenameTab { tab: u64, name: String },
+    /// Respawn an exited pane's command in place (same pane id, scrollback kept).
+    Restart { pane: u64 },
     ClosePane { pane: u64 },
     SetActive { space: u64, tab: u64, pane: u64 },
     Attach { pane: u64, rows: u16, cols: u16 },
@@ -123,6 +130,78 @@ impl Node {
         self.leaves(&mut v);
         v.contains(&pane)
     }
+
+    pub fn valid_weights(&self) -> bool {
+        match self {
+            Node::Leaf { .. } => true,
+            Node::Split { children, weights, .. } => {
+                (weights.is_empty()
+                    || (weights.len() == children.len() && weights.iter().all(|w| *w > 0)))
+                    && children.iter().all(|c| c.valid_weights())
+            }
+        }
+    }
+
+    /// Replace the target leaf with a split of [target, new]; if the enclosing
+    /// split already flows in `dir`, insert as a sibling instead of nesting.
+    pub fn split_at(&mut self, target: u64, dir: Dir, new_pane: u64) -> bool {
+        match self {
+            Node::Leaf { pane } if *pane == target => {
+                *self = Node::Split {
+                    dir,
+                    children: vec![Node::Leaf { pane: target }, Node::Leaf { pane: new_pane }],
+                    weights: Vec::new(),
+                };
+                true
+            }
+            Node::Leaf { .. } => false,
+            Node::Split { dir: d, children, weights } => {
+                if *d == dir {
+                    if let Some(idx) = children
+                        .iter()
+                        .position(|c| matches!(c, Node::Leaf { pane } if *pane == target))
+                    {
+                        children.insert(idx + 1, Node::Leaf { pane: new_pane });
+                        if !weights.is_empty() {
+                            let w = weights[idx];
+                            weights.insert(idx + 1, w);
+                        }
+                        return true;
+                    }
+                }
+                children.iter_mut().any(|c| c.split_at(target, dir, new_pane))
+            }
+        }
+    }
+
+    /// Remove a leaf, collapsing single-child splits. None if the tree empties.
+    pub fn remove_leaf(self, pane: u64) -> Option<Node> {
+        match self {
+            Node::Leaf { pane: p } if p == pane => None,
+            leaf @ Node::Leaf { .. } => Some(leaf),
+            Node::Split { dir, children, weights } => {
+                let weights = if weights.len() == children.len() {
+                    weights
+                } else {
+                    vec![1; children.len()]
+                };
+                let kept: Vec<(Node, u16)> = children
+                    .into_iter()
+                    .zip(weights)
+                    .filter_map(|(c, w)| c.remove_leaf(pane).map(|n| (n, w)))
+                    .collect();
+                match kept.len() {
+                    0 => None,
+                    1 => Some(kept.into_iter().next().unwrap().0),
+                    _ => {
+                        let (children, weights): (Vec<Node>, Vec<u16>) =
+                            kept.into_iter().unzip();
+                        Some(Node::Split { dir, children, weights })
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,4 +268,110 @@ pub fn default_shell() -> String {
 
 pub fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(p: u64) -> Node {
+        Node::Leaf { pane: p }
+    }
+
+    #[test]
+    fn split_nests_and_inserts_siblings() {
+        let mut n = leaf(1);
+        assert!(n.split_at(1, Dir::Right, 2));
+        // same-dir split inserts a sibling, not a nested split
+        assert!(n.split_at(2, Dir::Right, 3));
+        match &n {
+            Node::Split { dir, children, .. } => {
+                assert_eq!(*dir, Dir::Right);
+                assert_eq!(children.len(), 3);
+            }
+            _ => panic!("expected split"),
+        }
+        // cross-dir split nests
+        assert!(n.split_at(2, Dir::Down, 4));
+        let mut leaves = Vec::new();
+        n.leaves(&mut leaves);
+        assert_eq!(leaves, vec![1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn split_preserves_weights_when_inserting() {
+        let mut n = Node::Split {
+            dir: Dir::Right,
+            children: vec![leaf(1), leaf(2)],
+            weights: vec![30, 70],
+        };
+        assert!(n.split_at(2, Dir::Right, 3));
+        match &n {
+            Node::Split { weights, .. } => assert_eq!(weights, &vec![30, 70, 70]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn remove_leaf_collapses() {
+        let n = Node::Split {
+            dir: Dir::Right,
+            children: vec![leaf(1), leaf(2)],
+            weights: vec![40, 60],
+        };
+        let n = n.remove_leaf(1).unwrap();
+        assert!(matches!(n, Node::Leaf { pane: 2 }));
+        assert!(leaf(5).remove_leaf(5).is_none());
+    }
+
+    #[test]
+    fn remove_leaf_keeps_sibling_weights() {
+        let n = Node::Split {
+            dir: Dir::Down,
+            children: vec![leaf(1), leaf(2), leaf(3)],
+            weights: vec![10, 20, 30],
+        };
+        match n.remove_leaf(2).unwrap() {
+            Node::Split { weights, children, .. } => {
+                assert_eq!(weights, vec![10, 30]);
+                assert_eq!(children.len(), 2);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn weights_validation() {
+        assert!(leaf(1).valid_weights());
+        let ok = Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![] };
+        assert!(ok.valid_weights());
+        let bad_len =
+            Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![1] };
+        assert!(!bad_len.valid_weights());
+        let zero =
+            Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![0, 1] };
+        assert!(!zero.valid_weights());
+    }
+
+    #[test]
+    fn frames_roundtrip() {
+        let frame = ClientFrame {
+            seq: 7,
+            req: Request::Split { pane: 3, dir: Dir::Down, cmd: vec!["claude".into()], cwd: None },
+        };
+        let s = serde_json::to_string(&frame).unwrap();
+        let back: ClientFrame = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.seq, 7);
+        assert!(matches!(back.req, Request::Split { pane: 3, dir: Dir::Down, .. }));
+
+        // weights default when omitted on the wire
+        let n: Node = serde_json::from_str(
+            r#"{"kind":"split","dir":"right","children":[{"kind":"leaf","pane":1},{"kind":"leaf","pane":2}]}"#,
+        )
+        .unwrap();
+        match n {
+            Node::Split { weights, .. } => assert!(weights.is_empty()),
+            _ => panic!(),
+        }
+    }
 }

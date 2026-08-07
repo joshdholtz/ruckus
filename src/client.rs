@@ -92,6 +92,18 @@ impl Client {
     }
 }
 
+/// Find the (space, tab) containing a pane.
+pub fn locate_pane(snapshot: &Snapshot, pane: u64) -> Option<(u64, u64)> {
+    for s in &snapshot.spaces {
+        for t in &s.tabs {
+            if t.layout.contains(pane) {
+                return Some((s.id, t.id));
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a pane by numeric id or title substring.
 pub fn resolve_pane(snapshot: &Snapshot, target: &str) -> Result<PaneInfo> {
     if let Ok(id) = target.parse::<u64>() {

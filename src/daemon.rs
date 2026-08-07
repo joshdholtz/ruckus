@@ -28,6 +28,11 @@ struct PaneSession {
     scrollback: VecDeque<u8>,
     subs: HashMap<u64, Tx>,
     last_output: std::time::Instant,
+    /// Scrollback changed since the last disk flush.
+    dirty: bool,
+    /// Rendered screen state — activity classification reads what a user would
+    /// actually see, not raw scrollback (old status lines linger there).
+    screen: vt100::Parser,
 }
 
 /// Output has to be quiet this long before we classify working -> waiting/idle.
@@ -71,55 +76,179 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Last non-empty line of a pane's recent output, ANSI-stripped.
-fn tail_line(scrollback: &VecDeque<u8>) -> String {
-    let tail: Vec<u8> = scrollback
-        .iter()
-        .skip(scrollback.len().saturating_sub(4096))
-        .copied()
-        .collect();
-    let clean = strip_ansi(&tail);
-    let text = String::from_utf8_lossy(&clean);
-    text.lines()
-        .rev()
-        .map(|l| l.trim_end_matches('\r').trim_end())
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .to_string()
+fn scrollback_path(id: u64) -> std::path::PathBuf {
+    let dir = ruckus_dir().join("scrollback");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{id}.bin"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Persisted {
+    snapshot: Snapshot,
+    next_id: u64,
+}
+
+/// Written on every tree change so a daemon restart can rebuild the world.
+fn save_state(st: &State) {
+    let p = Persisted { snapshot: st.snapshot(), next_id: st.next_id };
+    if let Ok(json) = serde_json::to_vec(&p) {
+        let dir = ruckus_dir();
+        let tmp = dir.join("state.json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(tmp, dir.join("state.json"));
+        }
+    }
+}
+
+fn flush_scrollbacks(st: &mut State) {
+    for (id, p) in st.panes.iter_mut() {
+        if p.dirty {
+            p.dirty = false;
+            let bytes: Vec<u8> = p.scrollback.iter().copied().collect();
+            let _ = std::fs::write(scrollback_path(*id), &bytes);
+        }
+    }
+}
+
+/// Rebuild spaces/tabs and respawn running panes from the last saved state.
+fn restore_state(state: &Arc<Mutex<State>>, st: &mut State) -> bool {
+    let path = ruckus_dir().join("state.json");
+    let Ok(data) = std::fs::read(&path) else { return false };
+    let Ok(p) = serde_json::from_slice::<Persisted>(&data) else { return false };
+    st.next_id = st.next_id.max(p.next_id);
+
+    let mut alive: Vec<u64> = Vec::new();
+    for info in &p.snapshot.panes {
+        if info.status != PaneStatus::Running {
+            let _ = std::fs::remove_file(scrollback_path(info.id));
+            continue;
+        }
+        let mut sb: VecDeque<u8> = std::fs::read(scrollback_path(info.id))
+            .map(VecDeque::from)
+            .unwrap_or_default();
+        sb.extend(b"\r\n\x1b[2m-- ruckus: daemon restarted, process respawned --\x1b[0m\r\n".iter());
+        match spawn_pane_with_id(state, st, info.id, info.cmd.clone(), Some(info.cwd.clone()), Some(sb))
+        {
+            Ok(()) => alive.push(info.id),
+            Err(e) => error!("restore: failed to respawn pane {}: {e:#}", info.id),
+        }
+    }
+
+    for sp in &p.snapshot.spaces {
+        let mut tabs = Vec::new();
+        for t in &sp.tabs {
+            let mut leaves = Vec::new();
+            t.layout.leaves(&mut leaves);
+            let mut layout = Some(t.layout.clone());
+            for l in leaves {
+                if !alive.contains(&l) {
+                    layout = layout.and_then(|n| n.remove_leaf(l));
+                }
+            }
+            if let Some(layout) = layout {
+                let active_pane = if layout.contains(t.active_pane) {
+                    t.active_pane
+                } else {
+                    layout.first_leaf()
+                };
+                tabs.push(Tab { id: t.id, name: t.name.clone(), active_pane, layout });
+            }
+        }
+        if !tabs.is_empty() {
+            let active_tab = if tabs.iter().any(|t| t.id == sp.active_tab) {
+                sp.active_tab
+            } else {
+                tabs[0].id
+            };
+            st.spaces.push(Space { id: sp.id, name: sp.name.clone(), active_tab, tabs });
+        }
+    }
+    if !st.spaces.iter().any(|s| s.id == p.snapshot.active_space) {
+        if let Some(first) = st.spaces.first() {
+            st.active_space = first.id;
+        }
+    } else {
+        st.active_space = p.snapshot.active_space;
+    }
+    info!("restored {} panes across {} spaces", alive.len(), st.spaces.len());
+    !st.spaces.is_empty()
+}
+
+/// Fire a macOS system notification (no-op elsewhere).
+fn notify_system(title: &str, msg: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("display notification {msg:?} with title {title:?}");
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, msg);
+    }
 }
 
 /// Classify a pane that has gone quiet: is it blocked on you, or just idle?
 fn classify_quiet(p: &PaneSession) -> Activity {
-    let line = tail_line(&p.scrollback);
-    let t = line.trim_end();
-    let lower = t.to_lowercase();
+    let text = p.screen.screen().contents();
+    let prog = basename(p.info.cmd.first().map(String::as_str).unwrap_or(""));
+    classify_tail(&prog, &text)
+}
+
+/// Pure classification over the ANSI-stripped tail of a pane's output.
+/// Agent-aware: coding agents print "esc to interrupt" while running, and a
+/// quiet agent without that marker is waiting on you.
+pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
+    let recent: Vec<&str> = text
+        .lines()
+        .rev()
+        .map(|l| l.trim_end_matches('\r').trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .take(12)
+        .collect();
+    let recent_lower = recent.join("\n").to_lowercase();
+
+    // Agent working markers: still busy even while producing no output
+    // (long tool calls run silent). Covers Claude Code, Codex, and friends.
+    if recent_lower.contains("esc to interrupt")
+        || recent_lower.contains("esc to cancel")
+        || recent_lower.contains("ctrl+c to interrupt")
+    {
+        return Activity::Working;
+    }
+
+    let last = recent.first().copied().unwrap_or("");
+    let lower = last.to_lowercase();
 
     // Explicit question / input markers win.
-    if t.ends_with('?')
-        || lower.contains("(y/n")
-        || lower.contains("[y/n")
+    if last.ends_with('?')
+        || recent_lower.contains("(y/n")
+        || recent_lower.contains("[y/n")
         || lower.contains("password")
         || lower.contains("continue?")
-        || t.ends_with(':')
-        || t.ends_with('╯') // bottom of a TUI input box (e.g. Claude Code)
+        || last.ends_with(':')
+        || last.ends_with('╯') // bottom of a TUI input box (e.g. Claude Code)
     {
         return Activity::Waiting;
     }
     // Shell-prompt endings mean idle.
-    if t.is_empty()
-        || t.ends_with('$')
-        || t.ends_with('%')
-        || t.ends_with('#')
-        || t.ends_with('❯')
-        || t.ends_with('➜')
-        || t.ends_with("$ ")
+    if last.is_empty()
+        || last.ends_with('$')
+        || last.ends_with('%')
+        || last.ends_with('#')
+        || last.ends_with('❯')
+        || last.ends_with('➜')
     {
         return Activity::Idle;
     }
     // A non-shell command (an agent) that stopped streaming is waiting on you;
     // a shell sitting quiet is just idle.
-    let prog = basename(p.info.cmd.first().map(String::as_str).unwrap_or(""));
-    if SHELLS.contains(&prog.as_str()) {
+    if SHELLS.contains(&prog) {
         Activity::Idle
     } else {
         Activity::Waiting
@@ -146,6 +275,8 @@ struct State {
     panes: HashMap<u64, PaneSession>,
     conns: HashMap<u64, Tx>,
     next_id: u64,
+    notify_waiting: bool,
+    notify_done: bool,
 }
 
 impl State {
@@ -202,19 +333,24 @@ pub async fn run() -> Result<()> {
     let listener = UnixListener::bind(&sock)?;
     info!("ruckus daemon listening on {}", sock.display());
 
+    let cfg = crate::config::Config::load();
     let state = Arc::new(Mutex::new(State {
         spaces: Vec::new(),
         active_space: 0,
         panes: HashMap::new(),
         conns: HashMap::new(),
         next_id: 1,
+        notify_waiting: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting"),
+        notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
     }));
 
     {
         let mut st = state.lock().unwrap();
+        restore_state(&state, &mut st);
         if let Err(e) = ensure_nonempty(&state, &mut st) {
             error!("failed to create default space: {e:#}");
         }
+        save_state(&st);
     }
 
     // Activity ticker: demote panes from working -> waiting/idle once quiet.
@@ -222,8 +358,10 @@ pub async fn run() -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut n: u64 = 0;
             loop {
                 tick.tick().await;
+                n += 1;
                 let mut st = state.lock().unwrap();
                 let mut changes = Vec::new();
                 for (id, p) in st.panes.iter_mut() {
@@ -238,8 +376,23 @@ pub async fn run() -> Result<()> {
                         }
                     }
                 }
+                for (pane, activity) in &changes {
+                    broadcast(&st, ServerMsg::Activity { pane: *pane, activity: *activity });
+                }
                 for (pane, activity) in changes {
-                    broadcast(&st, ServerMsg::Activity { pane, activity });
+                    if activity == Activity::Waiting && st.notify_waiting {
+                        if let Some(p) = st.panes.get(&pane) {
+                            if p.subs.is_empty() {
+                                notify_system(
+                                    "ruckus",
+                                    &format!("{} is waiting for you", p.info.title),
+                                );
+                            }
+                        }
+                    }
+                }
+                if n % 5 == 0 {
+                    flush_scrollbacks(&mut st);
                 }
             }
         });
@@ -326,6 +479,7 @@ fn broadcast(st: &State, msg: ServerMsg) {
 
 fn broadcast_state(st: &State) {
     broadcast(st, ServerMsg::State { snapshot: st.snapshot() });
+    save_state(st);
 }
 
 fn err(message: impl Into<String>) -> ServerMsg {
@@ -364,12 +518,54 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             if a != b {
                 return err("layout must contain exactly the tab's panes");
             }
-            if !valid_weights(&layout) {
+            if !layout.valid_weights() {
                 return err("weights must match children and be non-zero");
             }
             t.layout = layout;
             broadcast_state(&st);
             ServerMsg::Done
+        }
+        Request::RenameSpace { space, name } => {
+            let mut st = state.lock().unwrap();
+            let Some(s) = st.spaces.iter_mut().find(|s| s.id == space) else {
+                return err(format!("no space {space}"));
+            };
+            s.name = name;
+            broadcast_state(&st);
+            ServerMsg::Done
+        }
+        Request::RenameTab { tab, name } => {
+            let mut st = state.lock().unwrap();
+            let Some(t) = st
+                .spaces
+                .iter_mut()
+                .flat_map(|s| s.tabs.iter_mut())
+                .find(|t| t.id == tab)
+            else {
+                return err(format!("no tab {tab}"));
+            };
+            t.name = name;
+            broadcast_state(&st);
+            ServerMsg::Done
+        }
+        Request::Restart { pane } => {
+            let mut st = state.lock().unwrap();
+            let Some(p) = st.panes.get(&pane) else {
+                return err(format!("no pane {pane}"));
+            };
+            if p.info.status == PaneStatus::Running {
+                return err("pane is still running (close it first, or wait for it to exit)");
+            }
+            let (cmd, cwd) = (p.info.cmd.clone(), p.info.cwd.clone());
+            let mut sb = p.scrollback.clone();
+            sb.extend(b"\r\n\x1b[2m-- ruckus: restarted --\x1b[0m\r\n".iter());
+            match spawn_pane_with_id(state, &mut st, pane, cmd, Some(cwd), Some(sb)) {
+                Ok(()) => {
+                    broadcast_state(&st);
+                    ServerMsg::Done
+                }
+                Err(e) => err(format!("restart failed: {e:#}")),
+            }
         }
         Request::ClosePane { pane } => close_pane(state, pane)
             .unwrap_or_else(|e| err(format!("{e:#}"))),
@@ -400,6 +596,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 return err(format!("no pane {pane}"));
             };
             let _ = p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            p.screen.set_size(rows, cols);
             p.subs.insert(conn_id, tx);
             let scrollback = B64.encode(p.scrollback.make_contiguous());
             ServerMsg::Attached { pane, scrollback }
@@ -430,7 +627,10 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 return err(format!("no pane {pane}"));
             };
             match p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
-                Ok(_) => ServerMsg::Done,
+                Ok(_) => {
+                    p.screen.set_size(rows, cols);
+                    ServerMsg::Done
+                }
                 Err(e) => err(format!("resize failed: {e}")),
             }
         }
@@ -444,6 +644,21 @@ fn spawn_pane(
     cmd: Vec<String>,
     cwd: Option<String>,
 ) -> Result<u64> {
+    let id = st.next();
+    spawn_pane_with_id(state, st, id, cmd, cwd, None)?;
+    Ok(id)
+}
+
+/// Spawn (or respawn) a pane under a specific id. Replaces any existing session
+/// with that id; `scrollback` seeds history (restore / restart).
+fn spawn_pane_with_id(
+    state: &Arc<Mutex<State>>,
+    st: &mut State,
+    id: u64,
+    cmd: Vec<String>,
+    cwd: Option<String>,
+    scrollback: Option<VecDeque<u8>>,
+) -> Result<()> {
     let cmdline = if cmd.is_empty() { vec![default_shell()] } else { cmd };
     let cwd = cwd
         .or_else(|| dirs::home_dir().map(|p| p.display().to_string()))
@@ -465,7 +680,6 @@ fn spawn_pane(
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
 
-    let id = st.next();
     let title = format!("{}·{}", basename(&cmdline[0]), id);
     let info = PaneInfo {
         id,
@@ -476,6 +690,12 @@ fn spawn_pane(
         activity: Activity::Working,
         created: unix_now(),
     };
+
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    if let Some(sb) = &scrollback {
+        let bytes: Vec<u8> = sb.iter().copied().collect();
+        screen.process(&bytes);
+    }
 
     let (ev_tx, ev_rx) = unbounded_channel::<SessionEvent>();
     std::thread::spawn(move || {
@@ -502,12 +722,14 @@ fn spawn_pane(
             master: pair.master,
             writer,
             killer,
-            scrollback: VecDeque::new(),
+            scrollback: scrollback.unwrap_or_default(),
             subs: HashMap::new(),
             last_output: std::time::Instant::now(),
+            dirty: false,
+            screen,
         },
     );
-    Ok(id)
+    Ok(())
 }
 
 async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<SessionEvent>) {
@@ -522,6 +744,8 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                         p.scrollback.pop_front();
                     }
                     p.last_output = std::time::Instant::now();
+                    p.dirty = true;
+                    p.screen.process(&bytes);
                     let flip = p.info.activity != Activity::Working
                         && p.info.status == PaneStatus::Running;
                     if flip {
@@ -553,6 +777,16 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 if known {
                     broadcast(&st, ServerMsg::Exited { pane: id, code });
                     broadcast_state(&st);
+                    if st.notify_done {
+                        if let Some(p) = st.panes.get(&id) {
+                            if p.subs.is_empty() {
+                                notify_system(
+                                    "ruckus",
+                                    &format!("{} finished (exit {code})", p.info.title),
+                                );
+                            }
+                        }
+                    }
                 }
                 break;
             }
@@ -613,7 +847,7 @@ fn split(
     let pane = spawn_pane(state, &mut st, cmd, cwd)?;
     let s = st.spaces.iter_mut().find(|s| s.id == space_id).unwrap();
     let t = s.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
-    split_at(&mut t.layout, target, dir, pane);
+    t.layout.split_at(target, dir, pane);
     t.active_pane = pane;
     broadcast_state(&st);
     Ok(ServerMsg::Created { space: space_id, tab: tab_id, pane })
@@ -624,13 +858,14 @@ fn close_pane(state: &Arc<Mutex<State>>, pane: u64) -> Result<ServerMsg> {
     if let Some(mut p) = st.panes.remove(&pane) {
         let _ = p.killer.kill();
     }
+    let _ = std::fs::remove_file(scrollback_path(pane));
     let mut empty_spaces = Vec::new();
     for s in st.spaces.iter_mut() {
         s.tabs.retain_mut(|t| {
             if !t.layout.contains(pane) {
                 return true;
             }
-            match remove_leaf(t.layout.clone(), pane) {
+            match t.layout.clone().remove_leaf(pane) {
                 Some(layout) => {
                     if t.active_pane == pane {
                         t.active_pane = layout.first_leaf();
@@ -690,72 +925,46 @@ fn locate(st: &State, pane: u64) -> Option<(u64, u64)> {
     None
 }
 
-/// Replace the target leaf with a split of [target, new]; if the enclosing split
-/// already flows in `dir`, insert as a sibling instead of nesting.
-fn valid_weights(node: &Node) -> bool {
-    match node {
-        Node::Leaf { .. } => true,
-        Node::Split { children, weights, .. } => {
-            (weights.is_empty()
-                || (weights.len() == children.len() && weights.iter().all(|w| *w > 0)))
-                && children.iter().all(valid_weights)
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn split_at(node: &mut Node, target: u64, dir: Dir, new_pane: u64) -> bool {
-    match node {
-        Node::Leaf { pane } if *pane == target => {
-            *node = Node::Split {
-                dir,
-                children: vec![Node::Leaf { pane: target }, Node::Leaf { pane: new_pane }],
-                weights: Vec::new(),
-            };
-            true
-        }
-        Node::Leaf { .. } => false,
-        Node::Split { dir: d, children, weights } => {
-            if *d == dir {
-                if let Some(idx) = children
-                    .iter()
-                    .position(|c| matches!(c, Node::Leaf { pane } if *pane == target))
-                {
-                    children.insert(idx + 1, Node::Leaf { pane: new_pane });
-                    if !weights.is_empty() {
-                        let w = weights[idx];
-                        weights.insert(idx + 1, w);
-                    }
-                    return true;
-                }
-            }
-            children.iter_mut().any(|c| split_at(c, target, dir, new_pane))
-        }
+    #[test]
+    fn strip_ansi_removes_csi_and_osc() {
+        assert_eq!(strip_ansi(b"\x1b[31mred\x1b[0m"), b"red");
+        assert_eq!(strip_ansi(b"\x1b]0;title\x07text"), b"text");
+        assert_eq!(strip_ansi(b"plain"), b"plain");
     }
-}
 
-fn remove_leaf(node: Node, pane: u64) -> Option<Node> {
-    match node {
-        Node::Leaf { pane: p } if p == pane => None,
-        leaf @ Node::Leaf { .. } => Some(leaf),
-        Node::Split { dir, children, weights } => {
-            let weights = if weights.len() == children.len() {
-                weights
-            } else {
-                vec![1; children.len()]
-            };
-            let kept: Vec<(Node, u16)> = children
-                .into_iter()
-                .zip(weights)
-                .filter_map(|(c, w)| remove_leaf(c, pane).map(|n| (n, w)))
-                .collect();
-            match kept.len() {
-                0 => None,
-                1 => Some(kept.into_iter().next().unwrap().0),
-                _ => {
-                    let (children, weights): (Vec<Node>, Vec<u16>) = kept.into_iter().unzip();
-                    Some(Node::Split { dir, children, weights })
-                }
-            }
-        }
+    #[test]
+    fn quiet_shell_prompt_is_idle() {
+        assert_eq!(classify_tail("zsh", "josh@mac ruckus %"), Activity::Idle);
+        assert_eq!(classify_tail("fish", "~/code ❯"), Activity::Idle);
+        assert_eq!(classify_tail("bash", ""), Activity::Idle);
+    }
+
+    #[test]
+    fn questions_are_waiting() {
+        assert_eq!(classify_tail("python3", "continue? "), Activity::Waiting);
+        assert_eq!(classify_tail("sh", "Overwrite? [y/N]"), Activity::Waiting);
+        assert_eq!(classify_tail("ssh", "password:"), Activity::Waiting);
+    }
+
+    #[test]
+    fn claude_working_marker_wins_even_when_quiet() {
+        let tail = "✻ Cogitating…\n  (esc to interrupt)";
+        assert_eq!(classify_tail("claude", tail), Activity::Working);
+    }
+
+    #[test]
+    fn claude_input_box_is_waiting() {
+        let tail = "some output\n╭────────╮\n│ >      │\n╰────────╯";
+        assert_eq!(classify_tail("claude", tail), Activity::Waiting);
+    }
+
+    #[test]
+    fn quiet_nonshell_defaults_to_waiting_and_shell_to_idle() {
+        assert_eq!(classify_tail("cargo", "Compiling foo v0.1.0"), Activity::Waiting);
+        assert_eq!(classify_tail("zsh", "some scrollback text"), Activity::Idle);
     }
 }

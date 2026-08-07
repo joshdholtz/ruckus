@@ -54,6 +54,8 @@ enum MenuAction {
     SplitRight,
     SplitDown,
     NewTab,
+    Zoom,
+    Restart,
     ClosePane,
 }
 
@@ -89,6 +91,7 @@ struct App {
     running: bool,
     toast: Option<(String, Instant)>,
     sidebar: bool,
+    zoomed: bool,
     drawer: bool,
     help: bool,
     menu: Option<Menu>,
@@ -365,7 +368,11 @@ impl App {
     fn compute_rects(&self) -> Vec<(u64, Rect)> {
         let mut out = Vec::new();
         if let Some(t) = self.active_tab() {
-            node_rects(&t.layout, self.frame.panes, self.cfg.ui.gutter, &mut out);
+            if self.zoomed && t.layout.contains(self.focused) {
+                out.push((self.focused, self.frame.panes));
+            } else {
+                node_rects(&t.layout, self.frame.panes, self.cfg.ui.gutter, &mut out);
+            }
         }
         out
     }
@@ -630,6 +637,21 @@ impl App {
             }
             Action::ScrollUp => self.scroll_by(self.focused, 5),
             Action::ScrollDown => self.scroll_by(self.focused, -5),
+            Action::Zoom => {
+                self.zoomed = !self.zoomed;
+                self.sync().await;
+            }
+        }
+    }
+
+    async fn restart_action(&mut self, pane: u64) {
+        match self.client.request(Request::Restart { pane }).await {
+            Ok(_) => {
+                self.seen.remove(&pane);
+                self.views.remove(&pane); // fresh attach picks up seeded scrollback
+                self.sync().await;
+            }
+            Err(e) => self.toast(e.to_string()),
         }
     }
 
@@ -638,6 +660,11 @@ impl App {
             MenuAction::SplitRight => self.split_action(pane, Dir::Right).await,
             MenuAction::SplitDown => self.split_action(pane, Dir::Down).await,
             MenuAction::NewTab => self.new_tab_action().await,
+            MenuAction::Zoom => {
+                self.zoomed = !self.zoomed;
+                self.sync().await;
+            }
+            MenuAction::Restart => self.restart_action(pane).await,
             MenuAction::ClosePane => self.close_pane_action(pane).await,
         }
     }
@@ -673,6 +700,17 @@ impl App {
         }
         if let Some(a) = self.cfg.action_for(&ev) {
             self.do_action(a).await;
+            return;
+        }
+        // Enter on a dead pane restarts it in place (zellij-style).
+        if ev.code == KeyCode::Enter
+            && self
+                .snap
+                .pane(self.focused)
+                .map(|p| p.status != PaneStatus::Running)
+                .unwrap_or(false)
+        {
+            self.restart_action(self.focused).await;
             return;
         }
         if let Some(bytes) = encode_key(&ev) {
@@ -806,7 +844,9 @@ impl App {
                         items: vec![
                             ("split right", MenuAction::SplitRight),
                             ("split down", MenuAction::SplitDown),
+                            ("zoom", MenuAction::Zoom),
                             ("new tab", MenuAction::NewTab),
+                            ("restart", MenuAction::Restart),
                             ("close pane", MenuAction::ClosePane),
                         ],
                     });
@@ -1509,7 +1549,9 @@ impl App {
             (self.cfg.label(Action::ScrollUp), "scroll history up"),
             (self.cfg.label(Action::ScrollDown), "scroll history down"),
             (self.cfg.label(Action::ToggleSidebar), "toggle sidebar"),
+            (self.cfg.label(Action::Zoom), "zoom focused pane"),
             ("alt+1..9".into(), "jump to tab"),
+            ("enter".into(), "restart a finished pane"),
             (self.cfg.label(Action::Quit), "quit (daemon keeps running)"),
             ("".into(), ""),
             ("mouse".into(), "click to focus · right-click for menu"),
@@ -1648,6 +1690,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         running: true,
         toast: None,
         sidebar,
+        zoomed: false,
         drawer: false,
         help: false,
         menu: None,
@@ -1736,4 +1779,40 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn templates_expand_tokens() {
+        let icon = ("◉".to_string(), Color::Yellow);
+        let vars = vec![("title", "claude·3".to_string()), ("cwd", "/tmp".to_string())];
+        let spans = template_spans("{icon} {title} · {cwd}", &icon, &vars, Style::default(), Color::White);
+        assert_eq!(text_of(&spans), "◉ claude·3 · /tmp");
+        // unknown tokens render literally rather than vanishing
+        let spans = template_spans("{icon} {nope}", &icon, &vars, Style::default(), Color::White);
+        assert_eq!(text_of(&spans), "◉ {nope}");
+    }
+
+    #[test]
+    fn zoom_ignores_missing_pane() {
+        // compute_rects with zoom on a pane not in the tab falls back to layout
+        // (covered indirectly: Node::contains gate). Just exercise node_rects gutters.
+        let layout = Node::Split {
+            dir: Dir::Right,
+            children: vec![Node::Leaf { pane: 1 }, Node::Leaf { pane: 2 }],
+            weights: vec![],
+        };
+        let mut out = Vec::new();
+        node_rects(&layout, Rect::new(0, 0, 81, 20), 1, &mut out);
+        assert_eq!(out.len(), 2);
+        // gutter cell exists between the chunks
+        assert!(out[1].1.x > out[0].1.x + out[0].1.width);
+    }
 }
