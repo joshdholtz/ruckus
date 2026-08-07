@@ -41,11 +41,19 @@ enum Target {
     Pane(u64),
 }
 
+/// What a context menu acts on.
+#[derive(Clone, Copy)]
+enum MenuTarget {
+    Pane(u64),
+    Space(u64),
+    Tab { space: u64, tab: u64, pane: u64 },
+}
+
 #[derive(Clone)]
 struct Menu {
     x: u16,
     y: u16,
-    pane: u64,
+    target: MenuTarget,
     items: Vec<(&'static str, MenuAction)>,
 }
 
@@ -54,8 +62,11 @@ enum MenuAction {
     SplitRight,
     SplitDown,
     NewTab,
+    NewSpace,
     RenameTab,
     RenameSpace,
+    CloseTab,
+    CloseSpace,
     Zoom,
     Restart,
     ClosePane,
@@ -908,27 +919,67 @@ impl App {
         }
     }
 
-    async fn run_menu_item(&mut self, action: MenuAction, pane: u64) {
+    async fn run_menu_item(&mut self, action: MenuAction, target: MenuTarget) {
+        // Resolve the (space, tab, pane) this menu acts on.
+        let (space, tab, pane) = match target {
+            MenuTarget::Pane(p) => match self.locate(p) {
+                Some((s, t)) => (Some(s), Some(t), Some(p)),
+                None => (None, None, Some(p)),
+            },
+            MenuTarget::Space(s) => (Some(s), None, None),
+            MenuTarget::Tab { space, tab, pane } => (Some(space), Some(tab), Some(pane)),
+        };
         match action {
-            MenuAction::SplitRight => self.split_action(pane, Dir::Right).await,
-            MenuAction::SplitDown => self.split_action(pane, Dir::Down).await,
+            MenuAction::SplitRight => {
+                if let Some(p) = pane {
+                    self.split_action(p, Dir::Right).await;
+                }
+            }
+            MenuAction::SplitDown => {
+                if let Some(p) = pane {
+                    self.split_action(p, Dir::Down).await;
+                }
+            }
             MenuAction::NewTab => self.open_prompt(PromptKind::NewTab),
+            MenuAction::NewSpace => self.open_prompt(PromptKind::NewSpace),
             MenuAction::RenameTab => {
-                if let Some((_, tab)) = self.locate(pane) {
-                    self.open_prompt(PromptKind::RenameTab(tab));
+                if let Some(t) = tab {
+                    self.open_prompt(PromptKind::RenameTab(t));
                 }
             }
             MenuAction::RenameSpace => {
-                if let Some((space, _)) = self.locate(pane) {
-                    self.open_prompt(PromptKind::RenameSpace(space));
+                if let Some(s) = space {
+                    self.open_prompt(PromptKind::RenameSpace(s));
+                }
+            }
+            MenuAction::CloseTab => {
+                if let Some(t) = tab {
+                    if let Err(e) = self.client.request(Request::CloseTab { tab: t }).await {
+                        self.toast(e.to_string());
+                    }
+                }
+            }
+            MenuAction::CloseSpace => {
+                if let Some(s) = space {
+                    if let Err(e) = self.client.request(Request::CloseSpace { space: s }).await {
+                        self.toast(e.to_string());
+                    }
                 }
             }
             MenuAction::Zoom => {
                 self.zoomed = !self.zoomed;
                 self.sync().await;
             }
-            MenuAction::Restart => self.restart_action(pane).await,
-            MenuAction::ClosePane => self.close_pane_action(pane).await,
+            MenuAction::Restart => {
+                if let Some(p) = pane {
+                    self.restart_action(p).await;
+                }
+            }
+            MenuAction::ClosePane => {
+                if let Some(p) = pane {
+                    self.close_pane_action(p).await;
+                }
+            }
         }
     }
 
@@ -1132,12 +1183,49 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click a sidebar row → space/tab menu.
+                let sidebar_hit = self.frame.sidebar.map(|sb| {
+                    col >= sb.x && col < sb.x + sb.width && row >= sb.y
+                }).unwrap_or(false)
+                    || (self.drawer && {
+                        let dr = self.drawer_rect();
+                        col >= dr.x && col < dr.x + dr.width && row >= dr.y
+                    });
+                if sidebar_hit {
+                    if let Some(target) = self.sidebar_rows.iter().find(|(r, _)| *r == row).map(|(_, t)| *t) {
+                        let (mt, items) = match target {
+                            Target::Space(id) => (
+                                MenuTarget::Space(id),
+                                vec![
+                                    ("new tab", MenuAction::NewTab),
+                                    ("new space", MenuAction::NewSpace),
+                                    ("rename space", MenuAction::RenameSpace),
+                                    ("close space", MenuAction::CloseSpace),
+                                ],
+                            ),
+                            Target::Tab { space, tab, pane } => (
+                                MenuTarget::Tab { space, tab, pane },
+                                vec![
+                                    ("rename tab", MenuAction::RenameTab),
+                                    ("close tab", MenuAction::CloseTab),
+                                    ("new tab", MenuAction::NewTab),
+                                    ("new space", MenuAction::NewSpace),
+                                ],
+                            ),
+                            Target::Pane(p) => (MenuTarget::Pane(p), vec![]),
+                        };
+                        if !items.is_empty() {
+                            self.menu = Some(Menu { x: col, y: row, target: mt, items });
+                        }
+                    }
+                    return;
+                }
                 if let Some(pane) = self.pane_at(col, row) {
                     self.goto_pane(pane).await;
                     self.menu = Some(Menu {
                         x: col,
                         y: row,
-                        pane,
+                        target: MenuTarget::Pane(pane),
                         items: vec![
                             ("split right", MenuAction::SplitRight),
                             ("split down", MenuAction::SplitDown),
@@ -1183,7 +1271,7 @@ impl App {
                     {
                         let idx = (row - r.y - 1) as usize;
                         if let Some((_, action)) = m.items.get(idx) {
-                            self.run_menu_item(*action, m.pane).await;
+                            self.run_menu_item(*action, m.target).await;
                         }
                     }
                     return;

@@ -512,6 +512,109 @@ fn broadcast_state(st: &State) {
     save_state(st);
 }
 
+/// Kill a pane's process and drop its scrollback file (no layout cascade).
+fn drop_pane(st: &mut State, pane: u64) {
+    if let Some(mut p) = st.panes.remove(&pane) {
+        let _ = p.killer.kill();
+    }
+    let _ = std::fs::remove_file(scrollback_path(pane));
+}
+
+fn close_tab(state: &Arc<Mutex<State>>, tab: u64) -> Result<ServerMsg> {
+    let mut st = state.lock().unwrap();
+    let leaves: Vec<u64> = {
+        let mut v = Vec::new();
+        let found = st.spaces.iter().flat_map(|s| &s.tabs).find(|t| t.id == tab);
+        match found {
+            Some(t) => t.layout.leaves(&mut v),
+            None => return Ok(err(format!("no tab {tab}"))),
+        }
+        v
+    };
+    for p in leaves {
+        drop_pane(&mut st, p);
+    }
+    let mut empty = Vec::new();
+    for s in st.spaces.iter_mut() {
+        let had = s.tabs.iter().any(|t| t.id == tab);
+        s.tabs.retain(|t| t.id != tab);
+        if had && !s.tabs.iter().any(|t| t.id == s.active_tab) {
+            if let Some(f) = s.tabs.first() {
+                s.active_tab = f.id;
+            }
+        }
+        if s.tabs.is_empty() {
+            empty.push(s.id);
+        }
+    }
+    st.spaces.retain(|s| !empty.contains(&s.id));
+    if !st.spaces.iter().any(|s| s.id == st.active_space) {
+        if let Some(f) = st.spaces.first() {
+            st.active_space = f.id;
+        }
+    }
+    ensure_nonempty(state, &mut st)?;
+    broadcast_state(&st);
+    Ok(ServerMsg::Done)
+}
+
+fn close_space(state: &Arc<Mutex<State>>, space: u64) -> Result<ServerMsg> {
+    let mut st = state.lock().unwrap();
+    let leaves: Vec<u64> = {
+        let Some(s) = st.spaces.iter().find(|s| s.id == space) else {
+            return Ok(err(format!("no space {space}")));
+        };
+        let mut v = Vec::new();
+        for t in &s.tabs {
+            t.layout.leaves(&mut v);
+        }
+        v
+    };
+    for p in leaves {
+        drop_pane(&mut st, p);
+    }
+    st.spaces.retain(|s| s.id != space);
+    if st.active_space == space {
+        if let Some(f) = st.spaces.first() {
+            st.active_space = f.id;
+        }
+    }
+    ensure_nonempty(state, &mut st)?;
+    broadcast_state(&st);
+    Ok(ServerMsg::Done)
+}
+
+fn move_tab(state: &Arc<Mutex<State>>, tab: u64, to: usize) -> Result<ServerMsg> {
+    let mut st = state.lock().unwrap();
+    let mut moved = false;
+    for s in st.spaces.iter_mut() {
+        if let Some(i) = s.tabs.iter().position(|t| t.id == tab) {
+            let t = s.tabs.remove(i);
+            let to = to.min(s.tabs.len());
+            s.tabs.insert(to, t);
+            moved = true;
+            break;
+        }
+    }
+    if !moved {
+        return Ok(err(format!("no tab {tab}")));
+    }
+    broadcast_state(&st);
+    Ok(ServerMsg::Done)
+}
+
+fn move_space(state: &Arc<Mutex<State>>, space: u64, to: usize) -> Result<ServerMsg> {
+    let mut st = state.lock().unwrap();
+    let Some(i) = st.spaces.iter().position(|s| s.id == space) else {
+        return Ok(err(format!("no space {space}")));
+    };
+    let s = st.spaces.remove(i);
+    let to = to.min(st.spaces.len());
+    st.spaces.insert(to, s);
+    broadcast_state(&st);
+    Ok(ServerMsg::Done)
+}
+
 fn err(message: impl Into<String>) -> ServerMsg {
     ServerMsg::Error { message: message.into() }
 }
@@ -599,6 +702,18 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
         }
         Request::ClosePane { pane } => close_pane(state, pane)
             .unwrap_or_else(|e| err(format!("{e:#}"))),
+        Request::CloseTab { tab } => {
+            close_tab(state, tab).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
+        Request::CloseSpace { space } => {
+            close_space(state, space).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
+        Request::MoveTab { tab, to } => {
+            move_tab(state, tab, to).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
+        Request::MoveSpace { space, to } => {
+            move_space(state, space, to).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
         Request::SetActive { space, tab, pane } => {
             let mut st = state.lock().unwrap();
             if st.spaces.iter().any(|s| s.id == space) {

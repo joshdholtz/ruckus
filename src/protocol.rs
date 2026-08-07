@@ -31,6 +31,14 @@ pub enum Request {
     /// Respawn an exited pane's command in place (same pane id, scrollback kept).
     Restart { pane: u64 },
     ClosePane { pane: u64 },
+    /// Close a whole tab (kills its panes; removes the space if it empties).
+    CloseTab { tab: u64 },
+    /// Close a whole space (kills all its panes).
+    CloseSpace { space: u64 },
+    /// Reorder a tab to index `to` within its space.
+    MoveTab { tab: u64, to: usize },
+    /// Reorder a space to index `to` in the space list.
+    MoveSpace { space: u64, to: usize },
     SetActive { space: u64, tab: u64, pane: u64 },
     Attach { pane: u64, rows: u16, cols: u16 },
     Detach { pane: u64 },
