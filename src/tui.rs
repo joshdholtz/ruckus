@@ -1226,7 +1226,15 @@ impl App {
                     let spaces = self.snap.spaces.clone();
                     let space_tpl = self.cfg.ui.space_row.clone();
                     let tab_tpl = self.cfg.ui.tab_row.clone();
-                    for s in &spaces {
+                    let row_gap = self.cfg.ui.sidebar_row_gap;
+                    let marker_on = self.cfg.ui.sidebar_marker;
+                    let marker = self.cfg.glyphs.focus.clone();
+                    for (si, s) in spaces.iter().enumerate() {
+                        if row_gap > 0 && si > 0 {
+                            for _ in 0..row_gap {
+                                push!(Line::raw(""), None::<Target>);
+                            }
+                        }
                         let s_active = s.id == self.snap.active_space;
                         let icon = self.state_glyph(space_activity(&self.snap, s));
                         let hovered = hover_row == Some(y);
@@ -1241,7 +1249,12 @@ impl App {
                             ("title", s.name.clone()),
                             ("id", s.id.to_string()),
                         ];
-                        let mut spans = vec![Span::styled(" ".to_string(), row_style)];
+                        let lead = if marker_on && s_active {
+                            Span::styled(marker.clone(), row_style.fg(th.accent))
+                        } else {
+                            Span::styled(" ".to_string(), row_style)
+                        };
+                        let mut spans = vec![lead];
                         spans.extend(
                             template_spans(
                                 &space_tpl,
@@ -1279,8 +1292,15 @@ impl App {
                                     active_pane.map(|p| p.cwd.clone()).unwrap_or_default(),
                                 ),
                             ];
-                            let mut spans =
-                                vec![Span::styled("    ".to_string(), row_style)];
+                            let mut spans = if marker_on && t_active {
+                                vec![
+                                    Span::styled("  ".to_string(), row_style),
+                                    Span::styled(marker.clone(), row_style.fg(th.accent)),
+                                    Span::styled(" ".to_string(), row_style),
+                                ]
+                            } else {
+                                vec![Span::styled("    ".to_string(), row_style)]
+                            };
                             spans.extend(template_spans(
                                 &tab_tpl, &icon, &vars, row_style, text_fg,
                             ));
