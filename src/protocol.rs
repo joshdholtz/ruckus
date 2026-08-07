@@ -140,6 +140,24 @@ impl Node {
         }
     }
 
+    /// Swap two panes' positions in the layout tree.
+    pub fn swap_leaves(&mut self, a: u64, b: u64) {
+        match self {
+            Node::Leaf { pane } => {
+                if *pane == a {
+                    *pane = b;
+                } else if *pane == b {
+                    *pane = a;
+                }
+            }
+            Node::Split { children, .. } => {
+                for c in children {
+                    c.swap_leaves(a, b);
+                }
+            }
+        }
+    }
+
     pub fn leaves(&self, out: &mut Vec<u64>) {
         match self {
             Node::Leaf { pane } => out.push(*pane),

@@ -159,6 +159,12 @@ struct App {
     frame: FrameLayout,
     sidebar_rows: Vec<(u16, Target)>,
     tab_hits: Vec<(Option<u64>, std::ops::Range<u16>)>,
+    tab_close_hits: Vec<(u64, std::ops::Range<u16>)>,
+    /// Reorder-drag state: a tab or space being dragged in the strip/sidebar.
+    tab_drag: Option<u64>,
+    space_drag: Option<u64>,
+    /// Alt+drag a pane onto another to swap them.
+    swap_from: Option<u64>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     pane_rects: Vec<(u64, Rect)>,
 }
@@ -1153,6 +1159,7 @@ impl App {
 
     async fn on_mouse(&mut self, ev: MouseEvent) {
         let (col, row) = (ev.column, ev.row);
+        let alt = ev.modifiers.contains(KeyModifiers::ALT);
         match ev.kind {
             MouseEventKind::Moved => {
                 self.hover = Some((col, row));
@@ -1161,6 +1168,45 @@ impl App {
                 self.hover = Some((col, row));
                 if self.drag.is_some() {
                     self.apply_drag(col, row);
+                } else if let Some(tab) = self.tab_drag {
+                    // Reorder: move the dragged tab into the slot under the cursor.
+                    if Some(row) == self.frame.tabs {
+                        let over = self
+                            .tab_hits
+                            .iter()
+                            .find(|(_, r)| r.contains(&col))
+                            .and_then(|(id, _)| *id);
+                        if let Some(target) = over {
+                            if target != tab {
+                                if let Some(to) = self
+                                    .active_space()
+                                    .and_then(|s| s.tabs.iter().position(|t| t.id == target))
+                                {
+                                    let _ = self.client.request(Request::MoveTab { tab, to }).await;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(space) = self.space_drag {
+                    // Reorder spaces: move into the space row under the cursor.
+                    let over = self
+                        .sidebar_rows
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .and_then(|(_, t)| match t {
+                            Target::Space(id) => Some(*id),
+                            _ => None,
+                        });
+                    if let Some(target) = over {
+                        if target != space {
+                            if let Some(to) =
+                                self.snap.spaces.iter().position(|s| s.id == target)
+                            {
+                                let _ =
+                                    self.client.request(Request::MoveSpace { space, to }).await;
+                            }
+                        }
+                    }
                 } else if self.selecting {
                     if let Some(pane) = self.select.map(|s| s.pane) {
                         if let Some(cell) = self.cell_in_pane(pane, col, row) {
@@ -1172,6 +1218,25 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                self.tab_drag = None;
+                self.space_drag = None;
+                if let Some(from) = self.swap_from.take() {
+                    if let Some(to) = self.pane_at(col, row) {
+                        if to != from {
+                            if let Some(t) = self.active_tab() {
+                                let mut layout = t.layout.clone();
+                                layout.swap_leaves(from, to);
+                                let tab = t.id;
+                                if let Err(e) =
+                                    self.client.request(Request::SetLayout { tab, layout }).await
+                                {
+                                    self.toast(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 if self.drag.is_some() {
                     self.finish_drag().await;
                 } else if self.selecting {
@@ -1179,6 +1244,21 @@ impl App {
                     match self.select {
                         Some(sel) if !sel.is_empty() => self.copy_selection(),
                         _ => self.select = None, // plain click, not a drag
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Middle) => {
+                // Middle-click a tab to close it.
+                if Some(row) == self.frame.tabs && col >= self.frame.main.x {
+                    if let Some(tab) = self
+                        .tab_hits
+                        .iter()
+                        .find(|(_, r)| r.contains(&col))
+                        .and_then(|(id, _)| *id)
+                    {
+                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                            self.toast(e.to_string());
+                        }
                     }
                 }
             }
@@ -1243,6 +1323,13 @@ impl App {
                 // Any fresh left-press clears a prior selection.
                 self.select = None;
                 self.selecting = false;
+                // Alt+drag a pane onto another swaps them.
+                if alt {
+                    if let Some(pane) = self.pane_at(col, row) {
+                        self.swap_from = Some(pane);
+                        return;
+                    }
+                }
                 if self.help {
                     self.help = false;
                     return;
@@ -1312,12 +1399,24 @@ impl App {
                             .find(|(r, _)| *r == row)
                             .map(|(_, t)| *t);
                         if let Some(t) = target {
+                            if let Target::Space(id) = t {
+                                self.space_drag = Some(id); // arm reorder-drag
+                            }
                             self.handle_sidebar_target(t).await;
                         }
                         return;
                     }
                 }
                 if Some(row) == self.frame.tabs && col >= self.frame.main.x {
+                    // Close button (×) takes precedence over switching.
+                    if let Some(tab) =
+                        self.tab_close_hits.iter().find(|(_, r)| r.contains(&col)).map(|(id, _)| *id)
+                    {
+                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                            self.toast(e.to_string());
+                        }
+                        return;
+                    }
                     let hit = self
                         .tab_hits
                         .iter()
@@ -1325,6 +1424,8 @@ impl App {
                         .map(|(id, _)| *id);
                     match hit {
                         Some(Some(tab)) => {
+                            // Arm a potential reorder-drag and switch to the tab.
+                            self.tab_drag = Some(tab);
                             if let Some(s) = self.active_space() {
                                 let target = s
                                     .tabs
@@ -1848,8 +1949,10 @@ impl App {
         let th = self.cfg.theme.clone();
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         let mut hits: Vec<(Option<u64>, std::ops::Range<u16>)> = Vec::new();
+        let mut close_hits: Vec<(u64, std::ops::Range<u16>)> = Vec::new();
         let mut x = area.x + 1;
         let pad = " ".repeat(self.cfg.ui.tab_pad as usize);
+        let plen = pad.chars().count();
         if let Some(s) = self.active_space() {
             for (i, t) in s.tabs.iter().enumerate() {
                 let active = t.id == s.active_tab;
@@ -1862,9 +1965,9 @@ impl App {
                 } else {
                     t.name.clone()
                 };
-                // Every tab is a filled "pill": pad + icon + text + pad, then a gap.
-                let width =
-                    (pad.chars().count() * 2 + 2 + text.chars().count()) as u16;
+                let tlen = text.chars().count();
+                // Pill: pad + "icon " + text + " ×" + pad, then a gap.
+                let width = (plen * 2 + tlen + 4) as u16;
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
                 let (bg, fg, bold) = if active {
@@ -1878,11 +1981,20 @@ impl App {
                 if bold {
                     base = base.add_modifier(Modifier::BOLD);
                 }
+                let close_col = x + (plen + tlen + 3) as u16;
+                let close_hover = self.hover_at(&(close_col..close_col + 1), area.y);
                 spans.push(Span::styled(pad.clone(), base));
                 spans.push(Span::styled(format!("{g} "), base.fg(color)));
-                spans.push(Span::styled(format!("{text}{pad}"), base));
+                spans.push(Span::styled(text, base));
+                spans.push(Span::styled(" ".to_string(), base));
+                spans.push(Span::styled(
+                    "×".to_string(),
+                    base.fg(if close_hover { th.done_err } else { th.status_fg }),
+                ));
+                spans.push(Span::styled(pad.clone(), base));
                 spans.push(Span::raw(" ")); // gap between pills
                 hits.push((Some(t.id), range));
+                close_hits.push((t.id, close_col..close_col + 1));
                 x += width + 1;
             }
         }
@@ -1898,6 +2010,7 @@ impl App {
         ));
         hits.push((None, plus_range));
         self.tab_hits = hits;
+        self.tab_close_hits = close_hits;
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
             area,
@@ -2365,6 +2478,10 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         frame: FrameLayout::default(),
         sidebar_rows: Vec::new(),
         tab_hits: Vec::new(),
+        tab_close_hits: Vec::new(),
+        tab_drag: None,
+        space_drag: None,
+        swap_from: None,
         footer_hits: Vec::new(),
         pane_rects: Vec::new(),
     };
