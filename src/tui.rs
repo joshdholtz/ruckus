@@ -41,6 +41,13 @@ enum Target {
     Pane(u64),
 }
 
+/// A clickable affordance rendered in the sidebar.
+#[derive(Clone, Copy)]
+enum SidebarBtn {
+    NewSpace,
+    CloseSpace(u64),
+}
+
 /// What a context menu acts on.
 #[derive(Clone, Copy)]
 enum MenuTarget {
@@ -162,6 +169,7 @@ struct App {
     size: (u16, u16),
     frame: FrameLayout,
     sidebar_rows: Vec<(u16, Target)>,
+    sidebar_buttons: Vec<(u16, std::ops::Range<u16>, SidebarBtn)>,
     tab_hits: Vec<(Option<u64>, std::ops::Range<u16>)>,
     tab_close_hits: Vec<(u64, std::ops::Range<u16>)>,
     /// Reorder-drag state: a tab or space being dragged in the strip/sidebar.
@@ -1437,6 +1445,25 @@ impl App {
                 }
                 if let Some(sb) = self.frame.sidebar {
                     if col >= sb.x && col < sb.x + sb.width && row >= sb.y {
+                        // Visible buttons (+ new space, × close space) win over row-select.
+                        if let Some(btn) = self
+                            .sidebar_buttons
+                            .iter()
+                            .find(|(r, cr, _)| *r == row && cr.contains(&col))
+                            .map(|(_, _, b)| *b)
+                        {
+                            match btn {
+                                SidebarBtn::NewSpace => self.open_prompt(PromptKind::NewSpace),
+                                SidebarBtn::CloseSpace(id) => {
+                                    if let Err(e) =
+                                        self.client.request(Request::CloseSpace { space: id }).await
+                                    {
+                                        self.toast(e.to_string());
+                                    }
+                                }
+                            }
+                            return;
+                        }
                         let target = self
                             .sidebar_rows
                             .iter()
@@ -1712,6 +1739,7 @@ impl App {
             .map(|(_, r)| r);
         let mut lines: Vec<Line> = Vec::new();
         let mut rows: Vec<(u16, Target)> = Vec::new();
+        let mut buttons: Vec<(u16, std::ops::Range<u16>, SidebarBtn)> = Vec::new();
         let mut y = inner.y;
 
         macro_rules! push {
@@ -1832,6 +1860,17 @@ impl App {
                         )),
                         None::<Target>
                     );
+                    // Persistent, discoverable "new space" button.
+                    {
+                        let hov = hover_row == Some(y);
+                        let style = if hov {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th.status_fg)
+                        };
+                        buttons.push((y, inner.x + 1..inner.x + 13, SidebarBtn::NewSpace));
+                        push!(Line::from(Span::styled("  + new space", style)), None::<Target>);
+                    }
                     let spaces = self.snap.spaces.clone();
                     let space_tpl = self.cfg.ui.space_row.clone();
                     let tab_tpl = self.cfg.ui.tab_row.clone();
@@ -1888,8 +1927,18 @@ impl App {
                                 text_fg,
                             ),
                         );
-                        let pad = w.saturating_sub(spans_width(&spans));
-                        spans.push(Span::styled(" ".repeat(pad), row_style));
+                        // Hover reveals a × close button at the row's right edge.
+                        let row_hovered = hover_row == Some(y);
+                        if row_hovered && w >= 3 {
+                            let pad = w.saturating_sub(spans_width(&spans) + 2);
+                            spans.push(Span::styled(" ".repeat(pad), row_style));
+                            spans.push(Span::styled(" ×".to_string(), row_style.fg(th.done_err)));
+                            let x = inner.x + (w as u16).saturating_sub(2);
+                            buttons.push((y, x..x + 2, SidebarBtn::CloseSpace(s.id)));
+                        } else {
+                            let pad = w.saturating_sub(spans_width(&spans));
+                            spans.push(Span::styled(" ".repeat(pad), row_style));
+                        }
                         push!(Line::from(spans), Some(Target::Space(s.id)));
 
                         if !space_sub.is_empty() {
@@ -1983,6 +2032,7 @@ impl App {
 
         lines.truncate(inner.height as usize);
         self.sidebar_rows = rows;
+        self.sidebar_buttons = buttons;
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(th.sidebar_bg)),
             inner,
@@ -2521,6 +2571,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         size: crossterm::terminal::size().unwrap_or((80, 24)),
         frame: FrameLayout::default(),
         sidebar_rows: Vec::new(),
+        sidebar_buttons: Vec::new(),
         tab_hits: Vec::new(),
         tab_close_hits: Vec::new(),
         tab_drag: None,
