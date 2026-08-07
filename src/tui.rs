@@ -68,6 +68,29 @@ struct Drag {
     dir: Dir,
 }
 
+/// A text selection within one pane, in that pane's content-cell coordinates
+/// (row, col). `anchor` is where the drag began, `head` where it is now.
+#[derive(Clone, Copy)]
+struct Sel {
+    pane: u64,
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Sel {
+    /// (start, end) ordered top-to-bottom, left-to-right.
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum PromptKind {
     NewTab,
@@ -117,6 +140,8 @@ struct App {
     menu: Option<Menu>,
     prompt: Option<Prompt>,
     drag: Option<Drag>,
+    select: Option<Sel>,
+    selecting: bool,
     hover: Option<(u16, u16)>,
     tick: usize,
     size: (u16, u16),
@@ -140,6 +165,24 @@ fn home_relative(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Put text on the clipboard two ways for wide coverage: OSC 52 (works over SSH
+/// and in iTerm2 / WezTerm / kitty / …) and a local `pbcopy` fallback.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", B64.encode(text.as_bytes()));
+    let _ = out.flush();
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(si) = child.stdin.as_mut() {
+            let _ = si.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
@@ -440,6 +483,65 @@ impl App {
 
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// The content sub-rect of a pane rect (inside title bar + padding).
+    fn pane_content_rect(&self, rect: Rect) -> Rect {
+        let title = self.cfg.ui.pane_titles as u16;
+        let pad = self.cfg.ui.pane_padding;
+        Rect::new(
+            rect.x + pad,
+            rect.y + title + pad,
+            rect.width.saturating_sub(2 * pad),
+            rect.height.saturating_sub(title + 2 * pad),
+        )
+    }
+
+    /// Absolute (col,row) -> (pane id, content cell (row,col)) if it lands in a pane.
+    fn cell_at(&self, col: u16, row: u16) -> Option<(u64, (u16, u16))> {
+        for (pid, rect) in &self.pane_rects {
+            let c = self.pane_content_rect(*rect);
+            if c.width == 0 || c.height == 0 {
+                continue;
+            }
+            if col >= c.x && col < c.x + c.width && row >= c.y && row < c.y + c.height {
+                return Some((*pid, (row - c.y, col - c.x)));
+            }
+        }
+        None
+    }
+
+    /// Absolute (col,row) clamped into `pane`'s content -> cell (row,col).
+    fn cell_in_pane(&self, pane: u64, col: u16, row: u16) -> Option<(u16, u16)> {
+        let rect = self.pane_rects.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r)?;
+        let c = self.pane_content_rect(rect);
+        if c.width == 0 || c.height == 0 {
+            return None;
+        }
+        let cc = col.clamp(c.x, c.x + c.width - 1) - c.x;
+        let cr = row.clamp(c.y, c.y + c.height - 1) - c.y;
+        Some((cr, cc))
+    }
+
+    /// Extract the current selection's text and put it on the clipboard.
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.select else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let ((sr, sc), (er, ec)) = sel.ordered();
+        let Some(view) = self.views.get(&sel.pane) else { return };
+        let screen = view.parser.screen();
+        let (_, cols) = screen.size();
+        let ec2 = ec.saturating_add(1).min(cols); // include the cell under the cursor
+        let text = screen.contents_between(sr, sc, er, ec2);
+        let text = text.trim_end().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let n = text.chars().count();
+        copy_to_clipboard(&text);
+        self.toast(format!("copied {n} chars"));
     }
 
     fn pane_size(&self, rect: Rect) -> (u16, u16) {
@@ -1008,11 +1110,25 @@ impl App {
                 self.hover = Some((col, row));
                 if self.drag.is_some() {
                     self.apply_drag(col, row);
+                } else if self.selecting {
+                    if let Some(pane) = self.select.map(|s| s.pane) {
+                        if let Some(cell) = self.cell_in_pane(pane, col, row) {
+                            if let Some(sel) = self.select.as_mut() {
+                                sel.head = cell;
+                            }
+                        }
+                    }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.drag.is_some() {
                     self.finish_drag().await;
+                } else if self.selecting {
+                    self.selecting = false;
+                    match self.select {
+                        Some(sel) if !sel.is_empty() => self.copy_selection(),
+                        _ => self.select = None, // plain click, not a drag
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
@@ -1036,6 +1152,9 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Any fresh left-press clears a prior selection.
+                self.select = None;
+                self.selecting = false;
                 if self.help {
                     self.help = false;
                     return;
@@ -1135,6 +1254,13 @@ impl App {
                 } else if let Some(pane) = self.pane_at(col, row) {
                     if let Some((s, t)) = self.locate(pane) {
                         self.set_active(s, t, pane).await;
+                    }
+                    // Begin a text selection anchored at the clicked cell.
+                    if self.cfg.ui.mouse_select {
+                        if let Some((pid, cell)) = self.cell_at(col, row) {
+                            self.select = Some(Sel { pane: pid, anchor: cell, head: cell });
+                            self.selecting = true;
+                        }
                     }
                 }
             }
@@ -1864,6 +1990,40 @@ impl App {
         }
     }
 
+    /// Tint the selected cells so a drag-selection is visible.
+    fn draw_selection(&self, f: &mut Frame) {
+        let Some(sel) = self.select else { return };
+        let Some(rect) = self.pane_rects.iter().find(|(p, _)| *p == sel.pane).map(|(_, r)| *r)
+        else {
+            return;
+        };
+        let c = self.pane_content_rect(rect);
+        if c.width == 0 || c.height == 0 {
+            return;
+        }
+        let ((sr, sc), (er, ec)) = sel.ordered();
+        let bg = self.cfg.theme.select_bg;
+        let last_row = c.height.saturating_sub(1);
+        let last_col = c.width.saturating_sub(1);
+        let buf = f.buffer_mut();
+        for r in sr..=er.min(last_row) {
+            let (cs, ce) = if sr == er {
+                (sc, ec)
+            } else if r == sr {
+                (sc, last_col)
+            } else if r == er {
+                (0, ec)
+            } else {
+                (0, last_col)
+            };
+            for cc in cs..=ce.min(last_col) {
+                if let Some(cell) = buf.cell_mut((c.x + cc, c.y + r)) {
+                    cell.set_bg(bg);
+                }
+            }
+        }
+    }
+
     fn draw_menu(&self, f: &mut Frame) {
         let Some(m) = &self.menu else { return };
         let th = &self.cfg.theme;
@@ -2053,6 +2213,7 @@ impl App {
         }
         self.draw_panes(f);
         self.draw_dividers(f);
+        self.draw_selection(f);
         if let Some(r) = self.frame.footer {
             self.draw_footer(f, Rect::new(0, r, area.width, 1));
         }
@@ -2108,6 +2269,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         menu: None,
         prompt: None,
         drag: None,
+        select: None,
+        selecting: false,
         hover: None,
         tick: 0,
         size: crossterm::terminal::size().unwrap_or((80, 24)),
