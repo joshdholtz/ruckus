@@ -90,7 +90,6 @@ pub struct Binding {
 
 impl Binding {
     pub fn matches(&self, ev: &KeyEvent) -> bool {
-        // Compare chars case-insensitively so shift doesn't break alt bindings.
         let code_eq = match (self.code, ev.code) {
             (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
             (a, b) => a == b,
@@ -153,11 +152,8 @@ pub fn parse_binding(spec: &str) -> Result<Binding> {
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub accent: Color,
-    /// Overlay (menu/modal/toast) borders — panes use background layers, not lines.
     pub border: Color,
-    /// Root background, darkest layer; shows as gutters between panes.
     pub bg: Color,
-    /// Pane content background.
     pub surface: Color,
     pub bar_bg: Color,
     pub bar_fg: Color,
@@ -194,17 +190,98 @@ impl Default for Theme {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPos {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarPos {
+    Top,
+    Bottom,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastPos {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone)]
+pub struct Glyphs {
+    pub waiting: String,
+    pub done: String,
+    pub idle: String,
+    pub focus: String,
+    pub spinner: Vec<String>,
+}
+
+impl Default for Glyphs {
+    fn default() -> Self {
+        Glyphs {
+            waiting: "◉".to_string(),
+            done: "◍".to_string(),
+            idle: "○".to_string(),
+            focus: "▎".to_string(),
+            spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiConfig {
-    pub show_sidebar: bool,
+    pub sidebar_pos: SidebarPos,
+    pub sidebar_start_visible: bool,
     pub sidebar_width: u16,
-    pub mac_option_fallback: bool,
+    pub sidebar_sections: Vec<String>,
+    pub gutter: u16,
+    pub pane_padding: u16,
+    pub pane_titles: bool,
+    /// Sidebar auto-collapses below this width; 0 = never.
+    pub narrow_below: u16,
+    pub spinner_ms: u64,
+    pub toast_pos: ToastPos,
+    pub toast_seconds: u64,
+    pub header: BarPos,
+    pub footer: BarPos,
+    pub tab_strip: bool,
     pub mouse: bool,
+    pub mac_option_fallback: bool,
+    pub space_row: String,
+    pub tab_row: String,
+    pub queue_row: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        UiConfig { show_sidebar: true, sidebar_width: 26, mac_option_fallback: true, mouse: true }
+        UiConfig {
+            sidebar_pos: SidebarPos::Left,
+            sidebar_start_visible: true,
+            sidebar_width: 26,
+            sidebar_sections: vec!["needs_you".to_string(), "spaces".to_string()],
+            gutter: 1,
+            pane_padding: 0,
+            pane_titles: true,
+            narrow_below: 70,
+            spinner_ms: 120,
+            toast_pos: ToastPos::BottomRight,
+            toast_seconds: 4,
+            header: BarPos::Top,
+            footer: BarPos::Bottom,
+            tab_strip: true,
+            mouse: true,
+            mac_option_fallback: true,
+            space_row: "{icon} {name}".to_string(),
+            tab_row: "{icon} {title}".to_string(),
+            queue_row: "{icon} {title}".to_string(),
+        }
     }
 }
 
@@ -213,6 +290,7 @@ pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
     pub theme: Theme,
     pub ui: UiConfig,
+    pub glyphs: Glyphs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,11 +310,41 @@ impl KeySpec {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawToast {
+    position: Option<String>,
+    seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawUi {
+    // legacy key, still honored
     show_sidebar: Option<bool>,
+    sidebar: Option<String>,
     sidebar_width: Option<u16>,
-    mac_option_fallback: Option<bool>,
+    sidebar_sections: Option<Vec<String>>,
+    gutter: Option<u16>,
+    pane_padding: Option<u16>,
+    pane_titles: Option<bool>,
+    narrow_below: Option<u16>,
+    spinner_ms: Option<u64>,
+    toast: Option<RawToast>,
+    header: Option<String>,
+    footer: Option<String>,
+    tab_strip: Option<bool>,
     mouse: Option<bool>,
+    mac_option_fallback: Option<bool>,
+    space_row: Option<String>,
+    tab_row: Option<String>,
+    queue_row: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawGlyphs {
+    waiting: Option<String>,
+    done: Option<String>,
+    idle: Option<String>,
+    focus: Option<String>,
+    spinner: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -247,6 +355,8 @@ struct RawConfig {
     theme: HashMap<String, String>,
     #[serde(default)]
     ui: RawUi,
+    #[serde(default)]
+    glyphs: RawGlyphs,
 }
 
 fn parse_hex(s: &str) -> Option<Color> {
@@ -258,6 +368,15 @@ fn parse_hex(s: &str) -> Option<Color> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(Color::Rgb(r, g, b))
+}
+
+fn parse_bar(s: Option<&str>, default: BarPos) -> BarPos {
+    match s.map(|s| s.to_lowercase()) {
+        Some(s) if s == "top" => BarPos::Top,
+        Some(s) if s == "bottom" => BarPos::Bottom,
+        Some(s) if s == "off" => BarPos::Off,
+        _ => default,
+    }
 }
 
 impl Config {
@@ -312,14 +431,71 @@ impl Config {
         set(&mut theme.done_ok, "done_ok");
         set(&mut theme.done_err, "done_err");
 
+        let d = UiConfig::default();
+        let sidebar_raw = raw.ui.sidebar.as_deref().map(|s| s.to_lowercase());
+        let (sidebar_pos, mut sidebar_start_visible) = match sidebar_raw.as_deref() {
+            Some("right") => (SidebarPos::Right, true),
+            Some("off") => (SidebarPos::Left, false),
+            Some(_) | None => (SidebarPos::Left, true),
+        };
+        if raw.ui.show_sidebar == Some(false) {
+            sidebar_start_visible = false;
+        }
         let ui = UiConfig {
-            show_sidebar: raw.ui.show_sidebar.unwrap_or(true),
-            sidebar_width: raw.ui.sidebar_width.unwrap_or(26).clamp(16, 60),
-            mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(true),
-            mouse: raw.ui.mouse.unwrap_or(true),
+            sidebar_pos,
+            sidebar_start_visible,
+            sidebar_width: raw.ui.sidebar_width.unwrap_or(d.sidebar_width).clamp(16, 60),
+            sidebar_sections: raw.ui.sidebar_sections.unwrap_or(d.sidebar_sections),
+            gutter: raw.ui.gutter.unwrap_or(d.gutter).min(4),
+            pane_padding: raw.ui.pane_padding.unwrap_or(d.pane_padding).min(4),
+            pane_titles: raw.ui.pane_titles.unwrap_or(d.pane_titles),
+            narrow_below: raw.ui.narrow_below.unwrap_or(d.narrow_below),
+            spinner_ms: raw.ui.spinner_ms.unwrap_or(d.spinner_ms).clamp(30, 2000),
+            toast_pos: match raw
+                .ui
+                .toast
+                .as_ref()
+                .and_then(|t| t.position.as_deref())
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
+                Some("top-left") => ToastPos::TopLeft,
+                Some("top-right") => ToastPos::TopRight,
+                Some("bottom-left") => ToastPos::BottomLeft,
+                _ => ToastPos::BottomRight,
+            },
+            toast_seconds: raw
+                .ui
+                .toast
+                .as_ref()
+                .and_then(|t| t.seconds)
+                .unwrap_or(d.toast_seconds)
+                .clamp(1, 60),
+            header: parse_bar(raw.ui.header.as_deref(), BarPos::Top),
+            footer: parse_bar(raw.ui.footer.as_deref(), BarPos::Bottom),
+            tab_strip: raw.ui.tab_strip.unwrap_or(d.tab_strip),
+            mouse: raw.ui.mouse.unwrap_or(d.mouse),
+            mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(d.mac_option_fallback),
+            space_row: raw.ui.space_row.unwrap_or(d.space_row),
+            tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
+            queue_row: raw.ui.queue_row.unwrap_or(d.queue_row),
         };
 
-        Config { keys, theme, ui }
+        let dg = Glyphs::default();
+        let spinner = raw
+            .glyphs
+            .spinner
+            .filter(|v| !v.is_empty())
+            .unwrap_or(dg.spinner);
+        let glyphs = Glyphs {
+            waiting: raw.glyphs.waiting.unwrap_or(dg.waiting),
+            done: raw.glyphs.done.unwrap_or(dg.done),
+            idle: raw.glyphs.idle.unwrap_or(dg.idle),
+            focus: raw.glyphs.focus.unwrap_or(dg.focus),
+            spinner,
+        };
+
+        Config { keys, theme, ui, glyphs }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -348,7 +524,7 @@ impl Config {
     }
 }
 
-const DEFAULT_CONFIG: &str = r##"# ruckus config — every key below is rebindable, every color is yours.
+const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
 # Key specs look like: "alt-v", "ctrl-shift-p", "f5", "alt-pageup".
 # An action can have several bindings: quit = ["alt-q", "ctrl-q"]
 #
@@ -372,17 +548,39 @@ next_space = "alt-."
 prev_space = "alt-,"
 scroll_up = "alt-pageup"
 scroll_down = "alt-pagedown"
-toggle_sidebar = "alt-b"  # show/hide the sidebar
+toggle_sidebar = "alt-b"  # show/hide the sidebar (drawer on narrow screens)
 jump_waiting = "alt-a"    # jump to the next pane that needs you
 show_help = "alt-/"       # keybinding overlay
 
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
 
 [ui]
-show_sidebar = true
+sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
+sidebar_sections = ["needs_you", "spaces"]  # order them, or drop one
+gutter = 1                  # cells between panes: 0 = dense, 2 = airy
+pane_padding = 0            # cells of breathing room inside each pane
+pane_titles = true          # false = pure grid, no per-pane title bars
+narrow_below = 70           # sidebar auto-collapses under this width; 0 = never
+spinner_ms = 120            # working-spinner speed
+toast = { position = "bottom-right", seconds = 4 }  # also: top-left/right, bottom-left
+header = "top"              # top | bottom | off
+footer = "bottom"           # bottom | top | off
+tab_strip = true            # false hides the tab row (tabs still in the sidebar)
+mouse = true                # false leaves the mouse to your terminal (select/copy)
 mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt bindings
-mouse = true                # set false to leave the mouse to your terminal (select/copy)
+
+# Sidebar row templates. Tokens: {icon} {title} {name} {id} {cmd} {cwd}
+space_row = "{icon} {name}"
+tab_row = "{icon} {title}"
+queue_row = "{icon} {title}"
+
+[glyphs]
+waiting = "◉"
+done = "◍"
+idle = "○"
+focus = "▎"                 # focused pane marker in its title bar
+spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
 [theme]
 accent = "#f5a97f"        # focus marker, active tab, buttons
@@ -395,7 +593,7 @@ bar_active_fg = "#cad3f5" # active bar text
 status_fg = "#6e738d"     # hint text
 sidebar_bg = "#161925"    # sidebar background
 select_bg = "#2e3348"     # selected/hovered row + pane title bars
-working = "#8aadf4"       # pane state dots
+working = "#8aadf4"       # state colors
 waiting = "#eed49f"
 idle = "#5b6078"
 done_ok = "#a6da95"

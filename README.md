@@ -83,7 +83,17 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 
 ## Customization
 
-`~/.ruckus/config.toml` — `[keys]` rebinds every action, `[theme]` recolors everything (hex). The status bar hints re-render from *your* bindings.
+`~/.ruckus/config.toml` — the whole UI is yours:
+
+| Section | Controls |
+|---|---|
+| `[keys]` | Every action, multiple bindings per action; footer hints re-render from your bindings |
+| `[theme]` | All 15 colors — 4 background layers, accent, text tiers, state colors |
+| `[ui]` | Sidebar side (`left`/`right`/`off`) + width + section order; gutter width (0 = dense, 2 = airy); pane padding; pane title bars on/off; header/footer position (`top`/`bottom`/`off`); tab strip on/off; narrow-collapse threshold (`narrow_below = 0` keeps the sidebar on phones); spinner speed; toast position/duration; mouse capture |
+| `[glyphs]` | State icons, focus marker, spinner frames |
+| Row templates | `space_row` / `tab_row` / `queue_row` with `{icon} {title} {name} {id} {cmd} {cwd}` tokens |
+
+The only thing ruckus can't control is the font — that belongs to your terminal app.
 
 ## Plugins / scripting
 
