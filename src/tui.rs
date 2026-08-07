@@ -997,8 +997,27 @@ impl App {
                     self.seen.insert(pane);
                 }
             }
+            ServerMsg::ConfigChanged => self.reload_config().await,
             _ => {}
         }
+    }
+
+    /// Re-read config.toml live. Theme/glyphs/keys/templates apply on the next
+    /// render; layout-affecting settings re-fit panes via sync(); a mouse-capture
+    /// change is applied against the terminal immediately.
+    async fn reload_config(&mut self) {
+        let was_mouse = self.cfg.ui.mouse;
+        self.cfg = Config::load();
+        if self.cfg.ui.mouse != was_mouse {
+            let mut out = std::io::stdout();
+            if self.cfg.ui.mouse {
+                let _ = crossterm::execute!(out, EnableMouseCapture);
+            } else {
+                let _ = crossterm::execute!(out, DisableMouseCapture);
+            }
+        }
+        self.sync().await;
+        self.toast("config reloaded");
     }
 
     async fn on_term_event(&mut self, ev: Event) {

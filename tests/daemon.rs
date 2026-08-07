@@ -329,3 +329,45 @@ fn cli_resolves_pane_by_tab_name() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn reload_broadcasts_config_changed() {
+    use std::io::Read;
+    let d = Daemon::start("reload");
+
+    // Listener connection: register it by sending a snapshot, then watch for the
+    // unsolicited ConfigChanged event.
+    let mut listener = UnixStream::connect(d.dir.join("ruckus.sock")).unwrap();
+    listener.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    listener
+        .write_all(b"{\"seq\":99,\"req\":{\"type\":\"snapshot\"}}\n")
+        .unwrap();
+
+    // Trigger reload from a second connection.
+    let msg = rpc(&d.dir, json!({"type": "reload"}));
+    assert_eq!(msg["type"], "done");
+
+    // The listener should receive a config_changed event (seq-less broadcast).
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while Instant::now() < deadline {
+        match listener.read(&mut byte) {
+            Ok(1) => {
+                if byte[0] == b'\n' {
+                    let line = String::from_utf8_lossy(&buf);
+                    if line.contains("config_changed") {
+                        saw = true;
+                        break;
+                    }
+                    buf.clear();
+                } else {
+                    buf.push(byte[0]);
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw, "listener never received config_changed broadcast");
+}

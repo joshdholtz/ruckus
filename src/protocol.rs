@@ -36,6 +36,9 @@ pub enum Request {
     Detach { pane: u64 },
     Input { pane: u64, data: String },
     Resize { pane: u64, rows: u16, cols: u16 },
+    /// Re-read config.toml: daemon refreshes its own settings and tells every
+    /// attached client to reload and re-render.
+    Reload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +52,8 @@ pub enum ServerMsg {
     Output { pane: u64, data: String },
     Exited { pane: u64, code: u32 },
     Activity { pane: u64, activity: Activity },
+    /// Pushed to every client when config should be reloaded from disk.
+    ConfigChanged,
 }
 
 /// Attention state of a pane, detected by the daemon.

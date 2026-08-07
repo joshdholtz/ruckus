@@ -101,6 +101,8 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 
 The only thing ruckus can't control is the font — that belongs to your terminal app.
 
+**Live reload:** `ruckus config set …` applies to a running TUI instantly (theme, glyphs, keys, layout — all of it). Hand-edited the file? `ruckus reload` pushes it to every attached client. Only `spinner_ms` needs a restart.
+
 ## Plugins / scripting
 
 The daemon speaks newline-delimited JSON-RPC over `~/.ruckus/ruckus.sock` — the same protocol the TUI uses, available to any language. See [docs/PROTOCOL.md](docs/PROTOCOL.md). A Raycast script, a Stream Deck button, or a phone client is a socket connection away. Embedded scripting (Lua) is planned.

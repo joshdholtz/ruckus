@@ -598,6 +598,15 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 Err(e) => err(format!("resize failed: {e}")),
             }
         }
+        Request::Reload => {
+            let mut st = state.lock().unwrap();
+            let cfg = crate::config::Config::load();
+            st.notify_waiting = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
+            st.notify_done = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
+            info!("config reloaded; notifying {} clients", st.conns.len());
+            broadcast(&st, ServerMsg::ConfigChanged);
+            ServerMsg::Done
+        }
     }
 }
 

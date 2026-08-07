@@ -81,6 +81,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Tell the daemon and every attached TUI to reload config.toml now
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -120,7 +122,24 @@ async fn main() -> Result<()> {
         Some(Cmd::Focus { target }) => focus(target).await,
         Some(Cmd::Rename { kind, id, name }) => rename(kind, id, name).await,
         Some(Cmd::Restart { target }) => restart(target).await,
-        Some(Cmd::Config { cmd }) => config_cmd(cmd),
+        Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
+        Some(Cmd::Reload) => reload().await,
+    }
+}
+
+async fn reload() -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    client.request(Request::Reload).await?;
+    println!("config reloaded");
+    Ok(())
+}
+
+/// Ask a *running* daemon to reload, without starting one. Silent no-op if the
+/// daemon isn't up — editing config while nothing's running needs no reload.
+async fn reload_if_running() {
+    if let Ok((client, _events)) = connect().await {
+        let _ = client.request(Request::Reload).await;
     }
 }
 
@@ -213,8 +232,9 @@ fn parse_toml_value(v: &str) -> toml_edit::Item {
     toml_edit::value(v)
 }
 
-fn config_cmd(cmd: ConfigCmd) -> Result<()> {
+async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
     let path = config::ensure_config_file();
+    let mut changed = false;
     match cmd {
         ConfigCmd::Path => {
             println!("{}", path.display());
@@ -249,6 +269,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             item[parts[parts.len() - 1]] = parse_toml_value(&value);
             std::fs::write(&path, doc.to_string())?;
             println!("{key} = {}", value.trim());
+            changed = true;
         }
         ConfigCmd::Unset { key } => {
             let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
@@ -265,7 +286,11 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             }
             std::fs::write(&path, doc.to_string())?;
             println!("{key} unset (default applies)");
+            changed = true;
         }
+    }
+    if changed {
+        reload_if_running().await;
     }
     Ok(())
 }

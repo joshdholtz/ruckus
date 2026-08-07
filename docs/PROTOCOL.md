@@ -27,6 +27,7 @@ Daemon → client:
 | `rename_space` | `space`, `name` | `done` |
 | `rename_tab` | `tab`, `name` | `done` |
 | `restart` | `pane` | `done` (respawn an exited pane in place) |
+| `reload` | — | `done` (re-read config; pushes `config_changed` to all clients) |
 | `close_pane` | `pane` | `done` |
 | `set_active` | `space`, `tab`, `pane` | `done` |
 | `attach` | `pane`, `rows`, `cols` | `attached` (base64 scrollback replay; you now receive `output` events for this pane) |
@@ -44,6 +45,7 @@ Empty `cmd` spawns `$SHELL`.
 | `activity` | `pane`, `activity` | activity changed: `working` / `waiting` / `idle` / `done` |
 | `exited` | `pane`, `code` | pane's process exited |
 | `state` | `snapshot` | tree changed (created/closed/moved/active) — sent to every connection |
+| `config_changed` | — | config should be reloaded from disk (after a `reload`) |
 
 ## Example: notify when any agent needs you
 

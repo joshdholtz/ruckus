@@ -51,7 +51,9 @@ ruckus config path                          # where it lives
 ```
 
 Config keys are dotted paths into `config.toml`: `ui.*`, `theme.*`, `glyphs.*`,
-`keys.*`, `notify.*`. Changes apply the next time a TUI client starts.
+`keys.*`, `notify.*`. **`config set` / `unset` auto-reload a running daemon and
+every attached TUI live** — no restart. (Only `ui.spinner_ms` needs a restart.)
+`ruckus reload` forces a reload after a hand-edit of the file.
 
 ## Typical loop
 
