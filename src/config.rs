@@ -275,6 +275,9 @@ pub struct UiConfig {
     /// process (like tmux's pane_current_command), so agents started inside a
     /// shell still show up in the AGENTS list.
     pub detect_foreground: bool,
+    /// Foreground commands treated as "agents" (populate the AGENTS list). Keeps
+    /// transient commands like git/ls out of it. Empty = any non-shell command.
+    pub agent_commands: Vec<String>,
     /// Blank rows above the top bar / tab strip.
     pub top_margin: u16,
     /// Horizontal padding inside each tab "pill" in the strip.
@@ -320,6 +323,13 @@ impl Default for UiConfig {
             activity_quiet_ms: 900,
             detect_osc133: false,
             detect_foreground: false,
+            agent_commands: [
+                "claude", "codex", "aider", "goose", "opencode", "amp", "gemini",
+                "cursor-agent", "cline", "cody", "continue", "q",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             top_margin: 0,
             tab_pad: 1,
             pane_divider: true,
@@ -405,6 +415,7 @@ struct RawUi {
     activity_quiet_ms: Option<u64>,
     detect_osc133: Option<bool>,
     detect_foreground: Option<bool>,
+    agent_commands: Option<Vec<String>>,
     top_margin: Option<u16>,
     tab_pad: Option<u16>,
     pane_divider: Option<bool>,
@@ -563,6 +574,7 @@ impl Config {
             activity_quiet_ms: raw.ui.activity_quiet_ms.unwrap_or(d.activity_quiet_ms).clamp(200, 10_000),
             detect_osc133: raw.ui.detect_osc133.unwrap_or(d.detect_osc133),
             detect_foreground: raw.ui.detect_foreground.unwrap_or(d.detect_foreground),
+            agent_commands: raw.ui.agent_commands.unwrap_or(d.agent_commands),
             top_margin: raw.ui.top_margin.unwrap_or(d.top_margin).min(8),
             tab_pad: raw.ui.tab_pad.unwrap_or(d.tab_pad).min(4),
             pane_divider: raw.ui.pane_divider.unwrap_or(d.pane_divider),

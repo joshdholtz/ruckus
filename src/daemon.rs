@@ -253,6 +253,7 @@ struct State {
     quiet_after: std::time::Duration,
     detect_osc133: bool,
     detect_foreground: bool,
+    agent_commands: Vec<String>,
 }
 
 impl State {
@@ -321,6 +322,7 @@ pub async fn run() -> Result<()> {
         quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
+        agent_commands: cfg.ui.agent_commands.clone(),
     }));
 
     {
@@ -406,14 +408,16 @@ pub async fn run() -> Result<()> {
                 let pids: Vec<i32> = targets.iter().map(|(_, pid)| *pid).collect();
                 let names = resolve_fg_names(&pids);
                 let mut st = state.lock().unwrap();
+                let allow = st.agent_commands.clone();
                 let mut changed = false;
                 for (id, pid) in targets {
                     let base = names.get(&pid).map(|s| basename(s)).unwrap_or_default();
-                    let agent = if base.is_empty() || SHELLS.contains(&base.as_str()) {
-                        None
-                    } else {
-                        Some(base)
-                    };
+                    // Only known coding agents count — not transient commands (git, ls…).
+                    // An empty allowlist means "any non-shell command".
+                    let is_agent = !base.is_empty()
+                        && !SHELLS.contains(&base.as_str())
+                        && (allow.is_empty() || allow.iter().any(|a| a.eq_ignore_ascii_case(&base)));
+                    let agent = if is_agent { Some(base) } else { None };
                     if let Some(p) = st.panes.get_mut(&id) {
                         if p.info.agent != agent {
                             p.info.agent = agent;
@@ -811,6 +815,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
             st.detect_osc133 = cfg.ui.detect_osc133;
             st.detect_foreground = cfg.ui.detect_foreground;
+            st.agent_commands = cfg.ui.agent_commands.clone();
             info!("config reloaded; notifying {} clients", st.conns.len());
             broadcast(&st, ServerMsg::ConfigChanged);
             ServerMsg::Done

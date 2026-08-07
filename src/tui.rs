@@ -727,9 +727,13 @@ impl App {
                             .and_then(|c| c.rsplit('/').next())
                             .unwrap_or("");
                         // An agent = a detector reported one, or it was spawned
-                        // as a non-shell command.
-                        let is_agent =
-                            p.agent.is_some() || (!base.is_empty() && !SHELLS.contains(&base));
+                        // as a known agent command (allowlist; empty = any non-shell).
+                        let allow = &self.cfg.ui.agent_commands;
+                        let spawn_agent = !base.is_empty()
+                            && !SHELLS.contains(&base)
+                            && (allow.is_empty()
+                                || allow.iter().any(|a| a.eq_ignore_ascii_case(base)));
+                        let is_agent = p.agent.is_some() || spawn_agent;
                         if is_agent {
                             let label = p.agent.clone().unwrap_or_else(|| t.name.clone());
                             out.push((pid, label, s.name.clone()));
