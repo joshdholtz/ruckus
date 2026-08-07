@@ -1,0 +1,1544 @@
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::{Frame, Terminal};
+use tokio::sync::mpsc::unbounded_channel;
+
+use crate::client::{connect, ensure_daemon, resolve_pane, Client};
+use crate::config::{normalize_key, Action, Config};
+use crate::protocol::*;
+use crate::render::{encode_key, screen_to_lines};
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TOAST_SECS: u64 = 4;
+/// Below this width the sidebar auto-collapses (mobile SSH, narrow splits).
+const NARROW: u16 = 70;
+
+struct PaneView {
+    parser: vt100::Parser,
+    scroll: usize,
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    Space(u64),
+    Tab { space: u64, tab: u64, pane: u64 },
+    Pane(u64),
+}
+
+#[derive(Clone)]
+struct Menu {
+    x: u16,
+    y: u16,
+    pane: u64,
+    items: Vec<(&'static str, MenuAction)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MenuAction {
+    SplitRight,
+    SplitDown,
+    NewTab,
+    ClosePane,
+}
+
+struct Drag {
+    tab: u64,
+    path: Vec<usize>,
+    index: usize,
+    dir: Dir,
+}
+
+struct App {
+    cfg: Config,
+    client: Client,
+    snap: Snapshot,
+    views: HashMap<u64, PaneView>,
+    focused: u64,
+    /// Done panes the user has looked at — they leave the attention queue.
+    seen: HashSet<u64>,
+    cwd: String,
+    running: bool,
+    toast: Option<(String, Instant)>,
+    sidebar: bool,
+    /// Narrow-screen sidebar overlay (mobile SSH): same content, drawn over the panes.
+    drawer: bool,
+    help: bool,
+    menu: Option<Menu>,
+    drag: Option<Drag>,
+    hover: Option<(u16, u16)>,
+    tick: usize,
+    size: (u16, u16),
+    sidebar_rows: Vec<(u16, Target)>,
+    tab_hits: Vec<(Option<u64>, std::ops::Range<u16>)>,
+    footer_hits: Vec<(Action, std::ops::Range<u16>)>,
+    pane_rects: Vec<(u64, Rect)>,
+}
+
+fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
+    iter.max_by_key(|a| a.urgency()).unwrap_or(Activity::Idle)
+}
+
+fn tab_activity(snap: &Snapshot, tab: &TabInfo) -> Activity {
+    let mut leaves = Vec::new();
+    tab.layout.leaves(&mut leaves);
+    agg_activity(leaves.iter().filter_map(|p| snap.pane(*p)).map(|p| p.activity))
+}
+
+fn space_activity(snap: &Snapshot, space: &SpaceInfo) -> Activity {
+    agg_activity(space.tabs.iter().map(|t| tab_activity(snap, t)))
+}
+
+fn split_chunks(dir: Dir, n: usize, weights: &[u16], area: Rect) -> Vec<Rect> {
+    let cons: Vec<Constraint> = if weights.len() == n {
+        weights.iter().map(|w| Constraint::Fill(*w)).collect()
+    } else {
+        (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect()
+    };
+    let direction = match dir {
+        Dir::Right => Direction::Horizontal,
+        Dir::Down => Direction::Vertical,
+    };
+    // 1-cell gutters: the root background shows through between panes.
+    Layout::default()
+        .direction(direction)
+        .constraints(cons)
+        .spacing(1)
+        .split(area)
+        .to_vec()
+}
+
+fn node_rects(node: &Node, area: Rect, out: &mut Vec<(u64, Rect)>) {
+    match node {
+        Node::Leaf { pane } => out.push((*pane, area)),
+        Node::Split { dir, children, weights } => {
+            for (c, r) in children
+                .iter()
+                .zip(split_chunks(*dir, children.len(), weights, area))
+            {
+                node_rects(c, r, out);
+            }
+        }
+    }
+}
+
+/// Locate a draggable seam between two sibling panes at (col, row).
+fn find_border(
+    node: &Node,
+    area: Rect,
+    col: u16,
+    row: u16,
+    path: &mut Vec<usize>,
+) -> Option<(Vec<usize>, usize, Dir)> {
+    let Node::Split { dir, children, weights } = node else { return None };
+    let chunks = split_chunks(*dir, children.len(), weights, area);
+    for i in 0..children.len().saturating_sub(1) {
+        match dir {
+            Dir::Right => {
+                let b = chunks[i + 1].x;
+                if row >= area.y
+                    && row < area.y + area.height
+                    && (b.saturating_sub(2)..=b).contains(&col)
+                {
+                    return Some((path.clone(), i, Dir::Right));
+                }
+            }
+            Dir::Down => {
+                let b = chunks[i + 1].y;
+                if col >= area.x
+                    && col < area.x + area.width
+                    && (b.saturating_sub(2)..=b).contains(&row)
+                {
+                    return Some((path.clone(), i, Dir::Down));
+                }
+            }
+        }
+    }
+    for (i, (c, r)) in children.iter().zip(chunks.iter()).enumerate() {
+        if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+            path.push(i);
+            if let Some(hit) = find_border(c, *r, col, row, path) {
+                return Some(hit);
+            }
+            path.pop();
+        }
+    }
+    None
+}
+
+fn node_at_path_mut<'a>(node: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
+    if path.is_empty() {
+        return Some(node);
+    }
+    match node {
+        Node::Split { children, .. } => children
+            .get_mut(path[0])
+            .and_then(|c| node_at_path_mut(c, &path[1..])),
+        _ => None,
+    }
+}
+
+fn area_at_path(node: &Node, area: Rect, path: &[usize]) -> Option<Rect> {
+    if path.is_empty() {
+        return Some(area);
+    }
+    let Node::Split { dir, children, weights } = node else { return None };
+    let chunks = split_chunks(*dir, children.len(), weights, area);
+    let i = path[0];
+    children
+        .get(i)
+        .and_then(|c| area_at_path(c, *chunks.get(i)?, &path[1..]))
+}
+
+impl App {
+    fn active_space(&self) -> Option<SpaceInfo> {
+        self.snap
+            .spaces
+            .iter()
+            .find(|s| s.id == self.snap.active_space)
+            .or(self.snap.spaces.first())
+            .cloned()
+    }
+
+    fn active_tab(&self) -> Option<TabInfo> {
+        let s = self.active_space()?;
+        s.tabs
+            .iter()
+            .find(|t| t.id == s.active_tab)
+            .or(s.tabs.first())
+            .cloned()
+    }
+
+    fn visible(&self) -> Vec<u64> {
+        let mut v = Vec::new();
+        if let Some(t) = self.active_tab() {
+            t.layout.leaves(&mut v);
+        }
+        v
+    }
+
+    fn locate(&self, pane: u64) -> Option<(u64, u64)> {
+        for s in &self.snap.spaces {
+            for t in &s.tabs {
+                if t.layout.contains(pane) {
+                    return Some((s.id, t.id));
+                }
+            }
+        }
+        None
+    }
+
+    fn sidebar_shown(&self) -> bool {
+        self.sidebar && self.size.0 >= NARROW
+    }
+
+    fn main_x(&self) -> u16 {
+        if self.sidebar_shown() {
+            self.cfg.ui.sidebar_width.min(self.size.0.saturating_sub(20))
+        } else {
+            0
+        }
+    }
+
+    fn main_area(&self) -> Rect {
+        let (w, h) = self.size;
+        let x = self.main_x();
+        Rect::new(x, 2, w.saturating_sub(x), h.saturating_sub(3))
+    }
+
+    fn compute_rects(&self) -> Vec<(u64, Rect)> {
+        let mut out = Vec::new();
+        if let Some(t) = self.active_tab() {
+            node_rects(&t.layout, self.main_area(), &mut out);
+        }
+        out
+    }
+
+    fn toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    async fn sync(&mut self) {
+        self.size = crossterm::terminal::size().unwrap_or((80, 24));
+        let rects = self.compute_rects();
+        self.pane_rects = rects.clone();
+        let visible: Vec<u64> = rects.iter().map(|(p, _)| *p).collect();
+
+        let stale: Vec<u64> = self
+            .views
+            .keys()
+            .filter(|p| !visible.contains(p))
+            .copied()
+            .collect();
+        for p in stale {
+            self.views.remove(&p);
+            let _ = self.client.request(Request::Detach { pane: p }).await;
+        }
+
+        for (pane, rect) in rects {
+            // 1 row for the pane's title bar; content uses the full width.
+            let rows = rect.height.saturating_sub(1).max(1);
+            let cols = rect.width.max(1);
+            if !self.views.contains_key(&pane) {
+                match self.client.request(Request::Attach { pane, rows, cols }).await {
+                    Ok(ServerMsg::Attached { scrollback, .. }) => {
+                        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+                        if let Ok(bytes) = B64.decode(scrollback.as_bytes()) {
+                            parser.process(&bytes);
+                        }
+                        self.views.insert(pane, PaneView { parser, scroll: 0, rows, cols });
+                    }
+                    Err(e) => self.toast(e.to_string()),
+                    _ => {}
+                }
+            } else if let Some(v) = self.views.get_mut(&pane) {
+                if v.rows != rows || v.cols != cols {
+                    v.rows = rows;
+                    v.cols = cols;
+                    v.parser.set_size(rows, cols);
+                    let _ = self.client.request(Request::Resize { pane, rows, cols }).await;
+                }
+            }
+        }
+
+        if !visible.contains(&self.focused) {
+            let next = self
+                .active_tab()
+                .map(|t| t.active_pane)
+                .filter(|p| visible.contains(p))
+                .or_else(|| visible.first().copied());
+            if let Some(p) = next {
+                self.focused = p;
+            }
+        }
+    }
+
+    async fn set_active(&mut self, space: u64, tab: u64, pane: u64) {
+        self.snap.active_space = space;
+        if let Some(s) = self.snap.spaces.iter_mut().find(|s| s.id == space) {
+            s.active_tab = tab;
+            if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) {
+                t.active_pane = pane;
+            }
+        }
+        self.focused = pane;
+        self.mark_seen();
+        let _ = self.client.request(Request::SetActive { space, tab, pane }).await;
+        self.sync().await;
+    }
+
+    async fn goto_pane(&mut self, pane: u64) {
+        if let Some((s, t)) = self.locate(pane) {
+            self.set_active(s, t, pane).await;
+        }
+    }
+
+    async fn handle_sidebar_target(&mut self, target: Target) {
+        match target {
+            Target::Space(id) => {
+                let t = self.snap.spaces.iter().find(|s| s.id == id).and_then(|s| {
+                    s.tabs
+                        .iter()
+                        .find(|t| t.id == s.active_tab)
+                        .or(s.tabs.first())
+                        .map(|t| (s.id, t.id, t.active_pane))
+                });
+                if let Some((s, t, p)) = t {
+                    self.set_active(s, t, p).await;
+                }
+            }
+            Target::Tab { space, tab, pane } => self.set_active(space, tab, pane).await,
+            Target::Pane(p) => self.goto_pane(p).await,
+        }
+    }
+
+    fn drawer_width(&self) -> u16 {
+        self.cfg.ui.sidebar_width.min(self.size.0.saturating_sub(4))
+    }
+
+    fn scroll_by(&mut self, pane: u64, delta: isize) {
+        if let Some(v) = self.views.get_mut(&pane) {
+            v.scroll = (v.scroll as isize + delta).clamp(0, 10_000) as usize;
+            v.parser.set_scrollback(v.scroll);
+        }
+    }
+
+    fn attention(&self) -> Vec<&PaneInfo> {
+        let mut list: Vec<&PaneInfo> = self
+            .snap
+            .panes
+            .iter()
+            .filter(|p| match p.activity {
+                Activity::Waiting => true,
+                Activity::Done => !self.seen.contains(&p.id),
+                _ => false,
+            })
+            .collect();
+        list.sort_by_key(|p| std::cmp::Reverse(p.activity.urgency()));
+        list
+    }
+
+    fn mark_seen(&mut self) {
+        if let Some(p) = self.snap.pane(self.focused) {
+            if p.activity == Activity::Done {
+                self.seen.insert(p.id);
+            }
+        }
+    }
+
+    async fn split_action(&mut self, pane: u64, dir: Dir) {
+        let req = Request::Split { pane, dir, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
+        match self.client.request(req).await {
+            Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
+            Err(e) => self.toast(e.to_string()),
+            _ => {}
+        }
+    }
+
+    async fn new_tab_action(&mut self) {
+        let Some(space) = self.active_space().map(|s| s.id) else { return };
+        let req =
+            Request::NewTab { space, name: None, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
+        match self.client.request(req).await {
+            Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
+            Err(e) => self.toast(e.to_string()),
+            _ => {}
+        }
+    }
+
+    async fn close_pane_action(&mut self, pane: u64) {
+        if let Err(e) = self.client.request(Request::ClosePane { pane }).await {
+            self.toast(e.to_string());
+        }
+    }
+
+    async fn do_action(&mut self, a: Action) {
+        match a {
+            Action::Quit => self.running = false,
+            Action::ShowHelp => self.help = !self.help,
+            Action::ToggleSidebar => {
+                if self.size.0 < NARROW {
+                    self.drawer = !self.drawer;
+                } else {
+                    self.sidebar = !self.sidebar;
+                    self.sync().await;
+                }
+            }
+            Action::JumpWaiting => {
+                let next = self.attention().first().map(|p| p.id);
+                match next {
+                    Some(p) => self.goto_pane(p).await,
+                    None => self.toast("nothing needs you"),
+                }
+            }
+            Action::SplitRight => self.split_action(self.focused, Dir::Right).await,
+            Action::SplitDown => self.split_action(self.focused, Dir::Down).await,
+            Action::ClosePane => self.close_pane_action(self.focused).await,
+            Action::NextPane | Action::PrevPane => {
+                let vis = self.visible();
+                if vis.is_empty() {
+                    return;
+                }
+                let idx = vis.iter().position(|p| *p == self.focused).unwrap_or(0);
+                let next = if a == Action::NextPane {
+                    vis[(idx + 1) % vis.len()]
+                } else {
+                    vis[(idx + vis.len() - 1) % vis.len()]
+                };
+                self.goto_pane(next).await;
+            }
+            Action::NewTab => self.new_tab_action().await,
+            Action::NewSpace => {
+                let req = Request::NewSpace { name: None, cwd: Some(self.cwd.clone()) };
+                match self.client.request(req).await {
+                    Ok(ServerMsg::Created { space, tab, pane }) => {
+                        self.set_active(space, tab, pane).await
+                    }
+                    Err(e) => self.toast(e.to_string()),
+                    _ => {}
+                }
+            }
+            Action::NextTab | Action::PrevTab => {
+                let Some(s) = self.active_space() else { return };
+                if s.tabs.is_empty() {
+                    return;
+                }
+                let idx = s.tabs.iter().position(|t| t.id == s.active_tab).unwrap_or(0);
+                let next = if a == Action::NextTab {
+                    &s.tabs[(idx + 1) % s.tabs.len()]
+                } else {
+                    &s.tabs[(idx + s.tabs.len() - 1) % s.tabs.len()]
+                };
+                self.set_active(s.id, next.id, next.active_pane).await;
+            }
+            Action::NextSpace | Action::PrevSpace => {
+                if self.snap.spaces.is_empty() {
+                    return;
+                }
+                let idx = self
+                    .snap
+                    .spaces
+                    .iter()
+                    .position(|s| s.id == self.snap.active_space)
+                    .unwrap_or(0);
+                let n = self.snap.spaces.len();
+                let next = if a == Action::NextSpace {
+                    self.snap.spaces[(idx + 1) % n].clone()
+                } else {
+                    self.snap.spaces[(idx + n - 1) % n].clone()
+                };
+                let tab = next
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == next.active_tab)
+                    .or(next.tabs.first());
+                if let Some(t) = tab {
+                    self.set_active(next.id, t.id, t.active_pane).await;
+                }
+            }
+            Action::ScrollUp => self.scroll_by(self.focused, 5),
+            Action::ScrollDown => self.scroll_by(self.focused, -5),
+        }
+    }
+
+    async fn run_menu_item(&mut self, action: MenuAction, pane: u64) {
+        match action {
+            MenuAction::SplitRight => self.split_action(pane, Dir::Right).await,
+            MenuAction::SplitDown => self.split_action(pane, Dir::Down).await,
+            MenuAction::NewTab => self.new_tab_action().await,
+            MenuAction::ClosePane => self.close_pane_action(pane).await,
+        }
+    }
+
+    async fn on_key(&mut self, ev: KeyEvent) {
+        if ev.kind == KeyEventKind::Release {
+            return;
+        }
+        let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
+
+        if self.menu.is_some() {
+            self.menu = None;
+            if ev.code == KeyCode::Esc {
+                return;
+            }
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+
+        if ev.modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c @ '1'..='9') = ev.code {
+                let idx = c as usize - '1' as usize;
+                let target = self
+                    .active_space()
+                    .and_then(|s| s.tabs.get(idx).map(|t| (s.id, t.id, t.active_pane)));
+                if let Some((s, t, p)) = target {
+                    self.set_active(s, t, p).await;
+                }
+                return;
+            }
+        }
+        if let Some(a) = self.cfg.action_for(&ev) {
+            self.do_action(a).await;
+            return;
+        }
+        if let Some(bytes) = encode_key(&ev) {
+            if let Some(v) = self.views.get_mut(&self.focused) {
+                if v.scroll != 0 {
+                    v.scroll = 0;
+                    v.parser.set_scrollback(0);
+                }
+            }
+            let req = Request::Input { pane: self.focused, data: B64.encode(&bytes) };
+            if let Err(e) = self.client.request(req).await {
+                self.toast(e.to_string());
+            }
+        }
+    }
+
+    fn pane_at(&self, col: u16, row: u16) -> Option<u64> {
+        self.pane_rects
+            .iter()
+            .find(|(_, r)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+            .map(|(p, _)| *p)
+    }
+
+    fn menu_rect(&self, m: &Menu) -> Rect {
+        let w = (m.items.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(10) + 4) as u16;
+        let h = m.items.len() as u16 + 2;
+        let x = m.x.min(self.size.0.saturating_sub(w + 1));
+        let y = m.y.min(self.size.1.saturating_sub(h + 1));
+        Rect::new(x, y, w, h)
+    }
+
+    fn border_hit(&self, col: u16, row: u16) -> Option<(Vec<usize>, usize, Dir)> {
+        let t = self.active_tab()?;
+        let mut path = Vec::new();
+        find_border(&t.layout, self.main_area(), col, row, &mut path)
+    }
+
+    fn apply_drag(&mut self, col: u16, row: u16) {
+        let Some(drag) = &self.drag else { return };
+        let (tab_id, path, index, dir) = (drag.tab, drag.path.clone(), drag.index, drag.dir);
+        let main = self.main_area();
+        let Some(space) = self
+            .snap
+            .spaces
+            .iter_mut()
+            .find(|s| s.tabs.iter().any(|t| t.id == tab_id))
+        else {
+            return;
+        };
+        let Some(tab) = space.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let Some(split_area) = area_at_path(&tab.layout, main, &path) else { return };
+        let Some(Node::Split { dir: d, children, weights }) =
+            node_at_path_mut(&mut tab.layout, &path)
+        else {
+            return;
+        };
+        if *d != dir || index + 1 >= children.len() {
+            return;
+        }
+        let chunks = split_chunks(dir, children.len(), weights, split_area);
+        let mut sizes: Vec<u16> = chunks
+            .iter()
+            .map(|r| match dir {
+                Dir::Right => r.width,
+                Dir::Down => r.height,
+            })
+            .collect();
+        let start: u16 = match dir {
+            Dir::Right => chunks[index].x,
+            Dir::Down => chunks[index].y,
+        };
+        let pos = match dir {
+            Dir::Right => col,
+            Dir::Down => row,
+        };
+        let pair = sizes[index] + sizes[index + 1];
+        let first = pos
+            .saturating_sub(start)
+            .clamp(3, pair.saturating_sub(3).max(3));
+        sizes[index] = first;
+        sizes[index + 1] = pair.saturating_sub(first);
+        *weights = sizes.iter().map(|s| (*s).max(1)).collect();
+        self.pane_rects = self.compute_rects();
+    }
+
+    async fn finish_drag(&mut self) {
+        let Some(drag) = self.drag.take() else { return };
+        let layout = self
+            .snap
+            .spaces
+            .iter()
+            .flat_map(|s| s.tabs.iter())
+            .find(|t| t.id == drag.tab)
+            .map(|t| t.layout.clone());
+        if let Some(layout) = layout {
+            if let Err(e) = self.client.request(Request::SetLayout { tab: drag.tab, layout }).await
+            {
+                self.toast(e.to_string());
+            }
+        }
+        self.sync().await;
+    }
+
+    async fn on_mouse(&mut self, ev: MouseEvent) {
+        let (col, row) = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Moved => {
+                self.hover = Some((col, row));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.hover = Some((col, row));
+                if self.drag.is_some() {
+                    self.apply_drag(col, row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.is_some() {
+                    self.finish_drag().await;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(pane) = self.pane_at(col, row) {
+                    self.goto_pane(pane).await;
+                    self.menu = Some(Menu {
+                        x: col,
+                        y: row,
+                        pane,
+                        items: vec![
+                            ("split right", MenuAction::SplitRight),
+                            ("split down", MenuAction::SplitDown),
+                            ("new tab", MenuAction::NewTab),
+                            ("close pane", MenuAction::ClosePane),
+                        ],
+                    });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.help {
+                    self.help = false;
+                    return;
+                }
+                if self.drawer {
+                    if col < self.drawer_width() && row >= 1 {
+                        let target = self
+                            .sidebar_rows
+                            .iter()
+                            .find(|(r, _)| *r == row)
+                            .map(|(_, t)| *t);
+                        if let Some(t) = target {
+                            self.drawer = false;
+                            self.handle_sidebar_target(t).await;
+                            return;
+                        }
+                        return; // tap inside drawer chrome — keep it open
+                    }
+                    self.drawer = false;
+                    return;
+                }
+                if let Some(m) = self.menu.clone() {
+                    let r = self.menu_rect(&m);
+                    self.menu = None;
+                    if col > r.x && col < r.x + r.width - 1 && row > r.y && row < r.y + r.height - 1
+                    {
+                        let idx = (row - r.y - 1) as usize;
+                        if let Some((_, action)) = m.items.get(idx) {
+                            self.run_menu_item(*action, m.pane).await;
+                        }
+                    }
+                    return;
+                }
+                if row >= 2 {
+                    if let Some((path, index, dir)) = self.border_hit(col, row) {
+                        if let Some(t) = self.active_tab() {
+                            self.drag = Some(Drag { tab: t.id, path, index, dir });
+                        }
+                        return;
+                    }
+                }
+                if row == 0 {
+                    // logo tap toggles the sidebar; stats tap jumps to attention
+                    if col < 10 {
+                        self.do_action(Action::ToggleSidebar).await;
+                    } else if col > self.size.0.saturating_sub(40) {
+                        self.do_action(Action::JumpWaiting).await;
+                    }
+                    return;
+                }
+                if row == self.size.1.saturating_sub(1) {
+                    let hit = self
+                        .footer_hits
+                        .iter()
+                        .find(|(_, r)| r.contains(&col))
+                        .map(|(a, _)| *a);
+                    if let Some(a) = hit {
+                        self.do_action(a).await;
+                    }
+                    return;
+                }
+                if self.sidebar_shown() && col < self.main_x() {
+                    let target = self
+                        .sidebar_rows
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .map(|(_, t)| *t);
+                    if let Some(t) = target {
+                        self.handle_sidebar_target(t).await;
+                    }
+                    return;
+                }
+                if row == 1 {
+                    let hit = self
+                        .tab_hits
+                        .iter()
+                        .find(|(_, r)| r.contains(&col))
+                        .map(|(id, _)| *id);
+                    match hit {
+                        Some(Some(tab)) => {
+                            if let Some(s) = self.active_space() {
+                                let target = s
+                                    .tabs
+                                    .iter()
+                                    .find(|t| t.id == tab)
+                                    .map(|t| (s.id, t.id, t.active_pane));
+                                if let Some((sp, t, p)) = target {
+                                    self.set_active(sp, t, p).await;
+                                }
+                            }
+                        }
+                        Some(None) => self.new_tab_action().await,
+                        None => {}
+                    }
+                } else if let Some(pane) = self.pane_at(col, row) {
+                    if let Some((s, t)) = self.locate(pane) {
+                        self.set_active(s, t, pane).await;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(pane) = self.pane_at(col, row) {
+                    self.scroll_by(pane, 3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(pane) = self.pane_at(col, row) {
+                    self.scroll_by(pane, -3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn on_server(&mut self, msg: ServerMsg) {
+        match msg {
+            ServerMsg::State { snapshot } => {
+                self.drag = None;
+                self.snap = snapshot;
+                self.sync().await;
+            }
+            ServerMsg::Output { pane, data } => {
+                if let Some(v) = self.views.get_mut(&pane) {
+                    if let Ok(bytes) = B64.decode(data.as_bytes()) {
+                        v.parser.process(&bytes);
+                    }
+                }
+            }
+            ServerMsg::Activity { pane, activity } => {
+                if let Some(p) = self.snap.pane_mut(pane) {
+                    p.activity = activity;
+                }
+            }
+            ServerMsg::Exited { pane, code } => {
+                if let Some(p) = self.snap.pane_mut(pane) {
+                    p.status = PaneStatus::Exited { code };
+                    p.activity = Activity::Done;
+                }
+                // Already looking at it counts as seen; otherwise it joins NEEDS YOU.
+                if pane == self.focused {
+                    self.seen.insert(pane);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn on_term_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(k) => self.on_key(k).await,
+            Event::Mouse(m) => self.on_mouse(m).await,
+            Event::Resize(_, _) => self.sync().await,
+            _ => {}
+        }
+    }
+
+    fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if let Some((_, at)) = &self.toast {
+            if at.elapsed().as_secs() >= TOAST_SECS {
+                self.toast = None;
+            }
+        }
+    }
+
+    /// Glyph + color for an activity state; working animates, waiting pulses.
+    fn glyph(&self, info: Option<&PaneInfo>) -> (String, Color) {
+        let th = &self.cfg.theme;
+        match info.map(|i| (i.activity, i.status)) {
+            Some((Activity::Working, _)) => {
+                (SPINNER[self.tick % SPINNER.len()].to_string(), th.working)
+            }
+            Some((Activity::Waiting, _)) => {
+                let g = if (self.tick / 4) % 2 == 0 { "◉" } else { "○" };
+                (g.to_string(), th.waiting)
+            }
+            Some((Activity::Done, PaneStatus::Exited { code })) => (
+                "◍".to_string(),
+                if code == 0 { th.done_ok } else { th.done_err },
+            ),
+            Some((Activity::Done, _)) => ("◍".to_string(), th.done_ok),
+            _ => ("○".to_string(), th.idle),
+        }
+    }
+
+    fn state_glyph(&self, a: Activity) -> (String, Color) {
+        let th = &self.cfg.theme;
+        match a {
+            Activity::Working => (SPINNER[self.tick % SPINNER.len()].to_string(), th.working),
+            Activity::Waiting => {
+                let g = if (self.tick / 4) % 2 == 0 { "◉" } else { "○" };
+                (g.to_string(), th.waiting)
+            }
+            Activity::Done => ("◍".to_string(), th.done_ok),
+            Activity::Idle => ("○".to_string(), th.idle),
+        }
+    }
+
+    fn hover_at(&self, col_range: &std::ops::Range<u16>, row: u16) -> bool {
+        self.hover
+            .map(|(c, r)| r == row && col_range.contains(&c))
+            .unwrap_or(false)
+    }
+
+    fn draw_header(&self, f: &mut Frame, area: Rect) {
+        let th = &self.cfg.theme;
+        // On narrow screens the logo doubles as the drawer button — show the handle.
+        let logo_text = if area.width < NARROW { " ☰ ruckus " } else { "  ruckus  " };
+        let logo = Span::styled(
+            logo_text,
+            Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
+        );
+        let crumb = match (self.active_space(), self.active_tab()) {
+            (Some(s), Some(t)) => format!("  {}  ›  {}", s.name, t.name),
+            (Some(s), None) => format!("  {}", s.name),
+            _ => String::new(),
+        };
+        let crumb_span = Span::styled(crumb.clone(), Style::default().fg(th.bar_active_fg));
+
+        let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
+        let working = self.snap.panes.iter().filter(|p| p.activity == Activity::Working).count();
+        let done = self
+            .snap
+            .panes
+            .iter()
+            .filter(|p| p.activity == Activity::Done && !self.seen.contains(&p.id))
+            .count();
+        let mut right: Vec<Span> = Vec::new();
+        let mut right_len = 0usize;
+        for (n, label, activity) in [
+            (waiting, "waiting", Activity::Waiting),
+            (working, "working", Activity::Working),
+            (done, "done", Activity::Done),
+        ] {
+            if n > 0 {
+                let (g, color) = self.state_glyph(activity);
+                let text = format!("{n} {label}   ");
+                right_len += g.chars().count() + 1 + text.chars().count();
+                right.push(Span::styled(format!("{g} "), Style::default().fg(color)));
+                right.push(Span::styled(text, Style::default().fg(th.bar_active_fg)));
+            }
+        }
+
+        let used = 10 + crumb.chars().count() + right_len;
+        let pad = (area.width as usize).saturating_sub(used);
+        let mut spans = vec![logo, crumb_span, Span::raw(" ".repeat(pad))];
+        spans.extend(right);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
+    }
+
+    fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
+        let th = self.cfg.theme.clone();
+        let inner = area;
+        f.render_widget(
+            Paragraph::new("").style(Style::default().bg(th.sidebar_bg)),
+            area,
+        );
+
+        let w = inner.width as usize;
+        let hover_row = self
+            .hover
+            .filter(|(c, _)| *c < area.width)
+            .map(|(_, r)| r);
+        let mut lines: Vec<Line> = Vec::new();
+        let mut rows: Vec<(u16, Target)> = Vec::new();
+        let mut y = inner.y;
+
+        macro_rules! push {
+            ($line:expr, $target:expr) => {{
+                if let Some(t) = $target {
+                    rows.push((y, t));
+                }
+                lines.push($line);
+                #[allow(unused_assignments)]
+                {
+                    y += 1;
+                }
+            }};
+        }
+
+        push!(Line::raw(""), None::<Target>);
+
+        let attention: Vec<(u64, String, String, Color)> = self
+            .attention()
+            .iter()
+            .map(|p| {
+                let (g, c) = self.glyph(Some(p));
+                (p.id, p.title.clone(), g, c)
+            })
+            .collect();
+        if !attention.is_empty() {
+            push!(
+                Line::from(Span::styled(
+                    " NEEDS YOU",
+                    Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+                )),
+                None::<Target>
+            );
+            for (id, title, g, color) in attention {
+                let selected = id == self.focused;
+                let hovered = hover_row == Some(y);
+                let name: String = title.chars().take(w.saturating_sub(6)).collect();
+                let pad = w.saturating_sub(4 + name.chars().count());
+                let style = if selected || hovered {
+                    Style::default().bg(th.select_bg)
+                } else {
+                    Style::default()
+                };
+                push!(
+                    Line::from(vec![
+                        Span::styled(format!("  {g} "), style.fg(color)),
+                        Span::styled(
+                            format!("{name}{}", " ".repeat(pad)),
+                            style.fg(th.bar_active_fg),
+                        ),
+                    ]),
+                    Some(Target::Pane(id))
+                );
+            }
+            push!(Line::raw(""), None::<Target>);
+        }
+
+        push!(
+            Line::from(Span::styled(
+                " SPACES",
+                Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+            )),
+            None::<Target>
+        );
+        let spaces = self.snap.spaces.clone();
+        for s in &spaces {
+            let s_active = s.id == self.snap.active_space;
+            let (g, s_color) = self.state_glyph(space_activity(&self.snap, s));
+            let hovered = hover_row == Some(y);
+            let pad = w.saturating_sub(4 + s.name.chars().count());
+            let row_style = if s_active || hovered {
+                Style::default().bg(th.select_bg)
+            } else {
+                Style::default()
+            };
+            push!(
+                Line::from(vec![
+                    Span::styled(format!(" {g} "), row_style.fg(s_color)),
+                    Span::styled(
+                        format!("{}{}", s.name, " ".repeat(pad)),
+                        row_style
+                            .fg(if s_active { th.accent } else { th.bar_active_fg })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Some(Target::Space(s.id))
+            );
+            for t in &s.tabs {
+                let t_active = s_active && t.id == s.active_tab;
+                let (g, t_color) = self.state_glyph(tab_activity(&self.snap, t));
+                let hovered = hover_row == Some(y);
+                let pad = w.saturating_sub(7 + t.name.chars().count());
+                let row_style = if t_active || hovered {
+                    Style::default().bg(th.select_bg)
+                } else {
+                    Style::default()
+                };
+                push!(
+                    Line::from(vec![
+                        Span::styled(format!("    {g} "), row_style.fg(t_color)),
+                        Span::styled(
+                            format!("{}{}", t.name, " ".repeat(pad)),
+                            row_style.fg(if t_active { th.bar_active_fg } else { th.bar_fg }),
+                        ),
+                    ]),
+                    Some(Target::Tab { space: s.id, tab: t.id, pane: t.active_pane })
+                );
+            }
+        }
+
+        lines.truncate(inner.height as usize);
+        self.sidebar_rows = rows;
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(th.sidebar_bg)),
+            inner,
+        );
+    }
+
+    fn draw_tab_strip(&mut self, f: &mut Frame, area: Rect) {
+        let th = self.cfg.theme.clone();
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        let mut hits: Vec<(Option<u64>, std::ops::Range<u16>)> = Vec::new();
+        let mut x = area.x + 1;
+        if let Some(s) = self.active_space() {
+            for (i, t) in s.tabs.iter().enumerate() {
+                let active = t.id == s.active_tab;
+                let (g, color) = self.state_glyph(tab_activity(&self.snap, t));
+                let label = format!(" {} {} ", i + 1, t.name);
+                let width = (label.chars().count() + 2) as u16;
+                let range = x..x + width;
+                let hovered = self.hover_at(&range, area.y);
+                let style = if active {
+                    Style::default()
+                        .bg(th.select_bg)
+                        .fg(th.bar_active_fg)
+                        .add_modifier(Modifier::BOLD)
+                } else if hovered {
+                    Style::default().bg(th.select_bg).fg(th.bar_active_fg)
+                } else {
+                    Style::default().fg(th.bar_fg)
+                };
+                spans.push(Span::styled(format!("{g} "), style.fg(color)));
+                spans.push(Span::styled(label, style));
+                spans.push(Span::raw(" "));
+                hits.push((Some(t.id), range));
+                x += width + 1;
+            }
+        }
+        let plus_range = x..x + 3;
+        let plus_hover = self.hover_at(&plus_range, area.y);
+        spans.push(Span::styled(
+            " + ",
+            if plus_hover {
+                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.status_fg)
+            },
+        ));
+        hits.push((None, plus_range));
+        self.tab_hits = hits;
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
+    }
+
+    fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
+        let th = self.cfg.theme.clone();
+        let c = &self.cfg;
+        let narrow = area.width < NARROW;
+        let mut chips: Vec<(Action, String, &str)> = vec![
+            (Action::JumpWaiting, c.label(Action::JumpWaiting), "next"),
+            (Action::SplitRight, c.label(Action::SplitRight), "split"),
+            (Action::SplitDown, c.label(Action::SplitDown), "split↓"),
+            (Action::NewTab, c.label(Action::NewTab), "tab"),
+            (Action::NewSpace, c.label(Action::NewSpace), "space"),
+            (Action::ClosePane, c.label(Action::ClosePane), "close"),
+            (Action::ToggleSidebar, c.label(Action::ToggleSidebar), "bar"),
+            (Action::ShowHelp, c.label(Action::ShowHelp), "help"),
+            (Action::Quit, c.label(Action::Quit), "quit"),
+        ];
+        if narrow {
+            // On narrow/mobile screens show tap-first chips without key labels.
+            chips = vec![
+                (Action::JumpWaiting, "".into(), "next"),
+                (Action::SplitRight, "".into(), "split"),
+                (Action::SplitDown, "".into(), "split↓"),
+                (Action::NewTab, "".into(), "+tab"),
+                (Action::ClosePane, "".into(), "close"),
+                (Action::ShowHelp, "".into(), "?"),
+                (Action::Quit, "".into(), "quit"),
+            ];
+        }
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        let mut hits: Vec<(Action, std::ops::Range<u16>)> = Vec::new();
+        let mut x: u16 = 1;
+        for (action, key, label) in chips {
+            let text = if key.is_empty() {
+                format!("[{label}]")
+            } else {
+                format!("{key} {label}")
+            };
+            let width = text.chars().count() as u16;
+            let range = x..x + width;
+            let hovered = self.hover_at(&range, area.y);
+            let key_style = if hovered {
+                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            };
+            let label_style = if hovered {
+                Style::default().bg(th.select_bg).fg(th.bar_active_fg)
+            } else {
+                Style::default().fg(th.status_fg)
+            };
+            if key.is_empty() {
+                spans.push(Span::styled(text.clone(), key_style));
+            } else {
+                spans.push(Span::styled(key.clone(), key_style));
+                spans.push(Span::styled(format!(" {label}"), label_style));
+            }
+            spans.push(Span::raw("   "));
+            hits.push((action, range));
+            x += width + 3;
+        }
+        self.footer_hits = hits;
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
+    }
+
+    fn draw_panes(&mut self, f: &mut Frame) {
+        let th = self.cfg.theme.clone();
+        let rects = self.pane_rects.clone();
+        let many = rects.len() > 1;
+        for (pane, rect) in &rects {
+            if rect.width < 3 || rect.height < 2 {
+                continue;
+            }
+            let focused = *pane == self.focused;
+            let info = self.snap.pane(*pane);
+            let (g, dot) = self.glyph(info);
+            let title_text = info.map(|i| i.title.clone()).unwrap_or_else(|| pane.to_string());
+            let scroll = self.views.get(pane).map(|v| v.scroll).unwrap_or(0);
+
+            // Filled title bar — the IDE tab strip look, no box borders.
+            let bar_bg = if focused { th.select_bg } else { th.bar_bg };
+            let mut title_spans = vec![
+                Span::styled(
+                    if focused { "▎" } else { " " },
+                    Style::default().fg(th.accent).bg(bar_bg),
+                ),
+                Span::styled(format!("{g} "), Style::default().fg(dot).bg(bar_bg)),
+                Span::styled(
+                    format!("{title_text} "),
+                    if focused {
+                        Style::default()
+                            .fg(th.bar_active_fg)
+                            .bg(bar_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.bar_fg).bg(bar_bg)
+                    },
+                ),
+            ];
+            if scroll > 0 {
+                title_spans.push(Span::styled(
+                    format!(" ↑{scroll} "),
+                    Style::default().fg(th.waiting).bg(bar_bg),
+                ));
+            }
+            if let Some(PaneInfo { status: PaneStatus::Exited { code }, .. }) = info {
+                title_spans.push(Span::styled(
+                    format!(" exit {code} "),
+                    Style::default()
+                        .fg(if *code == 0 { th.done_ok } else { th.done_err })
+                        .bg(bar_bg),
+                ));
+            }
+            let title_rect = Rect::new(rect.x, rect.y, rect.width, 1);
+            f.render_widget(
+                Paragraph::new(Line::from(title_spans)).style(Style::default().bg(bar_bg)),
+                title_rect,
+            );
+
+            // Content on its own surface layer.
+            let content = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 1);
+            let dimmed = many && !focused;
+            if let Some(v) = self.views.get(pane) {
+                let lines = screen_to_lines(v.parser.screen(), focused && scroll == 0, dimmed);
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(th.surface)),
+                    content,
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new("").style(Style::default().bg(th.surface)),
+                    content,
+                );
+            }
+        }
+    }
+
+    fn draw_menu(&self, f: &mut Frame) {
+        let Some(m) = &self.menu else { return };
+        let th = &self.cfg.theme;
+        let r = self.menu_rect(m);
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let lines: Vec<Line> = m
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _))| {
+                let row = r.y + 1 + i as u16;
+                let hovered = self
+                    .hover
+                    .map(|(c, rr)| rr == row && c > r.x && c < r.x + r.width - 1)
+                    .unwrap_or(false);
+                let style = if hovered {
+                    Style::default().bg(th.select_bg).fg(th.bar_active_fg)
+                } else {
+                    Style::default().fg(th.bar_active_fg)
+                };
+                Line::from(Span::styled(
+                    format!(" {label}{} ", " ".repeat((inner.width as usize).saturating_sub(label.chars().count() + 2))),
+                    style,
+                ))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_help(&self, f: &mut Frame) {
+        if !self.help {
+            return;
+        }
+        let th = &self.cfg.theme;
+        let entries: Vec<(String, &str)> = vec![
+            (self.cfg.label(Action::JumpWaiting), "jump to next pane that needs you"),
+            (self.cfg.label(Action::SplitRight), "split pane right"),
+            (self.cfg.label(Action::SplitDown), "split pane down"),
+            (self.cfg.label(Action::ClosePane), "close pane"),
+            (self.cfg.label(Action::NextPane), "focus next pane"),
+            (self.cfg.label(Action::PrevPane), "focus previous pane"),
+            (self.cfg.label(Action::NewTab), "new tab"),
+            (self.cfg.label(Action::NextTab), "next tab"),
+            (self.cfg.label(Action::PrevTab), "previous tab"),
+            (self.cfg.label(Action::NewSpace), "new space"),
+            (self.cfg.label(Action::NextSpace), "next space"),
+            (self.cfg.label(Action::PrevSpace), "previous space"),
+            (self.cfg.label(Action::ScrollUp), "scroll history up"),
+            (self.cfg.label(Action::ScrollDown), "scroll history down"),
+            (self.cfg.label(Action::ToggleSidebar), "toggle sidebar"),
+            ("alt+1..9".into(), "jump to tab"),
+            (self.cfg.label(Action::Quit), "quit (daemon keeps running)"),
+            ("".into(), ""),
+            ("mouse".into(), "click to focus · right-click for menu"),
+            ("".into(), "drag pane borders to resize · wheel scrolls"),
+        ];
+        let w: u16 = 56;
+        let h = entries.len() as u16 + 4;
+        let x = self.size.0.saturating_sub(w) / 2;
+        let y = self.size.1.saturating_sub(h) / 2;
+        let r = Rect::new(x, y, w.min(self.size.0), h.min(self.size.1));
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg))
+            .title(Line::from(Span::styled(
+                " keys ",
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let lines: Vec<Line> = std::iter::once(Line::raw(""))
+            .chain(entries.iter().map(|(k, d)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {k:>12}  "),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(d.to_string(), Style::default().fg(th.bar_active_fg)),
+                ])
+            }))
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_toast(&self, f: &mut Frame) {
+        let Some((msg, _)) = &self.toast else { return };
+        let th = &self.cfg.theme;
+        let w = (msg.chars().count() as u16 + 4).min(self.size.0.saturating_sub(2));
+        let r = Rect::new(
+            self.size.0.saturating_sub(w + 2),
+            self.size.1.saturating_sub(4),
+            w,
+            3,
+        );
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.bar_bg));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {msg}"),
+                Style::default().fg(th.bar_active_fg),
+            ))),
+            inner,
+        );
+    }
+
+    fn draw(&mut self, f: &mut Frame) {
+        self.size = (f.area().width, f.area().height);
+        let area = f.area();
+        if area.height < 6 || area.width < 24 {
+            f.render_widget(Paragraph::new("window too small"), area);
+            return;
+        }
+
+        // Root layer: darkest background, visible as gutters between panes.
+        f.render_widget(
+            Paragraph::new("").style(Style::default().bg(self.cfg.theme.bg)),
+            area,
+        );
+
+        self.draw_header(f, Rect::new(0, 0, area.width, 1));
+
+        if self.sidebar_shown() {
+            let sw = self.main_x();
+            self.draw_sidebar(f, Rect::new(0, 1, sw, area.height - 2));
+        } else {
+            self.sidebar_rows.clear();
+        }
+
+        let mx = self.main_x();
+        self.draw_tab_strip(f, Rect::new(mx, 1, area.width - mx, 1));
+        self.draw_panes(f);
+        self.draw_footer(f, Rect::new(0, area.height - 1, area.width, 1));
+        if self.drawer && self.size.0 < NARROW {
+            let r = Rect::new(0, 1, self.drawer_width(), area.height - 2);
+            f.render_widget(Clear, r);
+            self.draw_sidebar(f, r);
+        } else if self.size.0 >= NARROW {
+            self.drawer = false;
+        }
+        self.draw_menu(f);
+        self.draw_help(f);
+        self.draw_toast(f);
+    }
+}
+
+pub async fn run(initial: Option<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let cfg = Config::load();
+    let (client, mut events) = connect().await?;
+    let snap = client.snapshot().await?;
+
+    let focused = snap
+        .spaces
+        .iter()
+        .find(|s| s.id == snap.active_space)
+        .or(snap.spaces.first())
+        .and_then(|s| s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()))
+        .map(|t| t.active_pane)
+        .unwrap_or(0);
+
+    let sidebar = cfg.ui.show_sidebar;
+    let mut app = App {
+        cfg,
+        client,
+        snap,
+        views: HashMap::new(),
+        focused,
+        seen: HashSet::new(),
+        cwd: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/".to_string()),
+        running: true,
+        toast: None,
+        sidebar,
+        drawer: false,
+        help: false,
+        menu: None,
+        drag: None,
+        hover: None,
+        tick: 0,
+        size: crossterm::terminal::size().unwrap_or((80, 24)),
+        sidebar_rows: Vec::new(),
+        tab_hits: Vec::new(),
+        footer_hits: Vec::new(),
+        pane_rects: Vec::new(),
+    };
+
+    if let Some(target) = initial {
+        let pane = resolve_pane(&app.snap, &target)?;
+        if let Some((s, t)) = app.locate(pane.id) {
+            app.set_active(s, t, pane.id).await;
+        }
+    }
+
+    enable_raw_mode()?;
+    if app.cfg.ui.mouse {
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    } else {
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    }
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        hook(info);
+    }));
+
+    app.sync().await;
+
+    let (in_tx, mut in_rx) = unbounded_channel::<Event>();
+    std::thread::spawn(move || loop {
+        match crossterm::event::poll(Duration::from_millis(50)) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(ev) => {
+                    if in_tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            },
+            Ok(false) => {
+                if in_tx.is_closed() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    while app.running {
+        terminal.draw(|f| app.draw(f))?;
+        tokio::select! {
+            ev = in_rx.recv() => match ev {
+                Some(e) => app.on_term_event(e).await,
+                None => app.running = false,
+            },
+            msg = events.recv() => match msg {
+                Some(m) => app.on_server(m).await,
+                None => {
+                    app.running = false;
+                    eprintln!("daemon connection lost");
+                }
+            },
+            _ = ticker.tick() => app.on_tick(),
+        }
+        while let Ok(e) = in_rx.try_recv() {
+            app.on_term_event(e).await;
+        }
+        while let Ok(m) = events.try_recv() {
+            app.on_server(m).await;
+        }
+    }
+
+    disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
