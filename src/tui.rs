@@ -595,8 +595,13 @@ impl App {
                             .first()
                             .and_then(|c| c.rsplit('/').next())
                             .unwrap_or("");
-                        if !base.is_empty() && !SHELLS.contains(&base) {
-                            out.push((pid, t.name.clone(), s.name.clone()));
+                        // An agent = a detector reported one, or it was spawned
+                        // as a non-shell command.
+                        let is_agent =
+                            p.agent.is_some() || (!base.is_empty() && !SHELLS.contains(&base));
+                        if is_agent {
+                            let label = p.agent.clone().unwrap_or_else(|| t.name.clone());
+                            out.push((pid, label, s.name.clone()));
                         }
                     }
                 }

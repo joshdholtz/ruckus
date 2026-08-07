@@ -42,6 +42,9 @@ pub enum Request {
     /// back to heuristic detection). Lets OSC 133 / shell-integration and
     /// foreground-process detectors live as plugins instead of core behaviour.
     ReportActivity { pane: u64, state: String },
+    /// Detector seam: report the agent running in a pane (e.g. "claude"), or
+    /// `null` to clear. Sets PaneInfo.agent, which drives the AGENTS list.
+    ReportAgent { pane: u64, name: Option<String> },
     /// Re-read config.toml: daemon refreshes its own settings and tells every
     /// attached client to reload and re-render.
     Reload,
@@ -257,6 +260,10 @@ pub struct PaneInfo {
     pub status: PaneStatus,
     pub activity: Activity,
     pub created: u64,
+    /// Detected agent name (e.g. "claude"), if a detector reported one — set by
+    /// the foreground-process detector or an external plugin via report_agent.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

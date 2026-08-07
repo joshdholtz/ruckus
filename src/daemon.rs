@@ -252,6 +252,7 @@ struct State {
     notify_done: bool,
     quiet_after: std::time::Duration,
     detect_osc133: bool,
+    detect_foreground: bool,
 }
 
 impl State {
@@ -319,6 +320,7 @@ pub async fn run() -> Result<()> {
         notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
         quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
         detect_osc133: cfg.ui.detect_osc133,
+        detect_foreground: cfg.ui.detect_foreground,
     }));
 
     {
@@ -373,6 +375,54 @@ pub async fn run() -> Result<()> {
                 // ~ every 5s (ticker runs at 250ms)
                 if n % 20 == 0 {
                     flush_scrollbacks(&mut st);
+                }
+            }
+        });
+    }
+
+    // Foreground-process detector (opt-in): identify the agent running in each
+    // pane from its foreground process group — like tmux's pane_current_command —
+    // so agents launched inside a shell still populate the AGENTS list.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
+            loop {
+                tick.tick().await;
+                let targets: Vec<(u64, i32)> = {
+                    let st = state.lock().unwrap();
+                    if !st.detect_foreground {
+                        continue;
+                    }
+                    st.panes
+                        .iter()
+                        .filter(|(_, p)| p.info.status == PaneStatus::Running)
+                        .filter_map(|(id, p)| p.master.process_group_leader().map(|pid| (*id, pid)))
+                        .collect()
+                };
+                if targets.is_empty() {
+                    continue;
+                }
+                let pids: Vec<i32> = targets.iter().map(|(_, pid)| *pid).collect();
+                let names = resolve_fg_names(&pids);
+                let mut st = state.lock().unwrap();
+                let mut changed = false;
+                for (id, pid) in targets {
+                    let base = names.get(&pid).map(|s| basename(s)).unwrap_or_default();
+                    let agent = if base.is_empty() || SHELLS.contains(&base.as_str()) {
+                        None
+                    } else {
+                        Some(base)
+                    };
+                    if let Some(p) = st.panes.get_mut(&id) {
+                        if p.info.agent != agent {
+                            p.info.agent = agent;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    broadcast_state(&st);
                 }
             }
         });
@@ -627,6 +677,17 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             }
             ServerMsg::Done
         }
+        Request::ReportAgent { pane, name } => {
+            let mut st = state.lock().unwrap();
+            let Some(p) = st.panes.get_mut(&pane) else {
+                return err(format!("no pane {pane}"));
+            };
+            if p.info.agent != name {
+                p.info.agent = name;
+                broadcast_state(&st);
+            }
+            ServerMsg::Done
+        }
         Request::Reload => {
             let mut st = state.lock().unwrap();
             let cfg = crate::config::Config::load();
@@ -634,6 +695,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             st.notify_done = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
             st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
             st.detect_osc133 = cfg.ui.detect_osc133;
+            st.detect_foreground = cfg.ui.detect_foreground;
             info!("config reloaded; notifying {} clients", st.conns.len());
             broadcast(&st, ServerMsg::ConfigChanged);
             ServerMsg::Done
@@ -717,6 +779,7 @@ fn spawn_pane_with_id(
         status: PaneStatus::Running,
         activity: Activity::Working,
         created: unix_now(),
+        agent: None,
     };
 
     let mut screen = vt100::Parser::new(24, 80, 0);
@@ -808,6 +871,30 @@ fn scan_osc133(bytes: &[u8]) -> Option<&'static str> {
         }
     }
     result
+}
+
+/// Resolve foreground pids to their command name via one `ps` call
+/// (pid -> comm; macOS gives a path, so callers basename it).
+fn resolve_fg_names(pids: &[i32]) -> HashMap<i32, String> {
+    let mut map = HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "pid=,comm=", "-p", &list])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if let Some((pid_s, comm)) = line.split_once(char::is_whitespace) {
+                if let Ok(pid) = pid_s.trim().parse::<i32>() {
+                    map.insert(pid, comm.trim().to_string());
+                }
+            }
+        }
+    }
+    map
 }
 
 async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<SessionEvent>) {

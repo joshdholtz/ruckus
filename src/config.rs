@@ -271,6 +271,10 @@ pub struct UiConfig {
     /// Opt-in: read OSC 133 shell-integration marks (FinalTerm FTCS) for exact
     /// command start/finish, overriding the output heuristic. Needs shell integration.
     pub detect_osc133: bool,
+    /// Opt-in: identify the agent in each pane by inspecting its foreground
+    /// process (like tmux's pane_current_command), so agents started inside a
+    /// shell still show up in the AGENTS list.
+    pub detect_foreground: bool,
     /// Blank rows above the top bar / tab strip.
     pub top_margin: u16,
     /// Horizontal padding inside each tab "pill" in the strip.
@@ -313,6 +317,7 @@ impl Default for UiConfig {
             working_style: WorkingStyle::Spinner,
             activity_quiet_ms: 900,
             detect_osc133: false,
+            detect_foreground: false,
             top_margin: 0,
             tab_pad: 1,
             pane_divider: true,
@@ -396,6 +401,7 @@ struct RawUi {
     working_style: Option<String>,
     activity_quiet_ms: Option<u64>,
     detect_osc133: Option<bool>,
+    detect_foreground: Option<bool>,
     top_margin: Option<u16>,
     tab_pad: Option<u16>,
     pane_divider: Option<bool>,
@@ -552,6 +558,7 @@ impl Config {
             },
             activity_quiet_ms: raw.ui.activity_quiet_ms.unwrap_or(d.activity_quiet_ms).clamp(200, 10_000),
             detect_osc133: raw.ui.detect_osc133.unwrap_or(d.detect_osc133),
+            detect_foreground: raw.ui.detect_foreground.unwrap_or(d.detect_foreground),
             top_margin: raw.ui.top_margin.unwrap_or(d.top_margin).min(8),
             tab_pad: raw.ui.tab_pad.unwrap_or(d.tab_pad).min(4),
             pane_divider: raw.ui.pane_divider.unwrap_or(d.pane_divider),
