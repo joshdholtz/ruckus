@@ -21,10 +21,16 @@ ruckus                  # open the TUI (starts the daemon if needed)
 ruckus new claude       # new tab running claude, attached
 ruckus new -d -- cargo watch -x test    # create without attaching
 ruckus ls               # tree of everything + activity states
+ruckus status --json    # full state as JSON (for scripts and agents)
+ruckus send 4 "yes"     # type into a pane
+ruckus restart 4        # respawn an exited pane in place
 ruckus tail 4           # stream a pane's output (like tail -f)
 ruckus attach 4         # open the TUI focused on pane 4
 ruckus kill 4           # kill + remove a pane
 ```
+
+Any `<target>` accepts a pane id, a tab name, or a substring. Agents get a full
+control + config surface — see **[AGENTS.md](AGENTS.md)**.
 
 Quitting the TUI never kills your sessions — they live in the daemon.
 
@@ -117,9 +123,11 @@ The daemon speaks newline-delimited JSON-RPC over `~/.ruckus/ruckus.sock` — th
 - [x] attention queue (sidebar NEEDS YOU + alt+a jump)
 - [x] spinner/pulse animation, dimmed unfocused panes, toasts, help overlay
 - [x] mobile-SSH mode: tappable footer actions, auto-collapsing sidebar
-- [x] JSON-RPC socket (plugin API v0)
-- [ ] per-agent activity adapters (Claude Code, Codex, …)
-- [ ] pane zoom, layout presets, tab/space rename
-- [ ] session persistence across daemon restarts
+- [x] JSON-RPC socket (plugin API v0) + agent CLI (status/send/split/config…)
+- [x] agent-aware activity detection (esc-to-interrupt / input-box cues)
+- [x] pane zoom, restart-in-place, tab/space rename
+- [x] session persistence across daemon restarts (panes respawn under same ids)
+- [x] system notifications when a pane needs you and nobody's attached
+- [ ] layout presets, drag-select copy
 - [ ] Lua scripting
 - [ ] remote transport (TCP + auth) → native phone / web clients

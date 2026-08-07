@@ -40,42 +40,6 @@ const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "nu", "dash"];
 
-/// Strip ANSI escape sequences (CSI + OSC) from raw terminal bytes.
-fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i += 1;
-            match bytes.get(i) {
-                Some(b'[') => {
-                    i += 1;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                Some(b']') => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
-                        i += 1;
-                    }
-                    if bytes.get(i) == Some(&0x1b) {
-                        i += 1; // skip the \ of ST
-                    }
-                    i += 1;
-                }
-                Some(_) => i += 2,
-                None => {}
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
 fn scrollback_path(id: u64) -> std::path::PathBuf {
     let dir = ruckus_dir().join("scrollback");
     let _ = std::fs::create_dir_all(&dir);
@@ -928,13 +892,6 @@ fn locate(st: &State, pane: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strip_ansi_removes_csi_and_osc() {
-        assert_eq!(strip_ansi(b"\x1b[31mred\x1b[0m"), b"red");
-        assert_eq!(strip_ansi(b"\x1b]0;title\x07text"), b"text");
-        assert_eq!(strip_ansi(b"plain"), b"plain");
-    }
 
     #[test]
     fn quiet_shell_prompt_is_idle() {

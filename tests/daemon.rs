@@ -303,3 +303,29 @@ fn cli_config_roundtrip() {
     let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("# ruckus config"));
 }
+
+#[test]
+fn cli_resolves_pane_by_tab_name() {
+    let d = Daemon::start("resolve");
+    let snap = snapshot(&d.dir);
+    let space = snap["spaces"][0]["id"].as_u64().unwrap();
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "new_tab", "space": space, "name": "named-tab",
+               "cmd": ["sleep", "300"], "cwd": null}),
+    );
+    let pane = msg["pane"].as_u64().unwrap();
+    let _ = pane;
+
+    // `ruckus focus named-tab` should work even though the pane title is "sleep·N"
+    let out = Command::new(bin())
+        .args(["focus", "named-tab"])
+        .env("RUCKUS_DIR", &d.dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "focus by tab name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

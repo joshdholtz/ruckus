@@ -99,6 +99,12 @@ enum ConfigCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, which turns `ruckus status | head` into a panic on
+    // the broken pipe. Restore default so piped CLI output terminates quietly.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match cli.cmd {
         None => tui::run(None).await,

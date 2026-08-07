@@ -23,6 +23,10 @@ Daemon → client:
 | `new_space` | `name?`, `cwd?` | `created` |
 | `new_tab` | `space`, `name?`, `cmd: []`, `cwd?` | `created` |
 | `split` | `pane`, `dir: right\|down`, `cmd: []`, `cwd?` | `created` |
+| `set_layout` | `tab`, `layout: Node` | `done` (same panes, new arrangement/weights) |
+| `rename_space` | `space`, `name` | `done` |
+| `rename_tab` | `tab`, `name` | `done` |
+| `restart` | `pane` | `done` (respawn an exited pane in place) |
 | `close_pane` | `pane` | `done` |
 | `set_active` | `space`, `tab`, `pane` | `done` |
 | `attach` | `pane`, `rows`, `cols` | `attached` (base64 scrollback replay; you now receive `output` events for this pane) |

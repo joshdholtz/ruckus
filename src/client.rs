@@ -104,22 +104,59 @@ pub fn locate_pane(snapshot: &Snapshot, pane: u64) -> Option<(u64, u64)> {
     None
 }
 
-/// Resolve a pane by numeric id or title substring.
+/// Resolve a pane by numeric id, pane-title substring, or tab name. Tab names
+/// resolve to that tab's active pane — agents and humans refer to the name they
+/// gave a tab, not the auto-generated pane title.
 pub fn resolve_pane(snapshot: &Snapshot, target: &str) -> Result<PaneInfo> {
     if let Ok(id) = target.parse::<u64>() {
         if let Some(p) = snapshot.pane(id) {
             return Ok(p.clone());
         }
     }
-    let matches: Vec<&PaneInfo> = snapshot
+    // Exact tab name wins (unambiguous intent).
+    let tab_active: Vec<u64> = snapshot
+        .spaces
+        .iter()
+        .flat_map(|s| s.tabs.iter())
+        .filter(|t| t.name == target)
+        .map(|t| t.active_pane)
+        .collect();
+    if tab_active.len() == 1 {
+        if let Some(p) = snapshot.pane(tab_active[0]) {
+            return Ok(p.clone());
+        }
+    }
+    let mut matches: Vec<&PaneInfo> = snapshot
         .panes
         .iter()
         .filter(|p| p.title.contains(target))
         .collect();
+    // Fall back to substring match on tab names → their active panes.
+    if matches.is_empty() {
+        let ids: Vec<u64> = snapshot
+            .spaces
+            .iter()
+            .flat_map(|s| s.tabs.iter())
+            .filter(|t| t.name.contains(target))
+            .map(|t| t.active_pane)
+            .collect();
+        matches = snapshot.panes.iter().filter(|p| ids.contains(&p.id)).collect();
+    }
+    // Last resort: a space name → its active tab's active pane.
+    if matches.is_empty() {
+        let ids: Vec<u64> = snapshot
+            .spaces
+            .iter()
+            .filter(|s| s.name == target || s.name.contains(target))
+            .filter_map(|s| s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()))
+            .map(|t| t.active_pane)
+            .collect();
+        matches = snapshot.panes.iter().filter(|p| ids.contains(&p.id)).collect();
+    }
     match matches.len() {
-        0 => bail!("no pane matching '{target}'"),
+        0 => bail!("no pane, tab, or title matching '{target}'"),
         1 => Ok(matches[0].clone()),
-        n => bail!("'{target}' is ambiguous ({n} panes match)"),
+        n => bail!("'{target}' is ambiguous ({n} matches) — use a pane id"),
     }
 }
 
