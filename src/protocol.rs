@@ -36,6 +36,12 @@ pub enum Request {
     Detach { pane: u64 },
     Input { pane: u64, data: String },
     Resize { pane: u64, rows: u16, cols: u16 },
+    /// Detector seam: report an authoritative activity for a pane, overriding
+    /// the built-in output heuristic. Any external process on the socket can send
+    /// it. `state`: "working" | "waiting" | "idle" | "auto" ("auto" hands the pane
+    /// back to heuristic detection). Lets OSC 133 / shell-integration and
+    /// foreground-process detectors live as plugins instead of core behaviour.
+    ReportActivity { pane: u64, state: String },
     /// Re-read config.toml: daemon refreshes its own settings and tells every
     /// attached client to reload and re-render.
     Reload,

@@ -578,6 +578,37 @@ impl App {
         list
     }
 
+    /// Every pane running a non-shell command (an "agent"), across all spaces,
+    /// most-attention-first: (pane id, tab name, space name).
+    fn agent_rows(&self) -> Vec<(u64, String, String)> {
+        const SHELLS: &[&str] =
+            &["zsh", "bash", "sh", "fish", "dash", "tcsh", "ksh", "nu", "pwsh"];
+        let mut out = Vec::new();
+        for s in &self.snap.spaces {
+            for t in &s.tabs {
+                let mut leaves = Vec::new();
+                t.layout.leaves(&mut leaves);
+                for pid in leaves {
+                    if let Some(p) = self.snap.pane(pid) {
+                        let base = p
+                            .cmd
+                            .first()
+                            .and_then(|c| c.rsplit('/').next())
+                            .unwrap_or("");
+                        if !base.is_empty() && !SHELLS.contains(&base) {
+                            out.push((pid, t.name.clone(), s.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|(pid, _, _)| {
+            let a = self.snap.pane(*pid).map(|p| p.activity).unwrap_or(Activity::Idle);
+            std::cmp::Reverse(a.urgency())
+        });
+        out
+    }
+
     fn mark_seen(&mut self) {
         // Viewing a pane clears its unread badge.
         self.unread.remove(&self.focused);
@@ -1385,6 +1416,47 @@ impl App {
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
                         push!(Line::from(spans), Some(Target::Pane(id)));
+                    }
+                    push!(Line::raw(""), None::<Target>);
+                }
+                "agents" => {
+                    let agents = self.agent_rows();
+                    if agents.is_empty() {
+                        continue;
+                    }
+                    push!(
+                        Line::from(Span::styled(
+                            " AGENTS",
+                            Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+                        )),
+                        None::<Target>
+                    );
+                    for (pid, tab_name, space_name) in agents {
+                        let (g, mut color) = self
+                            .snap
+                            .pane(pid)
+                            .map(|p| self.glyph(Some(p)))
+                            .unwrap_or_else(|| (self.cfg.glyphs.idle.clone(), th.idle));
+                        if self.unread.contains(&pid) {
+                            color = th.accent;
+                        }
+                        let selected = pid == self.focused;
+                        let hovered = hover_row == Some(y);
+                        let row_style = if selected || hovered {
+                            Style::default().bg(th.select_bg)
+                        } else {
+                            Style::default()
+                        };
+                        let name_fg = if selected { th.bar_active_fg } else { th.bar_active_fg };
+                        let mut spans = vec![
+                            Span::styled("  ".to_string(), row_style),
+                            Span::styled(format!("{g} "), row_style.fg(color)),
+                            Span::styled(tab_name, row_style.fg(name_fg)),
+                            Span::styled(format!("  {space_name}"), row_style.fg(th.status_fg)),
+                        ];
+                        let pad = w.saturating_sub(spans_width(&spans));
+                        spans.push(Span::styled(" ".repeat(pad), row_style));
+                        push!(Line::from(spans), Some(Target::Pane(pid)));
                     }
                     push!(Line::raw(""), None::<Target>);
                 }

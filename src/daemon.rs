@@ -28,6 +28,10 @@ struct PaneSession {
     scrollback: VecDeque<u8>,
     subs: HashMap<u64, Tx>,
     last_output: std::time::Instant,
+    /// Authoritative activity set by a detector/plugin (OSC 133, foreground-process,
+    /// agent hook…). When `Some`, it overrides the output heuristic and the quiet
+    /// ticker leaves this pane alone. `None` = heuristic-managed (the default).
+    reported: Option<Activity>,
     /// When the PTY was last resized. Output right after a resize is just the
     /// program repainting (e.g. a shell redrawing its prompt), so it must NOT
     /// count as "working" — otherwise idle panes spin every time you switch view.
@@ -247,6 +251,7 @@ struct State {
     notify_waiting: bool,
     notify_done: bool,
     quiet_after: std::time::Duration,
+    detect_osc133: bool,
 }
 
 impl State {
@@ -313,6 +318,7 @@ pub async fn run() -> Result<()> {
         notify_waiting: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting"),
         notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
         quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
+        detect_osc133: cfg.ui.detect_osc133,
     }));
 
     {
@@ -337,7 +343,8 @@ pub async fn run() -> Result<()> {
                 let quiet_after = st.quiet_after;
                 let mut changes = Vec::new();
                 for (id, p) in st.panes.iter_mut() {
-                    if p.info.status == PaneStatus::Running
+                    if p.reported.is_none()
+                        && p.info.status == PaneStatus::Running
                         && p.info.activity == Activity::Working
                         && p.last_output.elapsed() >= quiet_after
                     {
@@ -609,12 +616,24 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 Err(e) => err(format!("resize failed: {e}")),
             }
         }
+        Request::ReportActivity { pane, state: report } => {
+            let mut st = state.lock().unwrap();
+            if !st.panes.contains_key(&pane) {
+                return err(format!("no pane {pane}"));
+            }
+            let change = st.panes.get_mut(&pane).and_then(|p| apply_report(p, &report));
+            if let Some(a) = change {
+                broadcast(&st, ServerMsg::Activity { pane, activity: a });
+            }
+            ServerMsg::Done
+        }
         Request::Reload => {
             let mut st = state.lock().unwrap();
             let cfg = crate::config::Config::load();
             st.notify_waiting = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
             st.notify_done = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
             st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
+            st.detect_osc133 = cfg.ui.detect_osc133;
             info!("config reloaded; notifying {} clients", st.conns.len());
             broadcast(&st, ServerMsg::ConfigChanged);
             ServerMsg::Done
@@ -735,11 +754,60 @@ fn spawn_pane_with_id(
             subs: HashMap::new(),
             last_output: std::time::Instant::now(),
             resized_at: std::time::Instant::now(),
+            reported: None,
             dirty: false,
             screen,
         },
     );
     Ok(())
+}
+
+/// Apply a detector's authoritative activity to a pane. Returns the new activity
+/// if it changed (so the caller can broadcast). "auto" relinquishes to heuristics.
+fn apply_report(p: &mut PaneSession, state: &str) -> Option<Activity> {
+    let target = match state {
+        "auto" => {
+            p.reported = None;
+            return None;
+        }
+        "working" => Activity::Working,
+        "waiting" => Activity::Waiting,
+        "idle" => Activity::Idle,
+        _ => return None,
+    };
+    p.reported = Some(target);
+    if p.info.status == PaneStatus::Running && p.info.activity != target {
+        p.info.activity = target;
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Scan a byte chunk for OSC 133 shell-integration marks (FinalTerm FTCS, the
+/// same protocol iTerm2 / WezTerm / kitty / VS Code use) and return the activity
+/// implied by the last relevant mark: `C` (command executed) = working,
+/// `D` (finished) / `A` (prompt) = idle. Returns None if no mark is present.
+fn scan_osc133(bytes: &[u8]) -> Option<&'static str> {
+    let mut result = None;
+    let mut i = 0;
+    while i + 6 < bytes.len() {
+        if bytes[i] == 0x1b
+            && bytes[i + 1] == b']'
+            && &bytes[i + 2..i + 5] == b"133"
+            && bytes[i + 5] == b';'
+        {
+            match bytes[i + 6] {
+                b'C' => result = Some("working"),
+                b'D' | b'A' => result = Some("idle"),
+                _ => {}
+            }
+            i += 6;
+        } else {
+            i += 1;
+        }
+    }
+    result
 }
 
 async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<SessionEvent>) {
@@ -759,7 +827,9 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     // Ignore repaint bursts triggered by a resize (view switch) —
                     // otherwise idle panes flash "working" whenever you change spaces.
                     let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
+                    // A detector owns this pane's state — don't let raw output override it.
                     let flip = !repaint
+                        && p.reported.is_none()
                         && p.info.activity != Activity::Working
                         && p.info.status == PaneStatus::Running;
                     if flip {
@@ -769,6 +839,16 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 };
                 if now_working {
                     broadcast(&st, ServerMsg::Activity { pane: id, activity: Activity::Working });
+                }
+                // Opt-in OSC 133 detector: exact command start/finish beats the heuristic.
+                if st.detect_osc133 {
+                    if let Some(state) = scan_osc133(&bytes) {
+                        let change =
+                            st.panes.get_mut(&id).and_then(|p| apply_report(p, state));
+                        if let Some(a) = change {
+                            broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
+                        }
+                    }
                 }
                 let Some(p) = st.panes.get_mut(&id) else { continue };
                 if !p.subs.is_empty() {

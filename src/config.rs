@@ -268,6 +268,9 @@ pub struct UiConfig {
     pub working_style: WorkingStyle,
     /// Milliseconds of output silence before a pane drops working -> idle/waiting.
     pub activity_quiet_ms: u64,
+    /// Opt-in: read OSC 133 shell-integration marks (FinalTerm FTCS) for exact
+    /// command start/finish, overriding the output heuristic. Needs shell integration.
+    pub detect_osc133: bool,
     /// Blank rows above the top bar / tab strip.
     pub top_margin: u16,
     /// Horizontal padding inside each tab "pill" in the strip.
@@ -309,6 +312,7 @@ impl Default for UiConfig {
             sidebar_tabs: true,
             working_style: WorkingStyle::Spinner,
             activity_quiet_ms: 900,
+            detect_osc133: false,
             top_margin: 0,
             tab_pad: 1,
             pane_divider: true,
@@ -391,6 +395,7 @@ struct RawUi {
     sidebar_tabs: Option<bool>,
     working_style: Option<String>,
     activity_quiet_ms: Option<u64>,
+    detect_osc133: Option<bool>,
     top_margin: Option<u16>,
     tab_pad: Option<u16>,
     pane_divider: Option<bool>,
@@ -546,6 +551,7 @@ impl Config {
                 _ => WorkingStyle::Spinner,
             },
             activity_quiet_ms: raw.ui.activity_quiet_ms.unwrap_or(d.activity_quiet_ms).clamp(200, 10_000),
+            detect_osc133: raw.ui.detect_osc133.unwrap_or(d.detect_osc133),
             top_margin: raw.ui.top_margin.unwrap_or(d.top_margin).min(8),
             tab_pad: raw.ui.tab_pad.unwrap_or(d.tab_pad).min(4),
             pane_divider: raw.ui.pane_divider.unwrap_or(d.pane_divider),
