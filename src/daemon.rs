@@ -28,6 +28,10 @@ struct PaneSession {
     scrollback: VecDeque<u8>,
     subs: HashMap<u64, Tx>,
     last_output: std::time::Instant,
+    /// When the PTY was last resized. Output right after a resize is just the
+    /// program repainting (e.g. a shell redrawing its prompt), so it must NOT
+    /// count as "working" — otherwise idle panes spin every time you switch view.
+    resized_at: std::time::Instant,
     /// Scrollback changed since the last disk flush.
     dirty: bool,
     /// Rendered screen state — activity classification reads what a user would
@@ -35,8 +39,9 @@ struct PaneSession {
     screen: vt100::Parser,
 }
 
-/// Output has to be quiet this long before we classify working -> waiting/idle.
-const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// Output arriving within this window after a resize is treated as a repaint,
+/// not fresh activity — so switching spaces/tabs doesn't flip idle panes to working.
+const RESIZE_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "nu", "dash"];
 
@@ -241,6 +246,7 @@ struct State {
     next_id: u64,
     notify_waiting: bool,
     notify_done: bool,
+    quiet_after: std::time::Duration,
 }
 
 impl State {
@@ -306,6 +312,7 @@ pub async fn run() -> Result<()> {
         next_id: 1,
         notify_waiting: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting"),
         notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
+        quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
     }));
 
     {
@@ -321,17 +328,18 @@ pub async fn run() -> Result<()> {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
             let mut n: u64 = 0;
             loop {
                 tick.tick().await;
                 n += 1;
                 let mut st = state.lock().unwrap();
+                let quiet_after = st.quiet_after;
                 let mut changes = Vec::new();
                 for (id, p) in st.panes.iter_mut() {
                     if p.info.status == PaneStatus::Running
                         && p.info.activity == Activity::Working
-                        && p.last_output.elapsed() >= QUIET_AFTER
+                        && p.last_output.elapsed() >= quiet_after
                     {
                         let next = classify_quiet(p);
                         if next != p.info.activity {
@@ -355,7 +363,8 @@ pub async fn run() -> Result<()> {
                         }
                     }
                 }
-                if n % 5 == 0 {
+                // ~ every 5s (ticker runs at 250ms)
+                if n % 20 == 0 {
                     flush_scrollbacks(&mut st);
                 }
             }
@@ -560,6 +569,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 return err(format!("no pane {pane}"));
             };
             let _ = p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            p.resized_at = std::time::Instant::now();
             p.screen.set_size(rows, cols);
             p.subs.insert(conn_id, tx);
             let scrollback = B64.encode(p.scrollback.make_contiguous());
@@ -592,6 +602,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             };
             match p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
                 Ok(_) => {
+                    p.resized_at = std::time::Instant::now();
                     p.screen.set_size(rows, cols);
                     ServerMsg::Done
                 }
@@ -603,6 +614,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let cfg = crate::config::Config::load();
             st.notify_waiting = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
             st.notify_done = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
+            st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
             info!("config reloaded; notifying {} clients", st.conns.len());
             broadcast(&st, ServerMsg::ConfigChanged);
             ServerMsg::Done
@@ -611,6 +623,30 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
 }
 
 /// Spawn a PTY + process; returns the new pane id. Caller must place it in the tree.
+/// A human-friendly default pane title. Shells are named after their working
+/// directory (the useful bit), everything else after the command itself.
+fn default_pane_title(cmd: &str, cwd: &str) -> String {
+    let base = basename(cmd);
+    let is_shell = matches!(
+        base.as_str(),
+        "zsh" | "bash" | "sh" | "fish" | "dash" | "tcsh" | "ksh" | "nu" | "pwsh"
+    );
+    if !is_shell {
+        return base;
+    }
+    if let Some(home) = dirs::home_dir() {
+        if std::path::Path::new(cwd) == home {
+            return "~".to_string();
+        }
+    }
+    let dir = basename(cwd);
+    if dir.is_empty() {
+        "/".to_string()
+    } else {
+        dir
+    }
+}
+
 fn spawn_pane(
     state: &Arc<Mutex<State>>,
     st: &mut State,
@@ -653,7 +689,7 @@ fn spawn_pane_with_id(
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
 
-    let title = format!("{}·{}", basename(&cmdline[0]), id);
+    let title = default_pane_title(&cmdline[0], &cwd);
     let info = PaneInfo {
         id,
         title,
@@ -698,6 +734,7 @@ fn spawn_pane_with_id(
             scrollback: scrollback.unwrap_or_default(),
             subs: HashMap::new(),
             last_output: std::time::Instant::now(),
+            resized_at: std::time::Instant::now(),
             dirty: false,
             screen,
         },
@@ -719,7 +756,11 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     p.last_output = std::time::Instant::now();
                     p.dirty = true;
                     p.screen.process(&bytes);
-                    let flip = p.info.activity != Activity::Working
+                    // Ignore repaint bursts triggered by a resize (view switch) —
+                    // otherwise idle panes flash "working" whenever you change spaces.
+                    let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
+                    let flip = !repaint
+                        && p.info.activity != Activity::Working
                         && p.info.status == PaneStatus::Running;
                     if flip {
                         p.info.activity = Activity::Working;

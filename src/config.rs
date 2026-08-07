@@ -213,11 +213,23 @@ pub enum ToastPos {
     BottomRight,
 }
 
+/// How a "working" pane is indicated in the dots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingStyle {
+    /// Animated braille spinner (default).
+    Spinner,
+    /// Steady dot whose color gently pulses.
+    Pulse,
+    /// Steady colored dot, no motion.
+    Dot,
+}
+
 #[derive(Debug, Clone)]
 pub struct Glyphs {
     pub waiting: String,
     pub done: String,
     pub idle: String,
+    pub working: String,
     pub focus: String,
     pub spinner: Vec<String>,
 }
@@ -228,6 +240,7 @@ impl Default for Glyphs {
             waiting: "◉".to_string(),
             done: "◍".to_string(),
             idle: "○".to_string(),
+            working: "●".to_string(),
             focus: "▎".to_string(),
             spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
                 .iter()
@@ -247,6 +260,24 @@ pub struct UiConfig {
     pub sidebar_row_gap: u16,
     /// Show an accent marker on the active sidebar row.
     pub sidebar_marker: bool,
+    /// Show 1-based jump numbers (alt+1..9) on tabs — in the strip and sidebar.
+    pub tab_numbers: bool,
+    /// List each space's tabs under it in the sidebar (false = spaces only).
+    pub sidebar_tabs: bool,
+    /// How a working pane is shown: spinner | pulse | dot.
+    pub working_style: WorkingStyle,
+    /// Milliseconds of output silence before a pane drops working -> idle/waiting.
+    pub activity_quiet_ms: u64,
+    /// Blank rows above the top bar / tab strip.
+    pub top_margin: u16,
+    /// Horizontal padding inside each tab "pill" in the strip.
+    pub tab_pad: u16,
+    /// Draw a subtle divider line in the gutter between split panes.
+    pub pane_divider: bool,
+    /// Dimmed second line under each space row (highlight spans both). Empty = single line.
+    pub space_subtitle: String,
+    /// Dimmed second line under each tab row (highlight spans both). Empty = single line.
+    pub tab_subtitle: String,
     pub gutter: u16,
     pub pane_padding: u16,
     pub pane_titles: bool,
@@ -274,6 +305,15 @@ impl Default for UiConfig {
             sidebar_sections: vec!["needs_you".to_string(), "spaces".to_string()],
             sidebar_row_gap: 1,
             sidebar_marker: true,
+            tab_numbers: true,
+            sidebar_tabs: true,
+            working_style: WorkingStyle::Spinner,
+            activity_quiet_ms: 900,
+            top_margin: 0,
+            tab_pad: 1,
+            pane_divider: true,
+            space_subtitle: String::new(),
+            tab_subtitle: "{cmd}".to_string(),
             gutter: 1,
             pane_padding: 0,
             pane_titles: true,
@@ -347,6 +387,15 @@ struct RawUi {
     sidebar_sections: Option<Vec<String>>,
     sidebar_row_gap: Option<u16>,
     sidebar_marker: Option<bool>,
+    tab_numbers: Option<bool>,
+    sidebar_tabs: Option<bool>,
+    working_style: Option<String>,
+    activity_quiet_ms: Option<u64>,
+    top_margin: Option<u16>,
+    tab_pad: Option<u16>,
+    pane_divider: Option<bool>,
+    space_subtitle: Option<String>,
+    tab_subtitle: Option<String>,
     gutter: Option<u16>,
     pane_padding: Option<u16>,
     pane_titles: Option<bool>,
@@ -368,6 +417,7 @@ struct RawGlyphs {
     waiting: Option<String>,
     done: Option<String>,
     idle: Option<String>,
+    working: Option<String>,
     focus: Option<String>,
     spinner: Option<Vec<String>>,
 }
@@ -488,6 +538,19 @@ impl Config {
             sidebar_sections: raw.ui.sidebar_sections.unwrap_or(d.sidebar_sections),
             sidebar_row_gap: raw.ui.sidebar_row_gap.unwrap_or(d.sidebar_row_gap).min(3),
             sidebar_marker: raw.ui.sidebar_marker.unwrap_or(d.sidebar_marker),
+            tab_numbers: raw.ui.tab_numbers.unwrap_or(d.tab_numbers),
+            sidebar_tabs: raw.ui.sidebar_tabs.unwrap_or(d.sidebar_tabs),
+            working_style: match raw.ui.working_style.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("pulse") => WorkingStyle::Pulse,
+                Some("dot") => WorkingStyle::Dot,
+                _ => WorkingStyle::Spinner,
+            },
+            activity_quiet_ms: raw.ui.activity_quiet_ms.unwrap_or(d.activity_quiet_ms).clamp(200, 10_000),
+            top_margin: raw.ui.top_margin.unwrap_or(d.top_margin).min(8),
+            tab_pad: raw.ui.tab_pad.unwrap_or(d.tab_pad).min(4),
+            pane_divider: raw.ui.pane_divider.unwrap_or(d.pane_divider),
+            space_subtitle: raw.ui.space_subtitle.unwrap_or(d.space_subtitle),
+            tab_subtitle: raw.ui.tab_subtitle.unwrap_or(d.tab_subtitle),
             gutter: raw.ui.gutter.unwrap_or(d.gutter).min(4),
             pane_padding: raw.ui.pane_padding.unwrap_or(d.pane_padding).min(4),
             pane_titles: raw.ui.pane_titles.unwrap_or(d.pane_titles),
@@ -533,6 +596,7 @@ impl Config {
             waiting: raw.glyphs.waiting.unwrap_or(dg.waiting),
             done: raw.glyphs.done.unwrap_or(dg.done),
             idle: raw.glyphs.idle.unwrap_or(dg.idle),
+            working: raw.glyphs.working.unwrap_or(dg.working),
             focus: raw.glyphs.focus.unwrap_or(dg.focus),
             spinner,
         };

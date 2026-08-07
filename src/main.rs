@@ -38,6 +38,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Create a new space (optionally named); its first tab runs your shell
+    NewSpace {
+        /// Space name
+        #[arg(short, long)]
+        name: Option<String>,
+    },
     /// Open the TUI focused on a pane (by id or title)
     Attach { target: String },
     /// Kill a pane's process and remove it (by id or title)
@@ -113,6 +119,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Daemon) => daemon::run().await,
         Some(Cmd::Ls) => ls().await,
         Some(Cmd::New { name, detach, cmd }) => new_tab(name, detach, cmd).await,
+        Some(Cmd::NewSpace { name }) => new_space(name).await,
         Some(Cmd::Attach { target }) => tui::run(Some(target)).await,
         Some(Cmd::Kill { target }) => kill(target).await,
         Some(Cmd::Tail { target }) => tail(target).await,
@@ -141,6 +148,17 @@ async fn reload_if_running() {
     if let Ok((client, _events)) = connect().await {
         let _ = client.request(Request::Reload).await;
     }
+}
+
+async fn new_space(name: Option<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let msg = client.request(Request::NewSpace { name, cwd }).await?;
+    if let ServerMsg::Created { space, pane, .. } = msg {
+        println!("space {space} created (pane {pane})");
+    }
+    Ok(())
 }
 
 async fn status(json: bool) -> Result<()> {

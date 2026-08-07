@@ -20,7 +20,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
-use crate::config::{normalize_key, Action, BarPos, Config, SidebarPos, ToastPos};
+use crate::config::{normalize_key, Action, BarPos, Config, SidebarPos, ToastPos, WorkingStyle};
 use crate::protocol::*;
 use crate::render::{encode_key, screen_to_lines};
 
@@ -54,6 +54,8 @@ enum MenuAction {
     SplitRight,
     SplitDown,
     NewTab,
+    RenameTab,
+    RenameSpace,
     Zoom,
     Restart,
     ClosePane,
@@ -64,6 +66,21 @@ struct Drag {
     path: Vec<usize>,
     index: usize,
     dir: Dir,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PromptKind {
+    NewTab,
+    NewSpace,
+    RenameSpace(u64),
+    RenameTab(u64),
+}
+
+/// A modal single-line text input (naming a new/renamed space or tab).
+struct Prompt {
+    kind: PromptKind,
+    label: &'static str,
+    buffer: String,
 }
 
 /// Where every chrome element lives this frame, derived from config + size.
@@ -87,6 +104,9 @@ struct App {
     views: HashMap<u64, PaneView>,
     focused: u64,
     seen: HashSet<u64>,
+    /// Panes that changed to a notable state (finished / needs input) while
+    /// unfocused. Cleared when you view the pane. Drives the "unread" badge.
+    unread: HashSet<u64>,
     cwd: String,
     running: bool,
     toast: Option<(String, Instant)>,
@@ -95,6 +115,7 @@ struct App {
     drawer: bool,
     help: bool,
     menu: Option<Menu>,
+    prompt: Option<Prompt>,
     drag: Option<Drag>,
     hover: Option<(u16, u16)>,
     tick: usize,
@@ -104,6 +125,21 @@ struct App {
     tab_hits: Vec<(Option<u64>, std::ops::Range<u16>)>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     pane_rects: Vec<(u64, Rect)>,
+}
+
+/// Collapse the user's home prefix to `~` for compact display.
+fn home_relative(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            if path == home {
+                return "~".to_string();
+            }
+            if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+                return format!("~/{rest}");
+            }
+        }
+    }
+    path.to_string()
 }
 
 fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
@@ -149,6 +185,31 @@ fn node_rects(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(u64, Rect)>) 
                 node_rects(c, r, gutter, out);
             }
         }
+    }
+}
+
+/// Collect subtle divider segments in the gutter between sibling panes.
+/// Each entry is (line rect, is_vertical).
+fn node_dividers(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(Rect, bool)>) {
+    let Node::Split { dir, children, weights } = node else { return };
+    let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
+    if gutter > 0 {
+        for pair in chunks.windows(2) {
+            let a = pair[0];
+            match dir {
+                Dir::Right => {
+                    let gx = a.x + a.width + gutter / 2;
+                    out.push((Rect::new(gx, area.y, 1, area.height), true));
+                }
+                Dir::Down => {
+                    let gy = a.y + a.height + gutter / 2;
+                    out.push((Rect::new(area.x, gy, area.width, 1), false));
+                }
+            }
+        }
+    }
+    for (c, r) in children.iter().zip(chunks) {
+        node_dividers(c, r, gutter, out);
     }
 }
 
@@ -316,7 +377,7 @@ impl App {
     fn compute_frame(&self) -> FrameLayout {
         let (w, h) = self.size;
         let ui = &self.cfg.ui;
-        let mut top: u16 = 0;
+        let mut top: u16 = ui.top_margin.min(h.saturating_sub(2));
         let mut bot: u16 = h;
         let mut header = None;
         let mut footer = None;
@@ -510,7 +571,7 @@ impl App {
             .filter(|p| match p.activity {
                 Activity::Waiting => true,
                 Activity::Done => !self.seen.contains(&p.id),
-                _ => false,
+                _ => self.unread.contains(&p.id),
             })
             .collect();
         list.sort_by_key(|p| std::cmp::Reverse(p.activity.urgency()));
@@ -518,11 +579,23 @@ impl App {
     }
 
     fn mark_seen(&mut self) {
+        // Viewing a pane clears its unread badge.
+        self.unread.remove(&self.focused);
         if let Some(p) = self.snap.pane(self.focused) {
             if p.activity == Activity::Done {
                 self.seen.insert(p.id);
             }
         }
+    }
+
+    fn tab_unread(&self, t: &TabInfo) -> bool {
+        let mut leaves = Vec::new();
+        t.layout.leaves(&mut leaves);
+        leaves.iter().any(|p| self.unread.contains(p))
+    }
+
+    fn space_unread(&self, s: &SpaceInfo) -> bool {
+        s.tabs.iter().any(|t| self.tab_unread(t))
     }
 
     async fn split_action(&mut self, pane: u64, dir: Dir) {
@@ -534,14 +607,65 @@ impl App {
         }
     }
 
-    async fn new_tab_action(&mut self) {
+    async fn new_tab_action(&mut self, name: Option<String>) {
         let Some(space) = self.active_space().map(|s| s.id) else { return };
         let req =
-            Request::NewTab { space, name: None, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
+            Request::NewTab { space, name, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
+        }
+    }
+
+    async fn new_space_action(&mut self, name: Option<String>) {
+        let req = Request::NewSpace { name, cwd: Some(self.cwd.clone()) };
+        match self.client.request(req).await {
+            Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
+            Err(e) => self.toast(e.to_string()),
+            _ => {}
+        }
+    }
+
+    /// Open the modal text input for `kind`.
+    fn open_prompt(&mut self, kind: PromptKind) {
+        let (label, buffer) = match kind {
+            PromptKind::NewTab => ("name new tab (blank = default)", String::new()),
+            PromptKind::NewSpace => ("name new space (blank = default)", String::new()),
+            PromptKind::RenameSpace(id) => (
+                "rename space",
+                self.snap.spaces.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default(),
+            ),
+            PromptKind::RenameTab(id) => (
+                "rename tab",
+                self.snap.spaces.iter().flat_map(|s| &s.tabs).find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_default(),
+            ),
+        };
+        self.prompt = Some(Prompt { kind, label, buffer });
+    }
+
+    /// Commit the active prompt: create or rename with the typed name.
+    async fn submit_prompt(&mut self) {
+        let Some(p) = self.prompt.take() else { return };
+        let name = p.buffer.trim().to_string();
+        let opt = if name.is_empty() { None } else { Some(name.clone()) };
+        match p.kind {
+            PromptKind::NewTab => self.new_tab_action(opt).await,
+            PromptKind::NewSpace => self.new_space_action(opt).await,
+            PromptKind::RenameSpace(space) => {
+                if let Some(name) = opt {
+                    if let Err(e) = self.client.request(Request::RenameSpace { space, name }).await {
+                        self.toast(e.to_string());
+                    }
+                }
+            }
+            PromptKind::RenameTab(tab) => {
+                if let Some(name) = opt {
+                    if let Err(e) = self.client.request(Request::RenameTab { tab, name }).await {
+                        self.toast(e.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -586,17 +710,8 @@ impl App {
                 };
                 self.goto_pane(next).await;
             }
-            Action::NewTab => self.new_tab_action().await,
-            Action::NewSpace => {
-                let req = Request::NewSpace { name: None, cwd: Some(self.cwd.clone()) };
-                match self.client.request(req).await {
-                    Ok(ServerMsg::Created { space, tab, pane }) => {
-                        self.set_active(space, tab, pane).await
-                    }
-                    Err(e) => self.toast(e.to_string()),
-                    _ => {}
-                }
-            }
+            Action::NewTab => self.open_prompt(PromptKind::NewTab),
+            Action::NewSpace => self.open_prompt(PromptKind::NewSpace),
             Action::NextTab | Action::PrevTab => {
                 let Some(s) = self.active_space() else { return };
                 if s.tabs.is_empty() {
@@ -659,7 +774,17 @@ impl App {
         match action {
             MenuAction::SplitRight => self.split_action(pane, Dir::Right).await,
             MenuAction::SplitDown => self.split_action(pane, Dir::Down).await,
-            MenuAction::NewTab => self.new_tab_action().await,
+            MenuAction::NewTab => self.open_prompt(PromptKind::NewTab),
+            MenuAction::RenameTab => {
+                if let Some((_, tab)) = self.locate(pane) {
+                    self.open_prompt(PromptKind::RenameTab(tab));
+                }
+            }
+            MenuAction::RenameSpace => {
+                if let Some((space, _)) = self.locate(pane) {
+                    self.open_prompt(PromptKind::RenameSpace(space));
+                }
+            }
             MenuAction::Zoom => {
                 self.zoomed = !self.zoomed;
                 self.sync().await;
@@ -674,6 +799,26 @@ impl App {
             return;
         }
         let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
+
+        // Modal text input swallows every key until Enter (submit) or Esc (cancel).
+        if self.prompt.is_some() {
+            match ev.code {
+                KeyCode::Esc => self.prompt = None,
+                KeyCode::Enter => self.submit_prompt().await,
+                KeyCode::Backspace => {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.buffer.pop();
+                    }
+                }
+                KeyCode::Char(c) if !ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.buffer.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         if self.menu.is_some() {
             self.menu = None;
@@ -846,6 +991,8 @@ impl App {
                             ("split down", MenuAction::SplitDown),
                             ("zoom", MenuAction::Zoom),
                             ("new tab", MenuAction::NewTab),
+                            ("rename tab", MenuAction::RenameTab),
+                            ("rename space", MenuAction::RenameSpace),
                             ("restart", MenuAction::Restart),
                             ("close pane", MenuAction::ClosePane),
                         ],
@@ -946,7 +1093,7 @@ impl App {
                                 }
                             }
                         }
-                        Some(None) => self.new_tab_action().await,
+                        Some(None) => self.open_prompt(PromptKind::NewTab),
                         None => {}
                     }
                 } else if let Some(pane) = self.pane_at(col, row) {
@@ -984,8 +1131,17 @@ impl App {
                 }
             }
             ServerMsg::Activity { pane, activity } => {
+                let prev = self.snap.pane(pane).map(|p| p.activity);
                 if let Some(p) = self.snap.pane_mut(pane) {
                     p.activity = activity;
+                }
+                // Flag as unread if it finished / now needs input while unfocused.
+                if pane != self.focused {
+                    let notable = matches!(activity, Activity::Waiting | Activity::Done)
+                        || (prev == Some(Activity::Working) && activity == Activity::Idle);
+                    if notable {
+                        self.unread.insert(pane);
+                    }
                 }
             }
             ServerMsg::Exited { pane, code } => {
@@ -995,6 +1151,8 @@ impl App {
                 }
                 if pane == self.focused {
                     self.seen.insert(pane);
+                } else {
+                    self.unread.insert(pane);
                 }
             }
             ServerMsg::ConfigChanged => self.reload_config().await,
@@ -1043,11 +1201,26 @@ impl App {
         s[self.tick % s.len()].clone()
     }
 
+    /// The working-state indicator (glyph + color), per `ui.working_style`.
+    fn working_indicator(&self) -> (String, Color) {
+        let th = &self.cfg.theme;
+        let g = &self.cfg.glyphs;
+        match self.cfg.ui.working_style {
+            WorkingStyle::Spinner => (self.spin(), th.working),
+            WorkingStyle::Dot => (g.working.clone(), th.working),
+            WorkingStyle::Pulse => {
+                // gentle two-step color pulse on a steady dot
+                let bright = (self.tick / 3) % 2 == 0;
+                (g.working.clone(), if bright { th.working } else { th.idle })
+            }
+        }
+    }
+
     fn glyph(&self, info: Option<&PaneInfo>) -> (String, Color) {
         let th = &self.cfg.theme;
         let g = &self.cfg.glyphs;
         match info.map(|i| (i.activity, i.status)) {
-            Some((Activity::Working, _)) => (self.spin(), th.working),
+            Some((Activity::Working, _)) => self.working_indicator(),
             Some((Activity::Waiting, _)) => {
                 let s = if (self.tick / 4) % 2 == 0 { &g.waiting } else { &g.idle };
                 (s.clone(), th.waiting)
@@ -1065,7 +1238,7 @@ impl App {
         let th = &self.cfg.theme;
         let g = &self.cfg.glyphs;
         match a {
-            Activity::Working => (self.spin(), th.working),
+            Activity::Working => self.working_indicator(),
             Activity::Waiting => {
                 let s = if (self.tick / 4) % 2 == 0 { &g.waiting } else { &g.idle };
                 (s.clone(), th.waiting)
@@ -1229,14 +1402,20 @@ impl App {
                     let row_gap = self.cfg.ui.sidebar_row_gap;
                     let marker_on = self.cfg.ui.sidebar_marker;
                     let marker = self.cfg.glyphs.focus.clone();
-                    for (si, s) in spaces.iter().enumerate() {
-                        if row_gap > 0 && si > 0 {
-                            for _ in 0..row_gap {
-                                push!(Line::raw(""), None::<Target>);
-                            }
+                    let space_sub = self.cfg.ui.space_subtitle.clone();
+                    let tab_sub = self.cfg.ui.tab_subtitle.clone();
+                    let tab_numbers = self.cfg.ui.tab_numbers;
+                    let show_tabs = self.cfg.ui.sidebar_tabs;
+                    let no_icon = (String::new(), th.status_fg);
+                    for (_si, s) in spaces.iter().enumerate() {
+                        for _ in 0..row_gap {
+                            push!(Line::raw(""), None::<Target>);
                         }
                         let s_active = s.id == self.snap.active_space;
-                        let icon = self.state_glyph(space_activity(&self.snap, s));
+                        let mut icon = self.state_glyph(space_activity(&self.snap, s));
+                        if self.space_unread(s) {
+                            icon.1 = th.accent; // unread badge
+                        }
                         let hovered = hover_row == Some(y);
                         let row_style = if s_active || hovered {
                             Style::default().bg(th.select_bg)
@@ -1248,6 +1427,15 @@ impl App {
                             ("name", s.name.clone()),
                             ("title", s.name.clone()),
                             ("id", s.id.to_string()),
+                            ("tabs", s.tabs.len().to_string()),
+                            (
+                                "active",
+                                s.tabs
+                                    .iter()
+                                    .find(|t| t.id == s.active_tab)
+                                    .map(|t| t.name.clone())
+                                    .unwrap_or_default(),
+                            ),
                         ];
                         let lead = if marker_on && s_active {
                             Span::styled(marker.clone(), row_style.fg(th.accent))
@@ -1268,9 +1456,29 @@ impl App {
                         spans.push(Span::styled(" ".repeat(pad), row_style));
                         push!(Line::from(spans), Some(Target::Space(s.id)));
 
-                        for t in &s.tabs {
+                        if !space_sub.is_empty() {
+                            let sub_fg = if s_active { th.bar_fg } else { th.status_fg };
+                            let mut sub = vec![Span::styled("   ".to_string(), row_style)];
+                            sub.extend(template_spans(
+                                &space_sub, &no_icon, &vars, row_style, sub_fg,
+                            ));
+                            let pad = w.saturating_sub(spans_width(&sub));
+                            sub.push(Span::styled(" ".repeat(pad), row_style));
+                            push!(Line::from(sub), Some(Target::Space(s.id)));
+                        }
+
+                        for (ti, t) in s.tabs.iter().enumerate() {
+                            if !show_tabs {
+                                break;
+                            }
+                            for _ in 0..row_gap {
+                                push!(Line::raw(""), None::<Target>);
+                            }
                             let t_active = s_active && t.id == s.active_tab;
-                            let icon = self.state_glyph(tab_activity(&self.snap, t));
+                            let mut icon = self.state_glyph(tab_activity(&self.snap, t));
+                            if self.tab_unread(t) {
+                                icon.1 = th.accent; // unread badge
+                            }
                             let hovered = hover_row == Some(y);
                             let row_style = if t_active || hovered {
                                 Style::default().bg(th.select_bg)
@@ -1289,7 +1497,7 @@ impl App {
                                 ),
                                 (
                                     "cwd",
-                                    active_pane.map(|p| p.cwd.clone()).unwrap_or_default(),
+                                    active_pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
                                 ),
                             ];
                             let mut spans = if marker_on && t_active {
@@ -1301,19 +1509,35 @@ impl App {
                             } else {
                                 vec![Span::styled("    ".to_string(), row_style)]
                             };
+                            if tab_numbers {
+                                spans.push(Span::styled(
+                                    format!("{} ", ti + 1),
+                                    row_style.fg(th.status_fg),
+                                ));
+                            }
                             spans.extend(template_spans(
                                 &tab_tpl, &icon, &vars, row_style, text_fg,
                             ));
                             let pad = w.saturating_sub(spans_width(&spans));
                             spans.push(Span::styled(" ".repeat(pad), row_style));
-                            push!(
-                                Line::from(spans),
-                                Some(Target::Tab {
-                                    space: s.id,
-                                    tab: t.id,
-                                    pane: t.active_pane
-                                })
-                            );
+                            let tab_target = Target::Tab {
+                                space: s.id,
+                                tab: t.id,
+                                pane: t.active_pane,
+                            };
+                            push!(Line::from(spans), Some(tab_target.clone()));
+
+                            if !tab_sub.is_empty() {
+                                let sub_fg = if t_active { th.bar_fg } else { th.status_fg };
+                                let mut sub =
+                                    vec![Span::styled("      ".to_string(), row_style)];
+                                sub.extend(template_spans(
+                                    &tab_sub, &no_icon, &vars, row_style, sub_fg,
+                                ));
+                                let pad = w.saturating_sub(spans_width(&sub));
+                                sub.push(Span::styled(" ".repeat(pad), row_style));
+                                push!(Line::from(sub), Some(tab_target.clone()));
+                            }
                         }
                     }
                 }
@@ -1334,27 +1558,39 @@ impl App {
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         let mut hits: Vec<(Option<u64>, std::ops::Range<u16>)> = Vec::new();
         let mut x = area.x + 1;
+        let pad = " ".repeat(self.cfg.ui.tab_pad as usize);
         if let Some(s) = self.active_space() {
             for (i, t) in s.tabs.iter().enumerate() {
                 let active = t.id == s.active_tab;
-                let (g, color) = self.state_glyph(tab_activity(&self.snap, t));
-                let label = format!(" {} {} ", i + 1, t.name);
-                let width = (label.chars().count() + 1 + g.chars().count()) as u16;
+                let (g, mut color) = self.state_glyph(tab_activity(&self.snap, t));
+                if self.tab_unread(t) {
+                    color = th.accent; // unread badge
+                }
+                let text = if self.cfg.ui.tab_numbers {
+                    format!("{} {}", i + 1, t.name)
+                } else {
+                    t.name.clone()
+                };
+                // Every tab is a filled "pill": pad + icon + text + pad, then a gap.
+                let width =
+                    (pad.chars().count() * 2 + 2 + text.chars().count()) as u16;
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
-                let style = if active {
-                    Style::default()
-                        .bg(th.select_bg)
-                        .fg(th.bar_active_fg)
-                        .add_modifier(Modifier::BOLD)
+                let (bg, fg, bold) = if active {
+                    (th.select_bg, th.bar_active_fg, true)
                 } else if hovered {
-                    Style::default().bg(th.select_bg).fg(th.bar_active_fg)
+                    (th.select_bg, th.bar_active_fg, false)
                 } else {
-                    Style::default().fg(th.bar_fg)
+                    (th.surface, th.bar_fg, false)
                 };
-                spans.push(Span::styled(format!("{g} "), style.fg(color)));
-                spans.push(Span::styled(label, style));
-                spans.push(Span::raw(" "));
+                let mut base = Style::default().bg(bg).fg(fg);
+                if bold {
+                    base = base.add_modifier(Modifier::BOLD);
+                }
+                spans.push(Span::styled(pad.clone(), base));
+                spans.push(Span::styled(format!("{g} "), base.fg(color)));
+                spans.push(Span::styled(format!("{text}{pad}"), base));
+                spans.push(Span::raw(" ")); // gap between pills
                 hits.push((Some(t.id), range));
                 x += width + 1;
             }
@@ -1529,6 +1765,28 @@ impl App {
         }
     }
 
+    /// Draw a subtle line in each split gutter so seams read as intentional.
+    fn draw_dividers(&self, f: &mut Frame) {
+        if !self.cfg.ui.pane_divider || self.zoomed || self.cfg.ui.gutter == 0 {
+            return;
+        }
+        let Some(t) = self.active_tab() else { return };
+        let mut segs = Vec::new();
+        node_dividers(&t.layout, self.frame.panes, self.cfg.ui.gutter, &mut segs);
+        let style = Style::default().fg(self.cfg.theme.border).bg(self.cfg.theme.bg);
+        for (rect, vertical) in segs {
+            if vertical {
+                let lines: Vec<Line> = (0..rect.height)
+                    .map(|_| Line::from(Span::styled("│", style)))
+                    .collect();
+                f.render_widget(Paragraph::new(lines), rect);
+            } else {
+                let bar = "─".repeat(rect.width as usize);
+                f.render_widget(Paragraph::new(Line::from(Span::styled(bar, style))), rect);
+            }
+        }
+    }
+
     fn draw_menu(&self, f: &mut Frame) {
         let Some(m) = &self.menu else { return };
         let th = &self.cfg.theme;
@@ -1626,6 +1884,41 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_prompt(&self, f: &mut Frame) {
+        let Some(p) = &self.prompt else { return };
+        let th = &self.cfg.theme;
+        let w: u16 = 52;
+        let h: u16 = 6;
+        let x = self.size.0.saturating_sub(w) / 2;
+        let y = self.size.1.saturating_sub(h) / 3;
+        let r = Rect::new(x, y, w.min(self.size.0), h.min(self.size.1));
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg))
+            .title(Line::from(Span::styled(
+                format!(" {} ", p.label),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let lines = vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  › ", Style::default().fg(th.accent)),
+                Span::styled(p.buffer.clone(), Style::default().fg(th.bar_active_fg)),
+                Span::styled("▎", Style::default().fg(th.accent)),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  enter confirm · esc cancel",
+                Style::default().fg(th.status_fg),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_toast(&self, f: &mut Frame) {
         let Some((msg, _)) = &self.toast else { return };
         let th = &self.cfg.theme;
@@ -1682,6 +1975,7 @@ impl App {
             self.draw_tab_strip(f, Rect::new(m.x, r, m.width, 1));
         }
         self.draw_panes(f);
+        self.draw_dividers(f);
         if let Some(r) = self.frame.footer {
             self.draw_footer(f, Rect::new(0, r, area.width, 1));
         }
@@ -1694,6 +1988,7 @@ impl App {
         }
         self.draw_menu(f);
         self.draw_help(f);
+        self.draw_prompt(f);
         self.draw_toast(f);
     }
 }
@@ -1723,6 +2018,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         views: HashMap::new(),
         focused,
         seen: HashSet::new(),
+        unread: HashSet::new(),
         cwd: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".to_string()),
@@ -1733,6 +2029,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         drawer: false,
         help: false,
         menu: None,
+        prompt: None,
         drag: None,
         hover: None,
         tick: 0,
