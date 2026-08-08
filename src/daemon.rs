@@ -38,6 +38,11 @@ struct PaneSession {
     /// program repainting (e.g. a shell redrawing its prompt), so it must NOT
     /// count as "working" — otherwise idle panes spin every time you switch view.
     resized_at: std::time::Instant,
+    /// Throttle for the (expensive) full-screen agent-prompt scan: last scan time
+    /// and its cached result. Heavy output (Claude Code redraws) would otherwise
+    /// scan the whole screen thousands of times/sec under the state lock.
+    last_prompt_scan: std::time::Instant,
+    prompt_cached: bool,
     /// Scrollback changed since the last disk flush.
     dirty: bool,
     /// Rendered screen state — activity classification reads what a user would
@@ -968,6 +973,8 @@ fn spawn_pane_with_id(
             resized_at: std::time::Instant::now(),
             reported: None,
             image: None,
+            last_prompt_scan: std::time::Instant::now(),
+            prompt_cached: false,
             dirty: false,
             screen,
         },
@@ -1064,10 +1071,17 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     // A strong agent prompt on screen means "waiting on you", even
                     // while the prompt animates (redraws keep output flowing, so the
                     // quiet-classifier would otherwise never get to re-check it).
-                    let text = p.screen.screen().contents().to_lowercase();
-                    let waiting_prompt = text.contains("esc to cancel")
-                        || text.contains("do you want to proceed")
-                        || text.contains("tab to amend");
+                    // Scanning the whole screen is expensive, so throttle it to a few
+                    // times/sec and reuse the cached result in between — otherwise a
+                    // flood of redraws (Claude Code) pegs the daemon under the lock.
+                    if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250) {
+                        let text = p.screen.screen().contents().to_lowercase();
+                        p.prompt_cached = text.contains("esc to cancel")
+                            || text.contains("do you want to proceed")
+                            || text.contains("tab to amend");
+                        p.last_prompt_scan = std::time::Instant::now();
+                    }
+                    let waiting_prompt = p.prompt_cached;
                     // Ignore repaint bursts triggered by a resize (view switch) —
                     // otherwise idle panes flash "working" whenever you change spaces.
                     let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
