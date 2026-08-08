@@ -371,3 +371,35 @@ fn reload_broadcasts_config_changed() {
     }
     assert!(saw, "listener never received config_changed broadcast");
 }
+
+#[test]
+fn multiple_requests_on_one_connection() {
+    // Exercises the framed reader: several newline-delimited requests sent
+    // back-to-back on a single connection must each get their matching response.
+    let d = Daemon::start("multiplex");
+    let mut stream = UnixStream::connect(d.dir.join("ruckus.sock")).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Send three snapshots at once (all in one write, no delays).
+    let mut out = String::new();
+    for seq in 1..=3 {
+        out.push_str(&json!({"seq": seq, "req": {"type": "snapshot"}}).to_string());
+        out.push('\n');
+    }
+    stream.write_all(out.as_bytes()).unwrap();
+
+    let reader = BufReader::new(stream);
+    let mut seen = std::collections::HashSet::new();
+    for line in reader.lines() {
+        let line = line.unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
+            assert_eq!(v["msg"]["type"], "state");
+            seen.insert(seq);
+            if seen.len() == 3 {
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, [1, 2, 3].into_iter().collect());
+}

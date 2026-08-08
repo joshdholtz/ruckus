@@ -179,6 +179,9 @@ struct App {
     /// Reorder-drag state: a tab or space being dragged in the strip/sidebar.
     tab_drag: Option<u64>,
     space_drag: Option<u64>,
+    /// Last reorder target sent during the active tab/space drag — dedups the
+    /// per-mouse-move MoveTab/MoveSpace round-trips so a drag can't flood the socket.
+    drag_target: Option<u64>,
     /// Alt+drag a pane onto another to swap them.
     swap_from: Option<u64>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
@@ -595,8 +598,14 @@ impl App {
         let ((sr, sc), (er, ec)) = sel.ordered();
         let Some(view) = self.views.get(&sel.pane) else { return };
         let screen = view.parser.screen();
-        let (_, cols) = screen.size();
-        let ec2 = ec.saturating_add(1).min(cols); // include the cell under the cursor
+        let (rows, cols) = screen.size();
+        // Clamp every coordinate to the grid: a client/daemon size desync can put
+        // the selection outside the pane's vt100 screen, and contents_between does
+        // an unguarded `cols - start_col` that would underflow-panic in debug.
+        let last_row = rows.saturating_sub(1);
+        let (sr, er) = (sr.min(last_row), er.min(last_row));
+        let sc = sc.min(cols);
+        let ec2 = ec.saturating_add(1).min(cols).max(sc); // include the cell under the cursor
         let text = screen.contents_between(sr, sc, er, ec2);
         let text = text.trim_end().to_string();
         if text.is_empty() {
@@ -1304,11 +1313,12 @@ impl App {
                             .find(|(_, r)| r.contains(&col))
                             .and_then(|(id, _)| *id);
                         if let Some(target) = over {
-                            if target != tab {
+                            if target != tab && self.drag_target != Some(target) {
                                 if let Some(to) = self
                                     .active_space()
                                     .and_then(|s| s.tabs.iter().position(|t| t.id == target))
                                 {
+                                    self.drag_target = Some(target);
                                     let _ = self.client.request(Request::MoveTab { tab, to }).await;
                                 }
                             }
@@ -1325,10 +1335,11 @@ impl App {
                             _ => None,
                         });
                     if let Some(target) = over {
-                        if target != space {
+                        if target != space && self.drag_target != Some(target) {
                             if let Some(to) =
                                 self.snap.spaces.iter().position(|s| s.id == target)
                             {
+                                self.drag_target = Some(target);
                                 let _ =
                                     self.client.request(Request::MoveSpace { space, to }).await;
                             }
@@ -1347,6 +1358,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.tab_drag = None;
                 self.space_drag = None;
+                self.drag_target = None;
                 if let Some(from) = self.swap_from.take() {
                     if let Some(to) = self.pane_at(col, row) {
                         if to != from {
@@ -2214,7 +2226,9 @@ impl App {
                 } else {
                     t.name.clone()
                 };
-                let tlen = text.chars().count();
+                // Display width, not char count — a CJK/emoji tab name renders
+                // wider than its char count, which would drift the × hit region.
+                let tlen = Span::raw(text.as_str()).width();
                 // Pill: pad + "icon " + text + " ×" + pad, then a gap.
                 let width = (plen * 2 + tlen + 4) as u16;
                 let range = x..x + width;
@@ -2917,6 +2931,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         tab_close_hits: Vec::new(),
         tab_drag: None,
         space_drag: None,
+        drag_target: None,
         swap_from: None,
         footer_hits: Vec::new(),
         pane_rects: Vec::new(),

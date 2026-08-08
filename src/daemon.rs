@@ -482,19 +482,48 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
         }
     });
 
-    let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<ClientFrame>(&line) {
-            Ok(frame) => {
-                info!("conn {conn_id}: request {:?}", frame.req);
-                let msg = handle_request(&state, conn_id, frame.req);
-                info!("conn {conn_id}: responding");
-                send(&tx, Some(frame.seq), msg);
+    // Read newline-delimited requests with a hard per-line cap, so a peer that
+    // never sends a newline (or sends a giant payload) can't balloon the daemon.
+    const MAX_LINE: usize = 16 * 1024 * 1024;
+    let mut reader = BufReader::new(read_half);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        let (found_nl, used, eof) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (false, 0, true)
+            } else if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..nl]);
+                (true, nl + 1, false)
+            } else {
+                buf.extend_from_slice(available);
+                (false, available.len(), false)
             }
-            Err(e) => send(&tx, None, ServerMsg::Error { message: format!("bad request: {e}") }),
+        };
+        reader.consume(used);
+        if buf.len() > MAX_LINE {
+            send(&tx, None, ServerMsg::Error { message: "request too large".into() });
+            break;
+        }
+        if found_nl {
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ClientFrame>(&line) {
+                Ok(frame) => {
+                    log_request(conn_id, &frame.req);
+                    let msg = handle_request(&state, conn_id, frame.req);
+                    send(&tx, Some(frame.seq), msg);
+                }
+                Err(e) => {
+                    send(&tx, None, ServerMsg::Error { message: format!("bad request: {e}") })
+                }
+            }
+        }
+        if eof {
+            break;
         }
     }
 
@@ -507,6 +536,17 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
     }
     writer_task.abort();
     Ok(())
+}
+
+/// Log a request without dumping payloads — Input carries keystrokes/pastes we
+/// must not write to disk, and other variants can be large.
+fn log_request(conn_id: u64, req: &Request) {
+    match req {
+        Request::Input { pane, data } => {
+            info!("conn {conn_id}: input pane {pane} ({} bytes)", data.len())
+        }
+        other => info!("conn {conn_id}: {other:?}"),
+    }
 }
 
 fn send(tx: &Tx, seq: Option<u64>, msg: ServerMsg) {
@@ -1039,9 +1079,19 @@ fn resolve_fg_names(pids: &[i32]) -> HashMap<i32, String> {
 
 async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<SessionEvent>) {
     while let Some(ev) = rx.recv().await {
-        let mut st = state.lock().unwrap();
         match ev {
             SessionEvent::Output(bytes) => {
+                // Encode the broadcast frame BEFORE taking the global lock. For a
+                // large chunk the base64 + JSON is the dominant per-chunk cost;
+                // doing it lock-free keeps one noisy pane from stalling every other
+                // pane that contends on the single State mutex.
+                let out_frame = serde_json::to_string(&ServerFrame {
+                    seq: None,
+                    msg: ServerMsg::Output { pane: id, data: B64.encode(&bytes) },
+                })
+                .unwrap();
+
+                let mut st = state.lock().unwrap();
                 let changed = {
                     let Some(p) = st.panes.get_mut(&id) else { continue };
                     p.scrollback.extend(bytes.iter().copied());
@@ -1111,15 +1161,11 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 }
                 let Some(p) = st.panes.get_mut(&id) else { continue };
                 if !p.subs.is_empty() {
-                    let frame = serde_json::to_string(&ServerFrame {
-                        seq: None,
-                        msg: ServerMsg::Output { pane: id, data: B64.encode(&bytes) },
-                    })
-                    .unwrap();
-                    p.subs.retain(|_, tx| tx.send(frame.clone()).is_ok());
+                    p.subs.retain(|_, tx| tx.send(out_frame.clone()).is_ok());
                 }
             }
             SessionEvent::Exited(code) => {
+                let mut st = state.lock().unwrap();
                 let known = if let Some(p) = st.panes.get_mut(&id) {
                     p.info.status = PaneStatus::Exited { code };
                     p.info.activity = Activity::Done;
