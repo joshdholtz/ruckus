@@ -1959,16 +1959,27 @@ impl App {
                         } else {
                             Style::default()
                         };
-                        let name_fg = if selected { th.bar_active_fg } else { th.bar_active_fg };
+                        // Line 1: state dot + agent name (bold), highlight spans both lines.
                         let mut spans = vec![
                             Span::styled("  ".to_string(), row_style),
                             Span::styled(format!("{g} "), row_style.fg(color)),
-                            Span::styled(tab_name, row_style.fg(name_fg)),
-                            Span::styled(format!("  {space_name}"), row_style.fg(th.status_fg)),
+                            Span::styled(
+                                tab_name,
+                                row_style.fg(th.bar_active_fg).add_modifier(Modifier::BOLD),
+                            ),
                         ];
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
                         push!(Line::from(spans), Some(Target::Pane(pid)));
+                        // Line 2: dimmed space it lives in.
+                        let sub_fg = if selected { th.bar_fg } else { th.status_fg };
+                        let mut sub = vec![
+                            Span::styled("      ".to_string(), row_style),
+                            Span::styled(space_name, row_style.fg(sub_fg)),
+                        ];
+                        let pad = w.saturating_sub(spans_width(&sub));
+                        sub.push(Span::styled(" ".repeat(pad), row_style));
+                        push!(Line::from(sub), Some(Target::Pane(pid)));
                     }
                     push!(Line::raw(""), None::<Target>);
                 }
