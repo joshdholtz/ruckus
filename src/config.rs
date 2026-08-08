@@ -723,6 +723,18 @@ impl Config {
             .map(|(a, _)| *a)
     }
 
+    /// Footer/help hint for an action: the tmux prefix form (e.g. "^b c") when a
+    /// prefix is set and the action has a prefix key, else the direct chord.
+    pub fn hint(&self, action: Action) -> String {
+        if let Some(pfx) = &self.prefix {
+            if let Some(b) = self.prefix_keys.get(&action).and_then(|bs| bs.first()) {
+                let p = pfx.label().replace("ctrl+", "^").replace("alt+", "M-");
+                return format!("{p} {}", b.label());
+            }
+        }
+        self.label(action)
+    }
+
     pub fn label(&self, action: Action) -> String {
         self.keys
             .get(&action)
