@@ -386,7 +386,7 @@ pub async fn run() -> Result<()> {
                             if p.subs.is_empty() {
                                 notify_system(
                                     "ruckus",
-                                    &format!("{} is waiting for you", p.info.title),
+                                    &format!("🐏 {} needs you", p.info.title),
                                 );
                             }
                         }
@@ -1144,7 +1144,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     if a == Activity::Waiting && st.notify_waiting {
                         if let Some(p) = st.panes.get(&id) {
                             if p.subs.is_empty() {
-                                notify_system("ruckus", &format!("{} is waiting for you", p.info.title));
+                                notify_system("ruckus", &format!("🐏 {} needs you", p.info.title));
                             }
                         }
                     }
@@ -1181,7 +1181,11 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                             if p.subs.is_empty() {
                                 notify_system(
                                     "ruckus",
-                                    &format!("{} finished (exit {code})", p.info.title),
+                                    &if code == 0 {
+                                        format!("✓ {} finished", p.info.title)
+                                    } else {
+                                        format!("✗ {} exited ({code})", p.info.title)
+                                    },
                                 );
                             }
                         }

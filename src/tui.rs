@@ -905,7 +905,7 @@ impl App {
                 let next = self.attention().first().map(|p| p.id);
                 match next {
                     Some(p) => self.goto_pane(p).await,
-                    None => self.toast("nothing needs you"),
+                    None => self.toast("🐏 all quiet — nothing needs you"),
                 }
             }
             Action::SplitRight => self.split_action(self.focused, Dir::Right).await,

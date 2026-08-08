@@ -103,6 +103,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// List built-in themes, or switch to one: `ruckus theme nord`
+    Theme { name: Option<String> },
     /// Tell the daemon and every attached TUI to reload config.toml now
     Reload,
 }
@@ -162,8 +164,42 @@ async fn main() -> Result<()> {
             simple_req(Request::ReportAgent { pane, name }, "reported").await
         }
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
+        Some(Cmd::Theme { name }) => theme_cmd(name).await,
         Some(Cmd::Reload) => reload().await,
     }
+}
+
+async fn theme_cmd(name: Option<String>) -> Result<()> {
+    let path = config::ensure_config_file();
+    let current = {
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
+        doc.get("theme")
+            .and_then(|t| t.get("preset"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("macchiato")
+            .to_string()
+    };
+    let Some(name) = name else {
+        println!("themes:");
+        for n in config::THEME_NAMES {
+            let mark = if *n == current { "●" } else { " " };
+            println!("  {mark} {n}");
+        }
+        println!("\nswitch with: ruckus theme <name>");
+        return Ok(());
+    };
+    if config::theme_preset(&name).is_none() {
+        anyhow::bail!("unknown theme '{name}' — try: {}", config::THEME_NAMES.join(", "));
+    }
+    let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
+    if doc.get("theme").is_none() {
+        doc["theme"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["theme"]["preset"] = toml_edit::value(name.as_str());
+    std::fs::write(&path, doc.to_string())?;
+    reload_if_running().await;
+    println!("theme set to {name}");
+    Ok(())
 }
 
 async fn reload() -> Result<()> {

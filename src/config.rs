@@ -170,26 +170,63 @@ pub struct Theme {
     pub done_err: Color,
 }
 
+const fn rgb(v: u32) -> Color {
+    Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
 impl Default for Theme {
     fn default() -> Self {
-        Theme {
-            accent: Color::Rgb(0xf5, 0xa9, 0x7f),
-            border: Color::Rgb(0x3b, 0x40, 0x58),
-            bg: Color::Rgb(0x0f, 0x11, 0x17),
-            surface: Color::Rgb(0x1c, 0x20, 0x30),
-            bar_bg: Color::Rgb(0x16, 0x19, 0x25),
-            bar_fg: Color::Rgb(0x8f, 0x93, 0xa2),
-            bar_active_fg: Color::Rgb(0xca, 0xd3, 0xf5),
-            status_fg: Color::Rgb(0x6e, 0x73, 0x8d),
-            sidebar_bg: Color::Rgb(0x16, 0x19, 0x25),
-            select_bg: Color::Rgb(0x2e, 0x33, 0x48),
-            working: Color::Rgb(0x8a, 0xad, 0xf4),
-            waiting: Color::Rgb(0xee, 0xd4, 0x9f),
-            idle: Color::Rgb(0x5b, 0x60, 0x78),
-            done_ok: Color::Rgb(0xa6, 0xda, 0x95),
-            done_err: Color::Rgb(0xed, 0x87, 0x96),
-        }
+        theme_preset("macchiato").expect("default preset exists")
     }
+}
+
+/// Built-in theme names, in the order `ruckus theme list` shows them.
+pub const THEME_NAMES: &[&str] =
+    &["macchiato", "latte", "gruvbox", "nord", "tokyonight", "dracula", "rosepine"];
+
+/// A named built-in palette. Fields map: accent, border, bg, surface, bar_bg,
+/// bar_fg, bar_active_fg, status_fg, sidebar_bg, select_bg, working, waiting,
+/// idle, done_ok, done_err.
+pub fn theme_preset(name: &str) -> Option<Theme> {
+    let t = |accent, border, bg, surface, bar_bg, bar_fg, bar_active_fg, status_fg, sidebar_bg,
+             select_bg, working, waiting, idle, done_ok, done_err| Theme {
+        accent: rgb(accent), border: rgb(border), bg: rgb(bg), surface: rgb(surface),
+        bar_bg: rgb(bar_bg), bar_fg: rgb(bar_fg), bar_active_fg: rgb(bar_active_fg),
+        status_fg: rgb(status_fg), sidebar_bg: rgb(sidebar_bg), select_bg: rgb(select_bg),
+        working: rgb(working), waiting: rgb(waiting), idle: rgb(idle),
+        done_ok: rgb(done_ok), done_err: rgb(done_err),
+    };
+    Some(match name.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+        "macchiato" | "default" | "catppuccin" => t(
+            0xf5a97f, 0x3b4058, 0x0f1117, 0x1c2030, 0x161925, 0x8f93a2, 0xcad3f5, 0x6e738d,
+            0x161925, 0x2e3348, 0x8aadf4, 0xeed49f, 0x5b6078, 0xa6da95, 0xed8796,
+        ),
+        "latte" => t(
+            0xfe640b, 0xbcc0cc, 0xeff1f5, 0xe6e9ef, 0xdce0e8, 0x6c6f85, 0x4c4f69, 0x8c8fa1,
+            0xdce0e8, 0xccd0da, 0x1e66f5, 0xdf8e1d, 0x9ca0b0, 0x40a02b, 0xd20f39,
+        ),
+        "gruvbox" => t(
+            0xfe8019, 0x504945, 0x1d2021, 0x282828, 0x1d2021, 0x928374, 0xebdbb2, 0x7c6f64,
+            0x1d2021, 0x3c3836, 0x83a598, 0xfabd2f, 0x665c54, 0xb8bb26, 0xfb4934,
+        ),
+        "nord" => t(
+            0x88c0d0, 0x434c5e, 0x2e3440, 0x3b4252, 0x2e3440, 0x616e88, 0xeceff4, 0x4c566a,
+            0x2e3440, 0x434c5e, 0x81a1c1, 0xebcb8b, 0x4c566a, 0xa3be8c, 0xbf616a,
+        ),
+        "tokyonight" => t(
+            0xff9e64, 0x3b4261, 0x1a1b26, 0x24283b, 0x16161e, 0x565f89, 0xc0caf5, 0x545c7e,
+            0x16161e, 0x2f334d, 0x7aa2f7, 0xe0af68, 0x565f89, 0x9ece6a, 0xf7768e,
+        ),
+        "dracula" => t(
+            0xff79c6, 0x44475a, 0x282a36, 0x1e2029, 0x191a21, 0x6272a4, 0xf8f8f2, 0x6272a4,
+            0x191a21, 0x44475a, 0xbd93f9, 0xf1fa8c, 0x6272a4, 0x50fa7b, 0xff5555,
+        ),
+        "rosepine" => t(
+            0xebbcba, 0x403d52, 0x191724, 0x1f1d2e, 0x15131f, 0x6e6a86, 0xe0def4, 0x6e6a86,
+            0x15131f, 0x26233a, 0x31748f, 0xf6c177, 0x6e6a86, 0x9ccfd8, 0xeb6f92,
+        ),
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,7 +641,12 @@ impl Config {
             }
         }
 
-        let mut theme = Theme::default();
+        // Start from a named preset if given, then layer individual overrides on top.
+        let mut theme = raw
+            .theme
+            .get("preset")
+            .and_then(|n| theme_preset(n))
+            .unwrap_or_default();
         let t = &raw.theme;
         let set = |field: &mut Color, name: &str| {
             if let Some(c) = t.get(name).and_then(|s| parse_hex(s)) {
@@ -846,6 +888,8 @@ focus = "▎"                 # focused pane marker in its title bar
 spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
 [theme]
+# preset = "macchiato"    # macchiato latte gruvbox nord tokyonight dracula rosepine
+                          # (or `ruckus theme <name>`); overrides below still win
 accent = "#f5a97f"        # focus marker, active tab, buttons
 border = "#3b4058"        # popup/dialog borders (panes are borderless layers)
 bg = "#0f1117"            # root background — the gutters between panes
@@ -877,6 +921,18 @@ mod tests {
         assert!(parse_binding("f5").is_ok());
         assert!(parse_binding("alt-pageup").is_ok());
         assert!(parse_binding("bogus-key").is_err());
+    }
+
+    #[test]
+    fn all_named_themes_resolve() {
+        for name in THEME_NAMES {
+            assert!(theme_preset(name).is_some(), "preset {name} missing");
+        }
+        assert!(theme_preset("nope").is_none());
+        // preset selects the base palette; explicit keys still override it
+        let cfg = Config::from_toml_str("[theme]\npreset = \"nord\"\naccent = \"#ffffff\"\n");
+        assert_eq!(cfg.theme.bg, theme_preset("nord").unwrap().bg);
+        assert_eq!(cfg.theme.accent, Color::Rgb(0xff, 0xff, 0xff));
     }
 
     #[test]
