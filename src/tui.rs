@@ -233,6 +233,8 @@ struct App {
     zoomed: bool,
     drawer: bool,
     help: bool,
+    /// Shown once on first ever launch; dismissed by any key/click.
+    welcome: bool,
     prefix_pending: bool,
     menu: Option<Menu>,
     prompt: Option<Prompt>,
@@ -1105,6 +1107,11 @@ impl App {
         }
     }
 
+    fn dismiss_welcome(&mut self) {
+        self.welcome = false;
+        let _ = std::fs::write(crate::protocol::ruckus_dir().join(".welcomed"), b"1");
+    }
+
     /// Palette rows matching the current query, best match first.
     fn palette_filtered(&self) -> Vec<(Action, &'static str)> {
         let q = self.palette.as_ref().map(|(q, _)| q.to_lowercase()).unwrap_or_default();
@@ -1241,6 +1248,12 @@ impl App {
             return;
         }
         let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
+
+        // First-run welcome: any key dismisses it and it never shows again.
+        if self.welcome {
+            self.dismiss_welcome();
+            return;
+        }
 
         // Command palette: a fuzzy action launcher that swallows keys while open.
         if self.palette.is_some() {
@@ -1671,6 +1684,10 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.welcome {
+                    self.dismiss_welcome();
+                    return;
+                }
                 // Any fresh left-press clears a prior selection.
                 self.select = None;
                 self.selecting = false;
@@ -2930,6 +2947,67 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_welcome(&self, f: &mut Frame) {
+        if !self.welcome {
+            return;
+        }
+        let th = &self.cfg.theme;
+        let key = |a: Action| self.cfg.hint(a);
+        let body: Vec<(String, String)> = vec![
+            (String::new(), String::new()),
+            ("your agents keep running in the".into(), String::new()),
+            ("background — this is where you".into(), String::new()),
+            ("watch the herd.".into(), String::new()),
+            (String::new(), String::new()),
+            (key(Action::Palette), "find any command".into()),
+            (key(Action::ShowHelp), "all keys".into()),
+            (key(Action::Search), "search scrollback".into()),
+            (key(Action::ToggleSidebar), "sidebar (☰ on mobile)".into()),
+            (key(Action::Quit), "quit — agents keep running".into()),
+            (String::new(), String::new()),
+            ("press any key to start".into(), String::new()),
+        ];
+        let w: u16 = 42.min(self.size.0.saturating_sub(4));
+        let h = body.len() as u16 + 4;
+        let x = self.size.0.saturating_sub(w) / 2;
+        let y = self.size.1.saturating_sub(h) / 2;
+        let r = Rect::new(x, y, w, h.min(self.size.1));
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+            "  🐏  ruckus",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))];
+        let iw = inner.width as usize;
+        for (a, b) in &body {
+            if b.is_empty() {
+                // centered prose / heading line
+                let calm = a == "press any key to start";
+                lines.push(Line::from(Span::styled(
+                    format!("  {a}"),
+                    Style::default().fg(if calm { th.status_fg } else { th.bar_active_fg }),
+                )));
+            } else {
+                let pad = iw.saturating_sub(2 + a.chars().count() + b.chars().count() + 2);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {a}"),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" ".repeat(pad + 2), Style::default()),
+                    Span::styled(b.clone(), Style::default().fg(th.bar_fg)),
+                ]));
+            }
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_search_bar(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
         let q = self.search.as_deref().unwrap_or("");
@@ -3067,6 +3145,7 @@ impl App {
             (self.cfg.hint(Action::ToggleSidebar), "toggle sidebar"),
             (self.cfg.hint(Action::Zoom), "zoom focused pane"),
             (self.cfg.hint(Action::Search), "search scrollback (n/N cycle)"),
+            (self.cfg.hint(Action::Palette), "command palette"),
             ("alt+1..9".into(), "jump to tab"),
             ("enter".into(), "restart a finished pane"),
             (self.cfg.hint(Action::Quit), "quit (daemon keeps running)"),
@@ -3241,6 +3320,7 @@ impl App {
         }
         self.draw_menu(f);
         self.draw_help(f);
+        self.draw_welcome(f);
         self.draw_palette(f);
         self.draw_prompt(f);
         self.draw_prefix_indicator(f);
@@ -3264,6 +3344,9 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         .unwrap_or(0);
 
     let sidebar = cfg.ui.sidebar_start_visible;
+    // Show the welcome overlay until the user has seen it once.
+    let welcome_marker = crate::protocol::ruckus_dir().join(".welcomed");
+    let welcome = !welcome_marker.exists();
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
     let mut app = App {
@@ -3284,6 +3367,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         zoomed: false,
         drawer: false,
         help: false,
+        welcome,
         prefix_pending: false,
         menu: None,
         prompt: None,

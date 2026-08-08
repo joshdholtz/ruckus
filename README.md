@@ -83,7 +83,9 @@ All rebindable in `~/.ruckus/config.toml` (created on first run).
 | alt+o / alt+i | next / prev pane | alt+n | new space |
 | alt+pgup / alt+pgdn | scroll history | alt+. / alt+, | next / prev space |
 | alt+a | jump to next pane that needs you | alt+b | toggle sidebar |
-| alt+/ | key reference overlay | alt+q or ctrl+q | quit TUI (daemon keeps running) |
+| alt+p | command palette (fuzzy-find any action) | alt+f | search scrollback (n/N cycle) |
+| alt+z | zoom focused pane | alt+/ | key reference overlay |
+| alt+q or ctrl+q | quit TUI (daemon keeps running) | | |
 
 Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, panes. Right-click panes for a menu. Drag borders to resize. Wheel scrolls history.
 
@@ -99,7 +101,7 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 | `[glyphs]` | State icons, focus marker, spinner frames |
 | Row templates | `space_row` / `tab_row` / `queue_row` with `{icon} {title} {name} {id} {cmd} {cwd}` tokens |
 
-The only thing ruckus can't control is the font — that belongs to your terminal app.
+Or pick a built-in theme: `ruckus theme` lists them (macchiato, latte, gruvbox, nord, tokyonight, dracula, rosepine), `ruckus theme nord` switches live. The only thing ruckus can't control is the font — that belongs to your terminal app.
 
 **Live reload:** `ruckus config set …` applies to a running TUI instantly (theme, glyphs, keys, layout — all of it). Hand-edited the file? `ruckus reload` pushes it to every attached client. Only `spinner_ms` needs a restart.
 
@@ -130,6 +132,9 @@ The daemon speaks newline-delimited JSON-RPC over `~/.ruckus/ruckus.sock` — th
 - [x] pane zoom, restart-in-place, tab/space rename
 - [x] session persistence across daemon restarts (panes respawn under same ids)
 - [x] system notifications when a pane needs you and nobody's attached
-- [ ] layout presets, drag-select copy
+- [x] command palette (alt+p), scrollback search (alt+f)
+- [x] theme presets (`ruckus theme`), state-change motion, graceful reconnect
+- [x] first-run welcome, drag-select copy (OSC 52 — reaches your phone)
+- [ ] layout presets, swipe gestures
 - [ ] Lua scripting
 - [ ] remote transport (TCP + auth) → native phone / web clients
