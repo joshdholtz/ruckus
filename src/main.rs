@@ -108,6 +108,9 @@ enum Cmd {
     Theme { name: Option<String> },
     /// Tell the daemon and every attached TUI to reload config.toml now
     Reload,
+    /// Upgrade the running daemon to the current binary WITHOUT killing panes
+    /// (re-execs in place; your agents keep running)
+    Upgrade,
 }
 
 #[derive(Subcommand)]
@@ -167,7 +170,21 @@ async fn main() -> Result<()> {
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
         Some(Cmd::Theme { name }) => theme_cmd(name).await,
         Some(Cmd::Reload) => reload().await,
+        Some(Cmd::Upgrade) => upgrade().await,
     }
+}
+
+async fn upgrade() -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    // The daemon re-execs and drops this connection, so don't wait for a reply.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.request(Request::Upgrade),
+    )
+    .await;
+    println!("ruckus daemon upgraded in place — panes and agents kept running");
+    Ok(())
 }
 
 async fn theme_cmd(name: Option<String>) -> Result<()> {

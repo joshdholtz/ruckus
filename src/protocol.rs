@@ -56,6 +56,9 @@ pub enum Request {
     /// Re-read config.toml: daemon refreshes its own settings and tells every
     /// attached client to reload and re-render.
     Reload,
+    /// Zero-downtime upgrade: the daemon re-execs the current binary in place,
+    /// keeping every pane's PTY + child process alive. Clients reconnect.
+    Upgrade,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

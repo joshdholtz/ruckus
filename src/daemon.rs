@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -14,6 +17,84 @@ use tracing::{error, info};
 use crate::protocol::*;
 
 type Tx = UnboundedSender<String>;
+
+/// A pane's PTY, owned as a raw master fd + child pid so it can be handed off
+/// across a self-exec upgrade (portable-pty's handles can't survive exec, but a
+/// bare fd + pid can — exec keeps open fds and child processes alive).
+struct Pty {
+    master_fd: RawFd,
+    pid: i32,
+    writer: File,
+}
+
+/// Wait for a child and return its exit code (1 if it didn't exit cleanly).
+fn reap(pid: i32) -> u32 {
+    let mut status = 0i32;
+    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if r > 0 && unsafe { libc::WIFEXITED(status) } {
+        unsafe { libc::WEXITSTATUS(status) as u32 }
+    } else {
+        1
+    }
+}
+
+/// dup an fd; `cloexec` controls whether the copy survives exec.
+fn dup_fd(fd: RawFd, cloexec: bool) -> std::io::Result<RawFd> {
+    let new = unsafe { libc::dup(fd) };
+    if new < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        let flags = if cloexec { libc::FD_CLOEXEC } else { 0 };
+        libc::fcntl(new, libc::F_SETFD, flags);
+    }
+    Ok(new)
+}
+
+impl Pty {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(self.master_fd, libc::TIOCSWINSZ, &ws);
+        }
+    }
+
+    /// Foreground process group of the terminal (for pane_current_command detection).
+    fn fg_pgrp(&self) -> Option<i32> {
+        let p = unsafe { libc::tcgetpgrp(self.master_fd) };
+        if p > 1 {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    fn kill(&self) {
+        unsafe {
+            libc::kill(self.pid, libc::SIGHUP);
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // writer (a dup) closes itself; close the canonical master fd.
+        unsafe {
+            libc::close(self.master_fd);
+        }
+    }
+}
 
 enum SessionEvent {
     Output(Vec<u8>),
@@ -29,9 +110,7 @@ struct Sub {
 
 struct PaneSession {
     info: PaneInfo,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    pty: Pty,
     scrollback: VecDeque<u8>,
     /// conn_id → subscriber. PTY size is the max of all attached sizes so a
     /// tiny `tail` client cannot shrink a full TUI (and vice-versa fights are
@@ -92,14 +171,14 @@ fn is_known_agent(prog: &str) -> bool {
 /// siblings that stayed in that group; SIGHUP mimics a terminal hangup so job
 /// control shells tend to tear down foreground jobs too.
 fn kill_pane_session(p: &mut PaneSession) {
-    if let Some(pgid) = p.master.process_group_leader() {
+    if let Some(pgid) = p.pty.fg_pgrp() {
         // Negative pid = whole process group.
         unsafe {
             let _ = libc::kill(-pgid, libc::SIGHUP);
             let _ = libc::kill(-pgid, libc::SIGTERM);
         }
     }
-    let _ = p.killer.kill();
+    p.pty.kill();
 }
 
 /// Resize the PTY to the max dimensions requested by any attached subscriber.
@@ -112,12 +191,7 @@ fn apply_max_attach_size(p: &mut PaneSession) {
     if rows == 0 || cols == 0 {
         return;
     }
-    let _ = p.master.resize(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    });
+    p.pty.resize(rows, cols);
     p.resized_at = std::time::Instant::now();
     p.screen.set_size(rows, cols);
 }
@@ -132,6 +206,59 @@ fn scrollback_path(id: u64) -> std::path::PathBuf {
 struct Persisted {
     snapshot: Snapshot,
     next_id: u64,
+}
+
+/// Handoff manifest for a self-exec upgrade: which live fds/pids map to which
+/// panes, plus the listening socket fd, so the new binary can adopt them all.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Handoff {
+    listener_fd: RawFd,
+    panes: Vec<HandoffPane>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct HandoffPane {
+    id: u64,
+    fd: RawFd,
+    pid: i32,
+    rows: u16,
+    cols: u16,
+}
+
+fn handoff_path() -> std::path::PathBuf {
+    ruckus_dir().join("handoff.json")
+}
+
+/// Clear FD_CLOEXEC so the fd survives exec.
+fn clear_cloexec(fd: RawFd) {
+    unsafe {
+        let f = libc::fcntl(fd, libc::F_GETFD);
+        if f >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, f & !libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Zero-downtime upgrade: keep every pane's PTY + child alive by re-exec'ing the
+/// current binary in place (exec preserves open fds and child processes). Writes
+/// a handoff manifest, un-CLOEXECs the fds to keep, then execs. Never returns on
+/// success (the process image is replaced).
+fn do_upgrade(st: &mut State) -> Result<()> {
+    flush_scrollbacks(st);
+    save_state(st);
+    let mut panes = Vec::new();
+    for (id, p) in st.panes.iter() {
+        let (rows, cols) = p.screen.screen().size();
+        clear_cloexec(p.pty.master_fd);
+        panes.push(HandoffPane { id: *id, fd: p.pty.master_fd, pid: p.pty.pid, rows, cols });
+    }
+    clear_cloexec(st.listener_fd);
+    let hf = Handoff { listener_fd: st.listener_fd, panes };
+    std::fs::write(handoff_path(), serde_json::to_vec(&hf)?)?;
+    let exe = std::env::current_exe()?;
+    use std::os::unix::process::CommandExt;
+    let e = std::process::Command::new(exe).arg("daemon").env("RUCKUS_HANDOFF", "1").exec();
+    Err(anyhow!("exec failed: {e}"))
 }
 
 /// Written on every tree change so a daemon restart can rebuild the world.
@@ -157,7 +284,11 @@ fn flush_scrollbacks(st: &mut State) {
 }
 
 /// Rebuild spaces/tabs and respawn running panes from the last saved state.
-fn restore_state(state: &Arc<Mutex<State>>, st: &mut State) -> bool {
+fn restore_state(
+    state: &Arc<Mutex<State>>,
+    st: &mut State,
+    handoff: Option<&HashMap<u64, HandoffPane>>,
+) -> bool {
     let path = ruckus_dir().join("state.json");
     let Ok(data) = std::fs::read(&path) else { return false };
     let Ok(p) = serde_json::from_slice::<Persisted>(&data) else { return false };
@@ -169,14 +300,21 @@ fn restore_state(state: &Arc<Mutex<State>>, st: &mut State) -> bool {
             let _ = std::fs::remove_file(scrollback_path(info.id));
             continue;
         }
-        let mut sb: VecDeque<u8> = std::fs::read(scrollback_path(info.id))
-            .map(VecDeque::from)
-            .unwrap_or_default();
-        sb.extend(b"\r\n\x1b[2m-- ruckus: daemon restarted, process respawned --\x1b[0m\r\n".iter());
-        match spawn_pane_with_id(state, st, info.id, info.cmd.clone(), Some(info.cwd.clone()), Some(sb))
-        {
+        // Upgrade path: adopt the still-running PTY. Cold start: respawn.
+        let result = if let Some(hp) = handoff.and_then(|m| m.get(&info.id)) {
+            adopt_pane(state, st, info.clone(), hp.fd, hp.pid, hp.rows, hp.cols)
+        } else {
+            let mut sb: VecDeque<u8> = std::fs::read(scrollback_path(info.id))
+                .map(VecDeque::from)
+                .unwrap_or_default();
+            sb.extend(
+                b"\r\n\x1b[2m-- ruckus: daemon restarted, process respawned --\x1b[0m\r\n".iter(),
+            );
+            spawn_pane_with_id(state, st, info.id, info.cmd.clone(), Some(info.cwd.clone()), Some(sb))
+        };
+        match result {
             Ok(()) => alive.push(info.id),
-            Err(e) => error!("restore: failed to respawn pane {}: {e:#}", info.id),
+            Err(e) => error!("restore: failed to restore pane {}: {e:#}", info.id),
         }
     }
 
@@ -381,6 +519,8 @@ struct State {
     detect_osc133: bool,
     detect_foreground: bool,
     agent_commands: Vec<String>,
+    /// Listening socket fd, handed off (un-CLOEXEC'd) across a self-exec upgrade.
+    listener_fd: RawFd,
 }
 
 impl State {
@@ -429,12 +569,28 @@ pub async fn run() -> Result<()> {
         .init();
 
     let sock = socket_path();
-    if UnixStream::connect(&sock).await.is_ok() {
-        info!("daemon already running, exiting");
-        return Ok(());
-    }
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock)?;
+    // Upgrade handoff: adopt the inherited listener + live panes from the old image.
+    let handoff: Option<Handoff> = if std::env::var("RUCKUS_HANDOFF").is_ok() {
+        std::fs::read(handoff_path())
+            .ok()
+            .and_then(|d| serde_json::from_slice(&d).ok())
+    } else {
+        None
+    };
+    let listener = if let Some(hf) = &handoff {
+        let std_l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(hf.listener_fd) };
+        std_l.set_nonblocking(true)?;
+        info!("ruckus daemon adopted {} panes across upgrade", hf.panes.len());
+        UnixListener::from_std(std_l)?
+    } else {
+        if UnixStream::connect(&sock).await.is_ok() {
+            info!("daemon already running, exiting");
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&sock);
+        UnixListener::bind(&sock)?
+    };
+    let listener_fd = listener.as_raw_fd();
     info!("ruckus daemon listening on {}", sock.display());
 
     let cfg = crate::config::Config::load();
@@ -450,16 +606,21 @@ pub async fn run() -> Result<()> {
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
         agent_commands: cfg.ui.agent_commands.clone(),
+        listener_fd,
     }));
 
     {
         let mut st = state.lock().unwrap();
-        restore_state(&state, &mut st);
+        let hmap: Option<HashMap<u64, HandoffPane>> = handoff
+            .as_ref()
+            .map(|hf| hf.panes.iter().map(|p| (p.id, p.clone())).collect());
+        restore_state(&state, &mut st, hmap.as_ref());
         if let Err(e) = ensure_nonempty(&state, &mut st) {
             error!("failed to create default space: {e:#}");
         }
         save_state(&st);
     }
+    let _ = std::fs::remove_file(handoff_path());
 
     // Activity ticker: demote panes from working -> waiting/idle once quiet.
     {
@@ -523,7 +684,7 @@ pub async fn run() -> Result<()> {
                         .panes
                         .iter()
                         .filter(|(_, p)| p.info.status == PaneStatus::Running)
-                        .filter_map(|(id, p)| p.master.process_group_leader().map(|pid| (*id, pid)))
+                        .filter_map(|(id, p)| p.pty.fg_pgrp().map(|pid| (*id, pid)))
                         .collect();
                     (targets, st.detect_foreground)
                 };
@@ -968,7 +1129,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let Ok(bytes) = B64.decode(&data) else {
                 return err("bad base64");
             };
-            match p.writer.write_all(&bytes).and_then(|_| p.writer.flush()) {
+            match p.pty.write(&bytes) {
                 Ok(_) => ServerMsg::Done,
                 Err(e) => err(format!("write failed: {e}")),
             }
@@ -986,18 +1147,9 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 apply_max_attach_size(p);
             } else {
                 // No active attach for this conn — apply size directly (scripted resize).
-                match p.master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
-                    Ok(_) => {
-                        p.resized_at = std::time::Instant::now();
-                        p.screen.set_size(rows, cols);
-                    }
-                    Err(e) => return err(format!("resize failed: {e}")),
-                }
+                p.pty.resize(rows, cols);
+                p.resized_at = std::time::Instant::now();
+                p.screen.set_size(rows, cols);
             }
             ServerMsg::Done
         }
@@ -1035,6 +1187,15 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             info!("config reloaded; notifying {} clients", st.conns.len());
             broadcast(&st, ServerMsg::ConfigChanged);
             ServerMsg::Done
+        }
+        Request::Upgrade => {
+            let mut st = state.lock().unwrap();
+            info!("upgrading: re-exec keeping {} panes alive", st.panes.len());
+            // On success this never returns (the process image is replaced).
+            match do_upgrade(&mut st) {
+                Ok(()) => ServerMsg::Done,
+                Err(e) => err(format!("upgrade failed: {e}")),
+            }
         }
     }
 }
@@ -1096,15 +1257,28 @@ fn spawn_pane_with_id(
     builder.args(&cmdline[1..]);
     builder.env("TERM", "xterm-256color");
     builder.cwd(&cwd);
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(builder)
         .map_err(|e| anyhow!("spawn {:?}: {e}", cmdline))?;
     drop(pair.slave);
 
-    let killer = child.clone_killer();
-    let mut reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
+    // Take ownership of the master fd as a bare, handoff-capable fd: dup a
+    // non-CLOEXEC canonical copy (survives exec), then drop portable-pty's
+    // wrapper (closing its fd) and forget the child (we reap via waitpid).
+    let raw = pair
+        .master
+        .as_raw_fd()
+        .ok_or_else(|| anyhow!("pty has no raw fd"))?;
+    let pid = child.process_id().unwrap_or(0) as i32;
+    let master_fd = dup_fd(raw, false)?; // canonical, survives exec
+    let reader_fd = dup_fd(raw, true)?; // reader thread (dies on exec)
+    let writer_fd = dup_fd(raw, true)?; // writer (recreated on adopt)
+    drop(pair.master);
+    std::mem::forget(child);
+    let reader = unsafe { File::from_raw_fd(reader_fd) };
+    let writer = unsafe { File::from_raw_fd(writer_fd) };
+    let pty = Pty { master_fd, pid, writer };
 
     let title = default_pane_title(&cmdline[0], &cwd);
     let info = PaneInfo {
@@ -1117,13 +1291,30 @@ fn spawn_pane_with_id(
         created: unix_now(),
         agent: None,
     };
+    install_pane(state, st, info, pty, reader, scrollback.unwrap_or_default(), 24, 80);
+    Ok(())
+}
 
-    let mut screen = vt100::Parser::new(24, 80, 0);
-    if let Some(sb) = &scrollback {
-        let bytes: Vec<u8> = sb.iter().copied().collect();
+/// Wire a Pty into a PaneSession: start the reader thread (reap on EOF), the
+/// pump task, seed the screen from scrollback, and insert it. Shared by fresh
+/// spawns and post-upgrade adoption.
+fn install_pane(
+    state: &Arc<Mutex<State>>,
+    st: &mut State,
+    info: PaneInfo,
+    pty: Pty,
+    mut reader: File,
+    scrollback: VecDeque<u8>,
+    rows: u16,
+    cols: u16,
+) {
+    let id = info.id;
+    let pid = pty.pid;
+    let mut screen = vt100::Parser::new(rows.max(1), cols.max(1), 0);
+    if !scrollback.is_empty() {
+        let bytes: Vec<u8> = scrollback.iter().copied().collect();
         screen.process(&bytes);
     }
-
     let (ev_tx, ev_rx) = unbounded_channel::<SessionEvent>();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -1137,29 +1328,45 @@ fn spawn_pane_with_id(
                 }
             }
         }
-        let code = child.wait().map(|s| s.exit_code()).unwrap_or(1);
-        let _ = ev_tx.send(SessionEvent::Exited(code));
+        let _ = ev_tx.send(SessionEvent::Exited(reap(pid)));
     });
     tokio::spawn(pump(state.clone(), id, ev_rx));
-
+    let now = std::time::Instant::now();
     st.panes.insert(
         id,
         PaneSession {
             info,
-            master: pair.master,
-            writer,
-            killer,
-            scrollback: scrollback.unwrap_or_default(),
+            pty,
+            scrollback,
             subs: HashMap::new(),
-            last_output: std::time::Instant::now(),
-            resized_at: std::time::Instant::now(),
+            last_output: now,
+            resized_at: now,
             reported: None,
-            last_prompt_scan: std::time::Instant::now(),
+            last_prompt_scan: now,
             prompt_cached: false,
             dirty: false,
             screen,
         },
     );
+}
+
+/// Adopt an already-running PTY (its master fd + child survived a self-exec
+/// upgrade). Rebuilds the pane around the live fd instead of respawning.
+fn adopt_pane(
+    state: &Arc<Mutex<State>>,
+    st: &mut State,
+    info: PaneInfo,
+    master_fd: RawFd,
+    pid: i32,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    let reader = unsafe { File::from_raw_fd(dup_fd(master_fd, true)?) };
+    let writer = unsafe { File::from_raw_fd(dup_fd(master_fd, true)?) };
+    let pty = Pty { master_fd, pid, writer };
+    let scrollback: VecDeque<u8> =
+        std::fs::read(scrollback_path(info.id)).map(VecDeque::from).unwrap_or_default();
+    install_pane(state, st, info, pty, reader, scrollback, rows, cols);
     Ok(())
 }
 
