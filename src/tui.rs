@@ -119,6 +119,7 @@ enum Target {
 #[derive(Clone, Copy)]
 enum SidebarBtn {
     NewSpace,
+    NewTab,
     CloseSpace(u64),
 }
 
@@ -1749,6 +1750,7 @@ impl App {
                         {
                             match btn {
                                 SidebarBtn::NewSpace => self.open_prompt(PromptKind::NewSpace),
+                                SidebarBtn::NewTab => self.open_prompt(PromptKind::NewTab),
                                 SidebarBtn::CloseSpace(id) => {
                                     if let Err(e) =
                                         self.client.request(Request::CloseSpace { space: id }).await
@@ -2022,10 +2024,16 @@ impl App {
             logo_text,
             Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
         );
-        let crumb = match (self.active_space(), self.active_tab()) {
-            (Some(s), Some(t)) => format!("  {}  ›  {}", s.name, t.name),
-            (Some(s), None) => format!("  {}", s.name),
-            _ => String::new(),
+        // On narrow screens the tab strip already shows the active tab, so the
+        // header only names the space — no redundant "space › tab" breadcrumb.
+        let crumb = if self.narrow() {
+            self.active_space().map(|s| format!("  {}", s.name)).unwrap_or_default()
+        } else {
+            match (self.active_space(), self.active_tab()) {
+                (Some(s), Some(t)) => format!("  {}  ›  {}", s.name, t.name),
+                (Some(s), None) => format!("  {}", s.name),
+                _ => String::new(),
+            }
         };
         let crumb_span = Span::styled(crumb.clone(), Style::default().fg(th.bar_active_fg));
 
@@ -2258,7 +2266,17 @@ impl App {
                         )),
                         None::<Target>
                     );
-                    // Persistent, discoverable "new space" button.
+                    // Persistent, discoverable "new tab" + "new space" buttons.
+                    {
+                        let hov = hover_row == Some(y);
+                        let style = if hov {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th.accent)
+                        };
+                        buttons.push((y, inner.x + 1..inner.x + 11, SidebarBtn::NewTab));
+                        push!(Line::from(Span::styled("  + new tab", style)), None::<Target>);
+                    }
                     {
                         let hov = hover_row == Some(y);
                         let style = if hov {
@@ -2470,8 +2488,10 @@ impl App {
                 let width = (plen * 2 + tlen + 4) as u16;
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
+                // Active tab uses the accent so "you are here" is obvious; the
+                // strip sits on `surface` so it reads as distinct from the header.
                 let (bg, fg, bold) = if active {
-                    (th.select_bg, th.bar_active_fg, true)
+                    (th.select_bg, th.accent, true)
                 } else if hovered {
                     (th.select_bg, th.bar_active_fg, false)
                 } else {
@@ -2498,21 +2518,25 @@ impl App {
                 x += width + 1;
             }
         }
-        let plus_range = x..x + 3;
+        // A labelled "+ tab" button, clearly tappable.
+        let plus_label = " + tab ";
+        let plus_range = x..x + plus_label.chars().count() as u16;
         let plus_hover = self.hover_at(&plus_range, area.y);
         spans.push(Span::styled(
-            " + ",
+            plus_label,
             if plus_hover {
-                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
+                Style::default().bg(th.accent).fg(th.surface).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(th.status_fg)
+                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
             },
         ));
         hits.push((None, plus_range));
         self.tab_hits = hits;
         self.tab_close_hits = close_hits;
+        // Strip background is `surface` (not the header's bar_bg) so the two top
+        // rows read as clearly separate bands.
         f.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.surface)),
             area,
         );
     }
