@@ -2285,12 +2285,15 @@ impl App {
         let left = self.render_status(&self.cfg.ui.status_left.clone());
         let right = self.render_status(&self.cfg.ui.status_right.clone());
         let w = area.width as usize;
-        let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
-        let rw: usize = right.iter().map(|s| s.content.chars().count()).sum();
+        // Use display width (unicode-aware) so wide glyphs/emoji don't push the
+        // right segment off the edge.
+        let lw: usize = left.iter().map(|s| s.width()).sum();
+        let rw: usize = right.iter().map(|s| s.width()).sum();
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         spans.extend(left);
-        // pad so `right` is flush to the edge
-        let used = 1 + lw + rw;
+        // pad so `right` is flush to the edge (leave 1 col so the last cell
+        // isn't at the very edge, which some terminals clip).
+        let used = 1 + lw + rw + 1;
         if w > used {
             spans.push(Span::raw(" ".repeat(w - used)));
         }
