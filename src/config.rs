@@ -205,6 +205,17 @@ pub enum BarPos {
     Off,
 }
 
+/// What the footer shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterMode {
+    /// Command hint chips (the classic footer).
+    Help,
+    /// Customizable status bar (clock, names, counts…).
+    Status,
+    /// Status bar normally; command hints while the prefix is armed.
+    Auto,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastPos {
     TopLeft,
@@ -298,6 +309,13 @@ pub struct UiConfig {
     pub toast_seconds: u64,
     pub header: BarPos,
     pub footer: BarPos,
+    /// What the footer renders: help hints, a status bar, or auto (status +
+    /// which-key on prefix).
+    pub footer_mode: FooterMode,
+    /// tmux-style status format strings (tokens: {clock} {space} {tab} {tabs}
+    /// {panes} {agents} {needs} {host} {cwd}; color markup: `#[accent]…#[]`).
+    pub status_left: String,
+    pub status_right: String,
     pub tab_strip: bool,
     pub mouse: bool,
     /// Drag to select text in a pane and copy it (OSC 52 + local clipboard).
@@ -344,6 +362,9 @@ impl Default for UiConfig {
             toast_seconds: 4,
             header: BarPos::Top,
             footer: BarPos::Bottom,
+            footer_mode: FooterMode::Auto,
+            status_left: "{space} › {tab}".to_string(),
+            status_right: "#[accent]⚡{agents}#[] ◉{needs}  #[bar_active_fg]{clock:%H:%M}".to_string(),
             tab_strip: true,
             mouse: true,
             mouse_select: true,
@@ -455,6 +476,9 @@ struct RawUi {
     toast: Option<RawToast>,
     header: Option<String>,
     footer: Option<String>,
+    footer_mode: Option<String>,
+    status_left: Option<String>,
+    status_right: Option<String>,
     tab_strip: Option<bool>,
     mouse: Option<bool>,
     mouse_select: Option<bool>,
@@ -657,6 +681,13 @@ impl Config {
                 .clamp(1, 60),
             header: parse_bar(raw.ui.header.as_deref(), BarPos::Top),
             footer: parse_bar(raw.ui.footer.as_deref(), BarPos::Bottom),
+            footer_mode: match raw.ui.footer_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("help") => FooterMode::Help,
+                Some("status") => FooterMode::Status,
+                _ => FooterMode::Auto,
+            },
+            status_left: raw.ui.status_left.unwrap_or(d.status_left),
+            status_right: raw.ui.status_right.unwrap_or(d.status_right),
             tab_strip: raw.ui.tab_strip.unwrap_or(d.tab_strip),
             mouse: raw.ui.mouse.unwrap_or(d.mouse),
             mouse_select: raw.ui.mouse_select.unwrap_or(d.mouse_select),

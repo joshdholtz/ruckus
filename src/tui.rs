@@ -23,7 +23,9 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
-use crate::config::{normalize_key, Action, BarPos, Config, SidebarPos, ToastPos, WorkingStyle};
+use crate::config::{
+    normalize_key, Action, BarPos, Config, FooterMode, SidebarPos, ToastPos, WorkingStyle,
+};
 use crate::protocol::*;
 use crate::render::{encode_key, screen_to_lines};
 
@@ -192,6 +194,18 @@ struct App {
     pane_rects: Vec<(u64, Rect)>,
     picker: Picker,
     images: HashMap<u64, ImageState>,
+}
+
+/// Short hostname (up to the first dot), for the {host} status token.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let full = String::from_utf8_lossy(&buf[..end]).to_string();
+    full.split('.').next().unwrap_or(&full).to_string()
 }
 
 /// Collapse the user's home prefix to `~` for compact display.
@@ -2165,6 +2179,129 @@ impl App {
     }
 
     fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
+        let show_hints = match self.cfg.ui.footer_mode {
+            FooterMode::Help => true,
+            FooterMode::Status => false,
+            FooterMode::Auto => self.prefix_pending,
+        };
+        if show_hints {
+            self.draw_footer_hints(f, area);
+        } else {
+            self.draw_footer_status(f, area);
+        }
+    }
+
+    /// Render a status format string (`status_left`/`status_right`) into spans,
+    /// expanding {tokens} and `#[color]` markup.
+    fn render_status(&self, template: &str) -> Vec<Span<'static>> {
+        let th = &self.cfg.theme;
+        let resolve_color = |name: &str| -> Color {
+            if let Some(hex) = name.strip_prefix('#').filter(|h| h.len() == 6) {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    u8::from_str_radix(&hex[0..2], 16),
+                    u8::from_str_radix(&hex[2..4], 16),
+                    u8::from_str_radix(&hex[4..6], 16),
+                ) {
+                    return Color::Rgb(r, g, b);
+                }
+            }
+            match name {
+                "accent" => th.accent,
+                "bar_fg" => th.bar_fg,
+                "bar_active_fg" => th.bar_active_fg,
+                "status_fg" => th.status_fg,
+                "working" => th.working,
+                "waiting" => th.waiting,
+                "idle" => th.idle,
+                "done_ok" => th.done_ok,
+                "done_err" => th.done_err,
+                "select_bg" => th.select_bg,
+                _ => th.status_fg,
+            }
+        };
+        let val = |token: &str| -> String {
+            let space = self.active_space();
+            let tab = self.active_tab();
+            let pane = self.snap.pane(self.focused);
+            match token.split(':').next().unwrap_or(token) {
+                "space" => space.map(|s| s.name).unwrap_or_default(),
+                "tab" => tab.map(|t| t.name).unwrap_or_default(),
+                "spaces" => self.snap.spaces.len().to_string(),
+                "tabs" => space.map(|s| s.tabs.len()).unwrap_or(0).to_string(),
+                "panes" => self.snap.panes.len().to_string(),
+                "agents" => self.agent_rows().len().to_string(),
+                "needs" => self.attention().len().to_string(),
+                "host" => hostname(),
+                "cwd" => pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
+                "clock" => {
+                    let fmt = token.splitn(2, ':').nth(1).unwrap_or("%H:%M");
+                    chrono::Local::now().format(fmt).to_string()
+                }
+                _ => String::new(),
+            }
+        };
+        let mut spans: Vec<Span> = Vec::new();
+        let mut fg = th.status_fg;
+        let mut buf = String::new();
+        let mut chars = template.chars().peekable();
+        let flush = |spans: &mut Vec<Span>, buf: &mut String, fg: Color| {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(buf), Style::default().fg(fg)));
+            }
+        };
+        while let Some(ch) = chars.next() {
+            if ch == '#' && chars.peek() == Some(&'[') {
+                flush(&mut spans, &mut buf, fg);
+                chars.next(); // consume '['
+                let mut name = String::new();
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                    name.push(c);
+                }
+                fg = if name.is_empty() { th.status_fg } else { resolve_color(&name) };
+            } else if ch == '{' {
+                flush(&mut spans, &mut buf, fg);
+                let mut token = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    token.push(c);
+                }
+                buf.push_str(&val(&token));
+            } else {
+                buf.push(ch);
+            }
+        }
+        flush(&mut spans, &mut buf, fg);
+        spans
+    }
+
+    fn draw_footer_status(&mut self, f: &mut Frame, area: Rect) {
+        let th = self.cfg.theme.clone();
+        self.footer_hits = Vec::new(); // status bar isn't clickable
+        let left = self.render_status(&self.cfg.ui.status_left.clone());
+        let right = self.render_status(&self.cfg.ui.status_right.clone());
+        let w = area.width as usize;
+        let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
+        let rw: usize = right.iter().map(|s| s.content.chars().count()).sum();
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        spans.extend(left);
+        // pad so `right` is flush to the edge
+        let used = 1 + lw + rw;
+        if w > used {
+            spans.push(Span::raw(" ".repeat(w - used)));
+        }
+        spans.extend(right);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
+    }
+
+    fn draw_footer_hints(&mut self, f: &mut Frame, area: Rect) {
         let th = self.cfg.theme.clone();
         let c = &self.cfg;
         let compact = area.width < FOOTER_COMPACT;
