@@ -3009,8 +3009,18 @@ pub async fn run(initial: Option<String>) -> Result<()> {
             msg = events.recv() => match msg {
                 Some(m) => app.on_server(m).await,
                 None => {
-                    app.running = false;
-                    eprintln!("daemon connection lost");
+                    // Daemon connection dropped (restart/upgrade) — reconnect and
+                    // reattach instead of exiting. Panes persist across daemon
+                    // restarts under the same ids, so the view comes right back.
+                    app.toast("reconnecting…");
+                    terminal.draw(|f| app.draw(f))?;
+                    match reconnect(&mut app, &mut in_rx).await {
+                        Some(new_events) => {
+                            events = new_events;
+                            app.toast("🐏 reconnected");
+                        }
+                        None => app.running = false,
+                    }
                 }
             },
             _ = ticker.tick() => app.on_tick(),
@@ -3028,6 +3038,39 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Re-establish the daemon connection after it drops. Restarts the daemon if it
+/// died, reconnects with backoff, re-fetches state, and re-attaches panes.
+/// Returns the fresh event stream, or None if the user quits or it gives up.
+async fn reconnect(
+    app: &mut App,
+    in_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+) -> Option<tokio::sync::mpsc::UnboundedReceiver<ServerMsg>> {
+    for _ in 0..240 {
+        // Let the user bail out while we retry.
+        while let Ok(ev) = in_rx.try_recv() {
+            if let Event::Key(k) = ev {
+                let k = normalize_key(&k, app.cfg.ui.mac_option_fallback);
+                if app.cfg.action_for(&k) == Some(Action::Quit) {
+                    return None;
+                }
+            }
+        }
+        if ensure_daemon().await.is_ok() {
+            if let Ok((client, events)) = connect().await {
+                if let Ok(snap) = client.snapshot().await {
+                    app.client = client;
+                    app.snap = snap;
+                    app.views.clear(); // force re-attach of every visible pane
+                    app.sync().await;
+                    return Some(events);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
 }
 
 #[cfg(test)]
