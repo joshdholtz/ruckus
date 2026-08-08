@@ -2586,7 +2586,20 @@ impl App {
             }
             let dimmed = many && !focused;
             if let Some(v) = self.views.get(pane) {
-                let lines = screen_to_lines(v.parser.screen(), focused && scroll == 0, dimmed);
+                let screen = v.parser.screen();
+                let live = focused && scroll == 0;
+                // Draw the synthetic (inverted-cell) cursor only when we can't place
+                // the real one — otherwise place the terminal's native blinking cursor
+                // at the focused pane so it blinks and mobile IMEs track it.
+                let mut placed_real = false;
+                if live && !screen.hide_cursor() {
+                    let (crow, ccol) = screen.cursor_position();
+                    let cx = content.x + ccol.min(content.width.saturating_sub(1));
+                    let cy = content.y + crow.min(content.height.saturating_sub(1));
+                    f.set_cursor_position((cx, cy));
+                    placed_real = true;
+                }
+                let lines = screen_to_lines(screen, live && !placed_real, dimmed);
                 f.render_widget(
                     Paragraph::new(lines).style(Style::default().bg(th.surface)),
                     content,
