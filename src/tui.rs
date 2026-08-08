@@ -194,6 +194,24 @@ struct App {
     pane_rects: Vec<(u64, Rect)>,
     picker: Picker,
     images: HashMap<u64, ImageState>,
+    /// Cached output of `#(command)` status segments, refreshed on an interval.
+    status_cmds: HashMap<String, String>,
+}
+
+/// Extract `#(command)` segments from a status format string.
+fn extract_commands(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(i) = rest.find("#(") {
+        rest = &rest[i + 2..];
+        if let Some(end) = rest.find(')') {
+            out.push(rest[..end].to_string());
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Short hostname (up to the first dot), for the {host} status token.
@@ -1118,6 +1136,24 @@ impl App {
                 }
                 return;
             }
+            // tmux tab commands that aren't in the Action enum.
+            match ev.code {
+                KeyCode::Char(',') => {
+                    if let Some(tab) = self.active_space().map(|s| s.active_tab) {
+                        self.open_prompt(PromptKind::RenameTab(tab));
+                    }
+                    return;
+                }
+                KeyCode::Char('&') => {
+                    if let Some(tab) = self.active_space().map(|s| s.active_tab) {
+                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                            self.toast(e.to_string());
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
             if let Some(a) = self.cfg.prefix_action_for(&ev) {
                 self.do_action(a).await;
             }
@@ -1125,7 +1161,6 @@ impl App {
         }
         if self.cfg.is_prefix(&ev) {
             self.prefix_pending = true;
-            self.toast("prefix …");
             return;
         }
 
@@ -2191,8 +2226,33 @@ impl App {
         }
     }
 
+    /// Re-run every `#(command)` in the status format and cache its first line.
+    async fn refresh_status_cmds(&mut self) {
+        let mut cmds = extract_commands(&self.cfg.ui.status_left);
+        cmds.extend(extract_commands(&self.cfg.ui.status_right));
+        cmds.sort();
+        cmds.dedup();
+        for cmd in cmds {
+            let out = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::process::Command::new("sh").arg("-c").arg(&cmd).output(),
+            )
+            .await;
+            let val = match out {
+                Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                _ => String::new(),
+            };
+            self.status_cmds.insert(cmd, val);
+        }
+    }
+
     /// Render a status format string (`status_left`/`status_right`) into spans,
-    /// expanding {tokens} and `#[color]` markup.
+    /// expanding {tokens}, `#(command)` output, and `#[color]` markup.
     fn render_status(&self, template: &str) -> Vec<Span<'static>> {
         let th = &self.cfg.theme;
         let resolve_color = |name: &str| -> Color {
@@ -2261,6 +2321,18 @@ impl App {
                     name.push(c);
                 }
                 fg = if name.is_empty() { th.status_fg } else { resolve_color(&name) };
+            } else if ch == '#' && chars.peek() == Some(&'(') {
+                chars.next(); // consume '('
+                let mut cmd = String::new();
+                for c in chars.by_ref() {
+                    if c == ')' {
+                        break;
+                    }
+                    cmd.push(c);
+                }
+                if let Some(v) = self.status_cmds.get(&cmd) {
+                    buf.push_str(v);
+                }
             } else if ch == '{' {
                 flush(&mut spans, &mut buf, fg);
                 let mut token = String::new();
@@ -2667,6 +2739,27 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Persistent badge at the top-right while the tmux prefix is armed.
+    fn draw_prefix_indicator(&self, f: &mut Frame) {
+        if !self.prefix_pending {
+            return;
+        }
+        let th = &self.cfg.theme;
+        let text = " ‹prefix› ";
+        let w = text.chars().count() as u16;
+        let row = self.frame.tabs.or(self.frame.header).unwrap_or(0);
+        let x = self.size.0.saturating_sub(w);
+        let rect = Rect::new(x, row, w.min(self.size.0), 1);
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD),
+            ))),
+            rect,
+        );
+    }
+
     fn draw_toast(&self, f: &mut Frame) {
         let Some((msg, _)) = &self.toast else { return };
         let th = &self.cfg.theme;
@@ -2738,6 +2831,7 @@ impl App {
         self.draw_menu(f);
         self.draw_help(f);
         self.draw_prompt(f);
+        self.draw_prefix_indicator(f);
         self.draw_toast(f);
     }
 }
@@ -2801,6 +2895,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         pane_rects: Vec::new(),
         picker,
         images: HashMap::new(),
+        status_cmds: HashMap::new(),
     };
 
     if let Some(target) = initial {
@@ -2849,6 +2944,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     });
 
     let mut ticker = tokio::time::interval(Duration::from_millis(spinner_ms));
+    let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
+    app.refresh_status_cmds().await; // populate #(command) segments up front
     while app.running {
         terminal.draw(|f| app.draw(f))?;
         tokio::select! {
@@ -2864,6 +2961,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 }
             },
             _ = ticker.tick() => app.on_tick(),
+            _ = status_ticker.tick() => app.refresh_status_cmds().await,
         }
         while let Ok(e) = in_rx.try_recv() {
             app.on_term_event(e).await;
