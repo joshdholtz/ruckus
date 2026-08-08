@@ -32,7 +32,7 @@ Distilled from research into herdr, zellij, lazygit, k9s, yazi, superfile, and c
 - ✅ Toasts bottom-right, auto-dismiss
 - ⬜ Toast delivery modes like herdr: `terminal` (OSC) / `system` notification when detached
 - ⬜ Row flash ~2s on state change (k9s)
-- ⬜ Dead pane frame: `[ EXITED ]` + `enter restart · esc close` hints (zellij)
+- ✅ Dead pane frame: `[ EXITED ]` + enter/esc + triage chips (restart/close)
 - ⬜ Light/dark auto-switching themes (`auto_switch`, `light_name`/`dark_name` like herdr)
 - ⬜ Templatable sidebar row format (config tokens → spans)
 - ⬜ Nerd Font icons strictly opt-in (everything today is plain Unicode)
@@ -42,5 +42,5 @@ Distilled from research into herdr, zellij, lazygit, k9s, yazi, superfile, and c
 - Coherent, fully rebindable keys (HN called herdr's "all over the place")
 - Persistent hint bar (herdr hides keys behind prefix+?)
 - Working-state spinner (herdr has none)
-- Mobile-SSH tap-first mode (footer buttons, auto-collapsing sidebar)
+- Mobile-SSH triage mode (auto-zoom, waiting/exited action chips, compact footer)
 - ⬜ Fixed/tmuxp-style layout presets (requested on HN, unmet by herdr)

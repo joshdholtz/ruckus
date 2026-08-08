@@ -194,6 +194,8 @@ enum PromptKind {
     RenameSpace(u64),
     RenameTab(u64),
     Search,
+    /// Free-text reply into the focused pane (mobile triage / soft keyboard).
+    Reply,
 }
 
 /// A modal single-line text input (naming a new/renamed space or tab).
@@ -203,11 +205,27 @@ struct Prompt {
     buffer: String,
 }
 
+/// Tap targets on the triage action bar (waiting / exited / narrow).
+#[derive(Clone)]
+enum ChipAction {
+    /// Bytes to type into the focused pane (usually includes trailing newline).
+    Send(Vec<u8>),
+    Restart,
+    Close,
+    JumpWaiting,
+    Zoom,
+    Reply,
+    ToggleSidebar,
+    Palette,
+}
+
 /// Where every chrome element lives this frame, derived from config + size.
 #[derive(Clone, Copy, Default)]
 struct FrameLayout {
     header: Option<u16>,
     footer: Option<u16>,
+    /// Row of big tappable chips (approve / restart) above the footer.
+    action: Option<u16>,
     tabs: Option<u16>,
     /// Full-width region between the horizontal bars.
     body: Rect,
@@ -234,6 +252,8 @@ struct App {
     toast: Option<(String, Instant)>,
     sidebar: bool,
     zoomed: bool,
+    /// Last-frame narrow state — used to auto-zoom when the window shrinks.
+    was_narrow: bool,
     drawer: bool,
     help: bool,
     /// Shown once on first ever launch; dismissed by any key/click.
@@ -265,6 +285,8 @@ struct App {
     /// Alt+drag a pane onto another to swap them.
     swap_from: Option<u64>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
+    /// Triage chips: (action, row, col range).
+    action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
     pane_rects: Vec<(u64, Rect)>,
     /// Cached output of `#(command)` status segments, refreshed on an interval.
     status_cmds: HashMap<String, String>,
@@ -436,6 +458,18 @@ impl App {
         self.sidebar && !self.narrow()
     }
 
+    /// Focused pane wants triage chips: waiting on you, or exited.
+    fn action_bar_kind(&self) -> Option<&'static str> {
+        let p = self.snap.pane(self.focused)?;
+        match p.status {
+            PaneStatus::Exited { .. } => Some("exited"),
+            PaneStatus::Running if p.activity == Activity::Waiting => Some("waiting"),
+            // Narrow idle/working still gets a slim nav strip for phone thumbs.
+            PaneStatus::Running if self.narrow() => Some("narrow"),
+            _ => None,
+        }
+    }
+
     fn compute_frame(&self) -> FrameLayout {
         let (w, h) = self.size;
         let ui = &self.cfg.ui;
@@ -443,6 +477,7 @@ impl App {
         let mut bot: u16 = h;
         let mut header = None;
         let mut footer = None;
+        let mut action = None;
         if ui.header == BarPos::Top {
             header = Some(top);
             top += 1;
@@ -454,6 +489,11 @@ impl App {
         if ui.footer == BarPos::Bottom && bot > top {
             bot -= 1;
             footer = Some(bot);
+        }
+        // Action/triage bar sits just above the footer (or at the bottom if no footer).
+        if self.action_bar_kind().is_some() && bot > top {
+            bot -= 1;
+            action = Some(bot);
         }
         if ui.header == BarPos::Bottom && bot > top {
             bot -= 1;
@@ -485,7 +525,7 @@ impl App {
         } else {
             (None, main)
         };
-        FrameLayout { header, footer, tabs, body, sidebar, main, panes }
+        FrameLayout { header, footer, action, tabs, body, sidebar, main, panes }
     }
 
     fn compute_rects(&self) -> Vec<(u64, Rect)> {
@@ -579,6 +619,13 @@ impl App {
 
     async fn sync(&mut self) {
         self.size = crossterm::terminal::size().unwrap_or((80, 24));
+        // Phone / narrow: auto-zoom so triage is one pane full-bleed. Only force
+        // when *entering* narrow so the user can still un-zoom if they want.
+        let n = self.narrow();
+        if n && !self.was_narrow {
+            self.zoomed = true;
+        }
+        self.was_narrow = n;
         self.frame = self.compute_frame();
         let rects = self.compute_rects();
         self.pane_rects = rects.clone();
@@ -799,6 +846,7 @@ impl App {
         let (label, buffer) = match kind {
             PromptKind::NewTab => ("name new tab (blank = default)", String::new()),
             PromptKind::NewSpace => ("name new space (blank = default)", String::new()),
+            PromptKind::Reply => ("type a reply (enter to send)", String::new()),
             PromptKind::RenameSpace(id) => (
                 "rename space",
                 self.snap.spaces.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default(),
@@ -888,6 +936,42 @@ impl App {
                     self.run_search(true);
                 }
             }
+            PromptKind::Reply => {
+                if !name.is_empty() {
+                    let mut bytes = name.into_bytes();
+                    bytes.push(b'\n');
+                    self.send_bytes(&bytes).await;
+                }
+            }
+        }
+    }
+
+    async fn send_bytes(&mut self, bytes: &[u8]) {
+        if let Some(v) = self.views.get_mut(&self.focused) {
+            if v.scroll != 0 {
+                v.scroll = 0;
+                v.parser.set_scrollback(0);
+            }
+        }
+        let req = Request::Input {
+            pane: self.focused,
+            data: B64.encode(bytes),
+        };
+        if let Err(e) = self.client.request(req).await {
+            self.toast(e.to_string());
+        }
+    }
+
+    async fn run_chip(&mut self, chip: ChipAction) {
+        match chip {
+            ChipAction::Send(bytes) => self.send_bytes(&bytes).await,
+            ChipAction::Restart => self.restart_action(self.focused).await,
+            ChipAction::Close => self.close_pane_action(self.focused).await,
+            ChipAction::JumpWaiting => self.do_action(Action::JumpWaiting).await,
+            ChipAction::Zoom => self.do_action(Action::Zoom).await,
+            ChipAction::Reply => self.open_prompt(PromptKind::Reply),
+            ChipAction::ToggleSidebar => self.do_action(Action::ToggleSidebar).await,
+            ChipAction::Palette => self.do_action(Action::Palette).await,
         }
     }
 
@@ -1640,6 +1724,17 @@ impl App {
                         .map(|(a, _)| *a);
                     if let Some(a) = hit {
                         self.do_action(a).await;
+                    }
+                    return;
+                }
+                if Some(row) == self.frame.action {
+                    let hit = self
+                        .action_hits
+                        .iter()
+                        .find(|(_, r, range)| *r == row && range.contains(&col))
+                        .map(|(a, _, _)| a.clone());
+                    if let Some(a) = hit {
+                        self.run_chip(a).await;
                     }
                     return;
                 }
@@ -2588,7 +2683,7 @@ impl App {
     fn draw_footer_hints(&mut self, f: &mut Frame, area: Rect) {
         let th = self.cfg.theme.clone();
         let c = &self.cfg;
-        let compact = area.width < FOOTER_COMPACT;
+        let compact = area.width < FOOTER_COMPACT || self.narrow();
         let mut chips: Vec<(Action, String, &str)> = vec![
             (Action::JumpWaiting, c.hint(Action::JumpWaiting), "next"),
             (Action::SplitRight, c.hint(Action::SplitRight), "split"),
@@ -2601,12 +2696,12 @@ impl App {
             (Action::Quit, c.hint(Action::Quit), "quit"),
         ];
         if compact {
+            // Triage-first: jump / zoom / nav / more. Layout chrome lives in palette.
             chips = vec![
                 (Action::JumpWaiting, "".into(), "next"),
-                (Action::SplitRight, "".into(), "split"),
-                (Action::SplitDown, "".into(), "split↓"),
-                (Action::NewTab, "".into(), "+tab"),
-                (Action::ClosePane, "".into(), "close"),
+                (Action::Zoom, "".into(), "zoom"),
+                (Action::ToggleSidebar, "".into(), "bar"),
+                (Action::Palette, "".into(), "···"),
                 (Action::ShowHelp, "".into(), "?"),
                 (Action::Quit, "".into(), "quit"),
             ];
@@ -2772,7 +2867,7 @@ impl App {
                     let status_fg = if ok { th.done_ok } else { th.done_err };
                     let banner = format!("[ EXITED {code} ]");
                     let hints = if focused {
-                        "enter restart · esc close"
+                        "enter restart · esc close · or tap chips"
                     } else {
                         "exited"
                     };
@@ -2879,6 +2974,92 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
+        let Some(kind) = self.action_bar_kind() else {
+            self.action_hits.clear();
+            return;
+        };
+        let th = self.cfg.theme.clone();
+        // label → chip action
+        let chips: Vec<(&str, ChipAction)> = match kind {
+            "waiting" => vec![
+                ("y", ChipAction::Send(b"y\n".to_vec())),
+                ("n", ChipAction::Send(b"n\n".to_vec())),
+                ("enter", ChipAction::Send(b"\n".to_vec())),
+                ("type…", ChipAction::Reply),
+                ("next", ChipAction::JumpWaiting),
+            ],
+            "exited" => vec![
+                ("restart", ChipAction::Restart),
+                ("close", ChipAction::Close),
+                ("next", ChipAction::JumpWaiting),
+            ],
+            // narrow idle/working: navigation only
+            _ => vec![
+                ("next", ChipAction::JumpWaiting),
+                ("zoom", ChipAction::Zoom),
+                ("bar", ChipAction::ToggleSidebar),
+                ("···", ChipAction::Palette),
+            ],
+        };
+
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        let mut hits = Vec::new();
+        let mut x: u16 = 1;
+        let accent = match kind {
+            "waiting" => th.waiting,
+            "exited" => th.done_err,
+            _ => th.accent,
+        };
+        // Leading status glyph so the bar reads as a state, not random buttons.
+        let tag = match kind {
+            "waiting" => " needs you ",
+            "exited" => " exited ",
+            _ => " ",
+        };
+        if kind != "narrow" {
+            let tw = tag.chars().count() as u16;
+            spans.push(Span::styled(
+                tag,
+                Style::default()
+                    .fg(th.bg)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            x += tw + 1;
+        }
+        for (label, action) in chips {
+            let text = format!("[{label}]");
+            let width = text.chars().count() as u16;
+            let range = x..x + width;
+            let hovered = self.hover_at(&range, area.y);
+            let style = if hovered {
+                Style::default()
+                    .bg(th.select_bg)
+                    .fg(accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(accent)
+                    .bg(th.bar_bg)
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(text, style));
+            spans.push(Span::raw(" "));
+            hits.push((action, area.y, range));
+            x += width + 1;
+            if x >= area.width.saturating_sub(2) {
+                break;
+            }
+        }
+        self.action_hits = hits;
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
+    }
+
     fn draw_welcome(&self, f: &mut Frame) {
         if !self.welcome {
             return;
@@ -2888,13 +3069,13 @@ impl App {
         let body: Vec<(String, String)> = vec![
             (String::new(), String::new()),
             ("your agents keep running in the".into(), String::new()),
-            ("background — this is where you".into(), String::new()),
-            ("watch the herd.".into(), String::new()),
+            ("background. this window is just".into(), String::new()),
+            ("how you watch and step in.".into(), String::new()),
             (String::new(), String::new()),
+            (key(Action::JumpWaiting), "jump to what needs you".into()),
             (key(Action::Palette), "find any command".into()),
             (key(Action::ShowHelp), "all keys".into()),
-            (key(Action::Search), "search scrollback".into()),
-            (key(Action::ToggleSidebar), "sidebar (☰ on mobile)".into()),
+            (key(Action::ToggleSidebar), "sidebar (☰ on phones)".into()),
             (key(Action::Quit), "quit — agents keep running".into()),
             (String::new(), String::new()),
             ("press any key to start".into(), String::new()),
@@ -3235,6 +3416,11 @@ impl App {
         self.draw_panes(f);
         self.draw_dividers(f);
         self.draw_selection(f);
+        if let Some(r) = self.frame.action {
+            self.draw_action_bar(f, Rect::new(0, r, area.width, 1));
+        } else {
+            self.action_hits.clear();
+        }
         if let Some(r) = self.frame.footer {
             // A search bar replaces the footer while a query is active.
             if self.search.is_some() && self.prompt.is_none() {
@@ -3297,6 +3483,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         toast: None,
         sidebar,
         zoomed: false,
+        was_narrow: false,
         drawer: false,
         help: false,
         welcome,
@@ -3321,9 +3508,15 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         drag_target: None,
         swap_from: None,
         footer_hits: Vec::new(),
+        action_hits: Vec::new(),
         pane_rects: Vec::new(),
         status_cmds: HashMap::new(),
     };
+    // Start zoomed on phones / narrow terminals.
+    if app.narrow() {
+        app.zoomed = true;
+        app.was_narrow = true;
+    }
 
     if let Some(target) = initial {
         let pane = resolve_pane(&app.snap, &target)?;

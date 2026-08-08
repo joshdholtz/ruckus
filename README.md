@@ -58,7 +58,15 @@ Look: no box borders — panes are **background layers** separated by dark gutte
 
 ### Mobile / SSH
 
-Over SSH from a phone (Termius, Blink, Prompt) taps arrive as clicks, so everything stays reachable without a modifier key: footer buttons run actions, the sidebar auto-collapses under 70 columns, and narrow screens switch to tap-first `[split] [+tab] [close]` chips. On desktop macOS, stock Terminal/iTerm sends Option+key as a special character (`œ`, `ß`, …) — ruckus maps those back automatically, and `ctrl+q` always quits. For alt+i / alt+n (dead keys) enable "Use Option as Meta" (Terminal) or "Esc+" (iTerm).
+Still fully usable — same daemon, same panes — but **triage-first** on a phone. Over SSH (Termius, Blink, Prompt) taps are clicks, so you never need a modifier key:
+
+- Under ~70 columns the sidebar becomes a `☰` drawer, the focused pane **auto-zooms**, and the footer becomes compact nav (`[next] [zoom] [bar] [···]`)
+- When a pane is **waiting**, an action bar appears: `[y] [n] [enter] [type…] [next]` — approve without hunting for keys
+- When a pane has **exited**: `[restart] [close] [next]` (or enter / esc on a keyboard)
+
+Desktop stays the multi-pane chaos surface. Phone is glance → decide → reply.
+
+On desktop macOS, stock Terminal/iTerm sends Option+key as a special character (`œ`, `ß`, …) — ruckus maps those back automatically, and `ctrl+q` always quits. For alt+i / alt+n (dead keys) enable "Use Option as Meta" (Terminal) or "Esc+" (iTerm).
 
 Every dot is an activity state, aggregated upward (pane → tab → space), so a glance at the space bar tells you if anything anywhere needs you.
 
