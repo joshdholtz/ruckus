@@ -28,8 +28,6 @@ struct PaneSession {
     scrollback: VecDeque<u8>,
     subs: HashMap<u64, Tx>,
     last_output: std::time::Instant,
-    /// Latest image to show in this pane (base64 PNG/JPEG), pushed via SetPaneImage.
-    image: Option<String>,
     /// Authoritative activity set by a detector/plugin (OSC 133, foreground-process,
     /// agent hook…). When `Some`, it overrides the output heuristic and the quiet
     /// ticker leaves this pane alone. `None` = heuristic-managed (the default).
@@ -767,13 +765,8 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let _ = p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
             p.resized_at = std::time::Instant::now();
             p.screen.set_size(rows, cols);
-            let img = p.image.clone();
             p.subs.insert(conn_id, tx.clone());
             let scrollback = B64.encode(p.scrollback.make_contiguous());
-            // Replay the current image so a freshly-attached client shows it.
-            if let Some(data) = img {
-                send(&tx, None, ServerMsg::PaneImage { pane, data });
-            }
             ServerMsg::Attached { pane, scrollback }
         }
         Request::Detach { pane } => {
@@ -819,15 +812,6 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             if let Some(a) = change {
                 broadcast(&st, ServerMsg::Activity { pane, activity: a });
             }
-            ServerMsg::Done
-        }
-        Request::SetPaneImage { pane, data } => {
-            let mut st = state.lock().unwrap();
-            let Some(p) = st.panes.get_mut(&pane) else {
-                return err(format!("no pane {pane}"));
-            };
-            p.image = if data.is_empty() { None } else { Some(data.clone()) };
-            broadcast(&st, ServerMsg::PaneImage { pane, data });
             ServerMsg::Done
         }
         Request::ReportAgent { pane, name } => {
@@ -972,7 +956,6 @@ fn spawn_pane_with_id(
             last_output: std::time::Instant::now(),
             resized_at: std::time::Instant::now(),
             reported: None,
-            image: None,
             last_prompt_scan: std::time::Instant::now(),
             prompt_cached: false,
             dirty: false,

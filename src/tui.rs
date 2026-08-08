@@ -13,9 +13,6 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::Protocol;
-use ratatui_image::{Image, Resize};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
@@ -46,12 +43,6 @@ enum Target {
     Pane(u64),
 }
 
-/// A decoded image to display in a pane, with a cached terminal-encoded protocol.
-struct ImageState {
-    img: image::DynamicImage,
-    proto: Option<Protocol>,
-    area: Option<Rect>,
-}
 
 /// A clickable affordance rendered in the sidebar.
 #[derive(Clone, Copy)]
@@ -192,8 +183,6 @@ struct App {
     swap_from: Option<u64>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     pane_rects: Vec<(u64, Rect)>,
-    picker: Picker,
-    images: HashMap<u64, ImageState>,
     /// Cached output of `#(command)` status segments, refreshed on an interval.
     status_cmds: HashMap<String, String>,
 }
@@ -1667,18 +1656,6 @@ impl App {
                     self.unread.insert(pane);
                 }
             }
-            ServerMsg::PaneImage { pane, data } => {
-                if data.is_empty() {
-                    self.images.remove(&pane);
-                } else if let Ok(bytes) = B64.decode(data.as_bytes()) {
-                    if let Ok(img) = image::load_from_memory(&bytes) {
-                        self.images.insert(
-                            pane,
-                            ImageState { img, proto: None, area: None },
-                        );
-                    }
-                }
-            }
             ServerMsg::ConfigChanged => self.reload_config().await,
             _ => {}
         }
@@ -2593,29 +2570,6 @@ impl App {
             if content.width == 0 || content.height == 0 {
                 continue;
             }
-            // Image pane: if a frame was pushed and the terminal supports graphics,
-            // draw the image (kitty/iterm2/sixel) instead of the text grid.
-            if self.picker.protocol_type() != ProtocolType::Halfblocks
-                && self.images.contains_key(pane)
-            {
-                let need = self
-                    .images
-                    .get(pane)
-                    .map(|s| s.proto.is_none() || s.area != Some(content))
-                    .unwrap_or(false);
-                if need {
-                    let img = self.images.get(pane).unwrap().img.clone();
-                    if let Ok(proto) = self.picker.new_protocol(img, content, Resize::Fit(None)) {
-                        let s = self.images.get_mut(pane).unwrap();
-                        s.proto = Some(proto);
-                        s.area = Some(content);
-                    }
-                }
-                if let Some(proto) = self.images.get(pane).and_then(|s| s.proto.as_ref()) {
-                    f.render_widget(Image::new(proto), content);
-                }
-                continue;
-            }
             let dimmed = many && !focused;
             if let Some(v) = self.views.get(pane) {
                 let lines = screen_to_lines(v.parser.screen(), focused && scroll == 0, dimmed);
@@ -2930,9 +2884,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     let sidebar = cfg.ui.sidebar_start_visible;
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
-    // Detect the terminal's graphics protocol (kitty/iterm2/sixel) before we take
-    // over the screen. Falls back to halfblocks (treated as "no graphics").
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
     let mut app = App {
         cfg,
         client,
@@ -2969,8 +2920,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         swap_from: None,
         footer_hits: Vec::new(),
         pane_rects: Vec::new(),
-        picker,
-        images: HashMap::new(),
         status_cmds: HashMap::new(),
     };
 

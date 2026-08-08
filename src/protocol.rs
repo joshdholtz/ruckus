@@ -53,10 +53,6 @@ pub enum Request {
     /// Detector seam: report the agent running in a pane (e.g. "claude"), or
     /// `null` to clear. Sets PaneInfo.agent, which drives the AGENTS list.
     ReportAgent { pane: u64, name: Option<String> },
-    /// Display an image in a pane (base64 PNG/JPEG; empty clears it). Rendered
-    /// via the kitty graphics protocol on capable terminals. Frame sources
-    /// (e.g. a simulator streamer) push frames here as a plugin.
-    SetPaneImage { pane: u64, data: String },
     /// Re-read config.toml: daemon refreshes its own settings and tells every
     /// attached client to reload and re-render.
     Reload,
@@ -73,8 +69,6 @@ pub enum ServerMsg {
     Output { pane: u64, data: String },
     Exited { pane: u64, code: u32 },
     Activity { pane: u64, activity: Activity },
-    /// Latest image for a pane (base64 PNG/JPEG; empty clears). Streamed like Output.
-    PaneImage { pane: u64, data: String },
     /// Pushed to every client when config should be reloaded from disk.
     ConfigChanged,
 }

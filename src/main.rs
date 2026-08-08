@@ -98,8 +98,6 @@ enum Cmd {
     },
     /// Report the agent running in a pane (omit NAME to clear)
     ReportAgent { pane: u64, name: Option<String> },
-    /// Show an image (PNG/JPEG) in a pane; omit PATH to clear. Needs a kitty-graphics terminal.
-    SetImage { target: String, path: Option<String> },
     /// Read or edit config.toml (comment-preserving)
     Config {
         #[command(subcommand)]
@@ -163,7 +161,6 @@ async fn main() -> Result<()> {
         Some(Cmd::ReportAgent { pane, name }) => {
             simple_req(Request::ReportAgent { pane, name }, "reported").await
         }
-        Some(Cmd::SetImage { target, path }) => set_image(target, path).await,
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
         Some(Cmd::Reload) => reload().await,
     }
@@ -174,22 +171,6 @@ async fn reload() -> Result<()> {
     let (client, _events) = connect().await?;
     client.request(Request::Reload).await?;
     println!("config reloaded");
-    Ok(())
-}
-
-async fn set_image(target: String, path: Option<String>) -> Result<()> {
-    ensure_daemon().await?;
-    let (client, _events) = connect().await?;
-    let snap = client.snapshot().await?;
-    let pane = resolve_pane(&snap, &target)?;
-    let data = match path {
-        Some(p) => B64.encode(std::fs::read(&p)?),
-        None => String::new(), // clear
-    };
-    match client.request(Request::SetPaneImage { pane: pane.id, data }).await? {
-        ServerMsg::Error { message } => anyhow::bail!(message),
-        _ => println!("set image on pane {} ({})", pane.id, pane.title),
-    }
     Ok(())
 }
 
