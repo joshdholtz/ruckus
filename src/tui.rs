@@ -1745,10 +1745,9 @@ impl App {
         let g = &self.cfg.glyphs;
         match info.map(|i| (i.activity, i.status)) {
             Some((Activity::Working, _)) => self.working_indicator(),
-            Some((Activity::Waiting, _)) => {
-                let s = if (self.tick / 4) % 2 == 0 { &g.waiting } else { &g.idle };
-                (s.clone(), th.waiting)
-            }
+            // Waiting is a steady dot (no blink) — blinking in several sections at
+            // once was too noisy.
+            Some((Activity::Waiting, _)) => (g.waiting.clone(), th.waiting),
             Some((Activity::Done, PaneStatus::Exited { code })) => (
                 g.done.clone(),
                 if code == 0 { th.done_ok } else { th.done_err },
@@ -1758,15 +1757,26 @@ impl App {
         }
     }
 
+    /// Animated state glyph (spinner for working) — for tabs and the agents list.
     fn state_glyph(&self, a: Activity) -> (String, Color) {
         let th = &self.cfg.theme;
         let g = &self.cfg.glyphs;
         match a {
             Activity::Working => self.working_indicator(),
-            Activity::Waiting => {
-                let s = if (self.tick / 4) % 2 == 0 { &g.waiting } else { &g.idle };
-                (s.clone(), th.waiting)
-            }
+            Activity::Waiting => (g.waiting.clone(), th.waiting),
+            Activity::Done => (g.done.clone(), th.done_ok),
+            Activity::Idle => (g.idle.clone(), th.idle),
+        }
+    }
+
+    /// Non-animated state glyph — for the SPACES aggregate so the space list
+    /// stays calm (only the actual agent/tab rows animate).
+    fn static_glyph(&self, a: Activity) -> (String, Color) {
+        let th = &self.cfg.theme;
+        let g = &self.cfg.glyphs;
+        match a {
+            Activity::Working => (g.working.clone(), th.working),
+            Activity::Waiting => (g.waiting.clone(), th.waiting),
             Activity::Done => (g.done.clone(), th.done_ok),
             Activity::Idle => (g.idle.clone(), th.idle),
         }
@@ -1890,7 +1900,11 @@ impl App {
                         None::<Target>
                     );
                     let tpl = self.cfg.ui.queue_row.clone();
+                    let gap = self.cfg.ui.sidebar_row_gap;
                     for (id, vars, icon) in attention {
+                        for _ in 0..gap {
+                            push!(Line::raw(""), None::<Target>);
+                        }
                         let selected = id == self.focused;
                         let hovered = hover_row == Some(y);
                         let row_style = if selected || hovered {
@@ -1925,7 +1939,11 @@ impl App {
                         )),
                         None::<Target>
                     );
+                    let gap = self.cfg.ui.sidebar_row_gap;
                     for (pid, tab_name, space_name) in agents {
+                        for _ in 0..gap {
+                            push!(Line::raw(""), None::<Target>);
+                        }
                         let (g, mut color) = self
                             .snap
                             .pane(pid)
@@ -1989,7 +2007,7 @@ impl App {
                             push!(Line::raw(""), None::<Target>);
                         }
                         let s_active = s.id == self.snap.active_space;
-                        let mut icon = self.state_glyph(space_activity(&self.snap, s));
+                        let mut icon = self.static_glyph(space_activity(&self.snap, s));
                         if self.space_unread(s) {
                             icon.1 = th.accent; // unread badge
                         }
