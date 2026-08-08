@@ -12,7 +12,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
@@ -22,6 +22,9 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
 use crate::config::{
     normalize_key, Action, BarPos, Config, FooterMode, SidebarPos, ToastPos, WorkingStyle,
+};
+use crate::layout::{
+    area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
 };
 use crate::protocol::*;
 use crate::render::{encode_key, screen_to_lines};
@@ -340,133 +343,6 @@ fn tab_activity(snap: &Snapshot, tab: &TabInfo) -> Activity {
 
 fn space_activity(snap: &Snapshot, space: &SpaceInfo) -> Activity {
     agg_activity(space.tabs.iter().map(|t| tab_activity(snap, t)))
-}
-
-fn split_chunks(dir: Dir, n: usize, weights: &[u16], area: Rect, gutter: u16) -> Vec<Rect> {
-    let cons: Vec<Constraint> = if weights.len() == n {
-        weights.iter().map(|w| Constraint::Fill(*w)).collect()
-    } else {
-        (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect()
-    };
-    let direction = match dir {
-        Dir::Right => Direction::Horizontal,
-        Dir::Down => Direction::Vertical,
-    };
-    Layout::default()
-        .direction(direction)
-        .constraints(cons)
-        .spacing(gutter)
-        .split(area)
-        .to_vec()
-}
-
-fn node_rects(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(u64, Rect)>) {
-    match node {
-        Node::Leaf { pane } => out.push((*pane, area)),
-        Node::Split { dir, children, weights } => {
-            for (c, r) in children
-                .iter()
-                .zip(split_chunks(*dir, children.len(), weights, area, gutter))
-            {
-                node_rects(c, r, gutter, out);
-            }
-        }
-    }
-}
-
-/// Collect subtle divider segments in the gutter between sibling panes.
-/// Each entry is (line rect, is_vertical).
-fn node_dividers(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(Rect, bool)>) {
-    let Node::Split { dir, children, weights } = node else { return };
-    let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
-    if gutter > 0 {
-        for pair in chunks.windows(2) {
-            let a = pair[0];
-            match dir {
-                Dir::Right => {
-                    let gx = a.x + a.width + gutter / 2;
-                    out.push((Rect::new(gx, area.y, 1, area.height), true));
-                }
-                Dir::Down => {
-                    let gy = a.y + a.height + gutter / 2;
-                    out.push((Rect::new(area.x, gy, area.width, 1), false));
-                }
-            }
-        }
-    }
-    for (c, r) in children.iter().zip(chunks) {
-        node_dividers(c, r, gutter, out);
-    }
-}
-
-/// Locate a draggable seam between two sibling panes at (col, row).
-fn find_border(
-    node: &Node,
-    area: Rect,
-    gutter: u16,
-    col: u16,
-    row: u16,
-    path: &mut Vec<usize>,
-) -> Option<(Vec<usize>, usize, Dir)> {
-    let Node::Split { dir, children, weights } = node else { return None };
-    let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
-    let grab = gutter + 1;
-    for i in 0..children.len().saturating_sub(1) {
-        match dir {
-            Dir::Right => {
-                let b = chunks[i + 1].x;
-                if row >= area.y
-                    && row < area.y + area.height
-                    && (b.saturating_sub(grab)..=b).contains(&col)
-                {
-                    return Some((path.clone(), i, Dir::Right));
-                }
-            }
-            Dir::Down => {
-                let b = chunks[i + 1].y;
-                if col >= area.x
-                    && col < area.x + area.width
-                    && (b.saturating_sub(grab)..=b).contains(&row)
-                {
-                    return Some((path.clone(), i, Dir::Down));
-                }
-            }
-        }
-    }
-    for (i, (c, r)) in children.iter().zip(chunks.iter()).enumerate() {
-        if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
-            path.push(i);
-            if let Some(hit) = find_border(c, *r, gutter, col, row, path) {
-                return Some(hit);
-            }
-            path.pop();
-        }
-    }
-    None
-}
-
-fn node_at_path_mut<'a>(node: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
-    if path.is_empty() {
-        return Some(node);
-    }
-    match node {
-        Node::Split { children, .. } => children
-            .get_mut(path[0])
-            .and_then(|c| node_at_path_mut(c, &path[1..])),
-        _ => None,
-    }
-}
-
-fn area_at_path(node: &Node, area: Rect, gutter: u16, path: &[usize]) -> Option<Rect> {
-    if path.is_empty() {
-        return Some(area);
-    }
-    let Node::Split { dir, children, weights } = node else { return None };
-    let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
-    let i = path[0];
-    children
-        .get(i)
-        .and_then(|c| area_at_path(c, *chunks.get(i)?, gutter, &path[1..]))
 }
 
 /// Expand a row template like "{icon} {title}" into styled spans.
@@ -1398,16 +1274,24 @@ impl App {
             self.do_action(a).await;
             return;
         }
-        // Enter on a dead pane restarts it in place (zellij-style).
-        if ev.code == KeyCode::Enter
-            && self
-                .snap
-                .pane(self.focused)
-                .map(|p| p.status != PaneStatus::Running)
-                .unwrap_or(false)
-        {
-            self.restart_action(self.focused).await;
-            return;
+        // Dead-pane chrome: Enter restarts in place, Esc closes (zellij-style).
+        let dead = self
+            .snap
+            .pane(self.focused)
+            .map(|p| p.status != PaneStatus::Running)
+            .unwrap_or(false);
+        if dead {
+            match ev.code {
+                KeyCode::Enter => {
+                    self.restart_action(self.focused).await;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.close_pane_action(self.focused).await;
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Some(bytes) = encode_key(&ev) {
             self.search = None; // typing into the pane leaves search mode
@@ -2844,9 +2728,10 @@ impl App {
                 continue;
             }
             let dimmed = many && !focused;
+            let exited = matches!(info.map(|i| &i.status), Some(PaneStatus::Exited { .. }));
             if let Some(v) = self.views.get(pane) {
                 let screen = v.parser.screen();
-                let live = focused && scroll == 0;
+                let live = focused && scroll == 0 && !exited;
                 // Draw the synthetic (inverted-cell) cursor only when we can't place
                 // the real one — otherwise place the terminal's native blinking cursor
                 // at the focused pane so it blinks and mobile IMEs track it.
@@ -2858,7 +2743,7 @@ impl App {
                     f.set_cursor_position((cx, cy));
                     placed_real = true;
                 }
-                let mut lines = screen_to_lines(screen, live && !placed_real, dimmed);
+                let mut lines = screen_to_lines(screen, live && !placed_real, dimmed || exited);
                 // Highlight scrollback-search matches on the focused pane: tint any
                 // visible row that contains the query.
                 if focused {
@@ -2879,6 +2764,53 @@ impl App {
                     Paragraph::new(lines).style(Style::default().bg(th.surface)),
                     content,
                 );
+            }
+            // Dead-pane frame: status banner + restart/close hints over the content.
+            if let Some(PaneInfo { status: PaneStatus::Exited { code }, .. }) = info {
+                if content.height >= 2 && content.width >= 12 {
+                    let ok = *code == 0;
+                    let status_fg = if ok { th.done_ok } else { th.done_err };
+                    let banner = format!("[ EXITED {code} ]");
+                    let hints = if focused {
+                        "enter restart · esc close"
+                    } else {
+                        "exited"
+                    };
+                    let ban_w = banner.chars().count() as u16;
+                    let hint_w = hints.chars().count() as u16;
+                    let mid_y = content.y + content.height / 2;
+                    let ban_x = content.x + content.width.saturating_sub(ban_w) / 2;
+                    let hint_x = content.x + content.width.saturating_sub(hint_w) / 2;
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            banner,
+                            Style::default()
+                                .fg(status_fg)
+                                .bg(th.surface)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Rect::new(
+                            ban_x,
+                            mid_y.saturating_sub(1).max(content.y),
+                            ban_w,
+                            1,
+                        ),
+                    );
+                    if content.height >= 3 {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                hints,
+                                Style::default().fg(th.status_fg).bg(th.surface),
+                            )),
+                            Rect::new(
+                                hint_x,
+                                mid_y.min(content.y + content.height - 1),
+                                hint_w,
+                                1,
+                            ),
+                        );
+                    }
+                }
             }
         }
     }

@@ -20,13 +20,23 @@ enum SessionEvent {
     Exited(u32),
 }
 
+/// One attached client (TUI / tail / plugin) subscribed to a pane's output.
+struct Sub {
+    tx: Tx,
+    rows: u16,
+    cols: u16,
+}
+
 struct PaneSession {
     info: PaneInfo,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     scrollback: VecDeque<u8>,
-    subs: HashMap<u64, Tx>,
+    /// conn_id → subscriber. PTY size is the max of all attached sizes so a
+    /// tiny `tail` client cannot shrink a full TUI (and vice-versa fights are
+    /// resolved toward the largest viewer).
+    subs: HashMap<u64, Sub>,
     last_output: std::time::Instant,
     /// Authoritative activity set by a detector/plugin (OSC 133, foreground-process,
     /// agent hook…). When `Some`, it overrides the output heuristic and the quiet
@@ -53,6 +63,64 @@ struct PaneSession {
 const RESIZE_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "nu", "dash"];
+
+/// Built-in coding-agent command names. Quiet panes running these default to
+/// `waiting` (they stopped streaming and likely need you). Quiet `cargo` /
+/// `pytest` / etc. default to `idle` instead — no more false NEEDS YOU.
+const KNOWN_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "aider",
+    "goose",
+    "opencode",
+    "amp",
+    "gemini",
+    "cursor-agent",
+    "cline",
+    "cody",
+    "continue",
+    "q",
+    "grok",
+];
+
+fn is_known_agent(prog: &str) -> bool {
+    KNOWN_AGENTS.iter().any(|a| a.eq_ignore_ascii_case(prog))
+}
+
+/// Kill a pane's process and its process group. portable-pty runs the child in
+/// its own session (`setsid`), so `kill(-pgid, …)` reaches the shell and
+/// siblings that stayed in that group; SIGHUP mimics a terminal hangup so job
+/// control shells tend to tear down foreground jobs too.
+fn kill_pane_session(p: &mut PaneSession) {
+    if let Some(pgid) = p.master.process_group_leader() {
+        // Negative pid = whole process group.
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGHUP);
+            let _ = libc::kill(-pgid, libc::SIGTERM);
+        }
+    }
+    let _ = p.killer.kill();
+}
+
+/// Resize the PTY to the max dimensions requested by any attached subscriber.
+/// No-op when nobody is attached (keeps the last size).
+fn apply_max_attach_size(p: &mut PaneSession) {
+    let (rows, cols) = p
+        .subs
+        .values()
+        .fold((0u16, 0u16), |(r, c), s| (r.max(s.rows), c.max(s.cols)));
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let _ = p.master.resize(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    p.resized_at = std::time::Instant::now();
+    p.screen.set_size(rows, cols);
+}
 
 fn scrollback_path(id: u64) -> std::path::PathBuf {
     let dir = ruckus_dir().join("scrollback");
@@ -178,6 +246,51 @@ fn classify_quiet(p: &PaneSession) -> Activity {
     classify_tail(&prog, &text)
 }
 
+/// True when a single line looks like an interactive input prompt, not a log
+/// line that happens to end with `:` (`Error:`, `Compiling foo:`, URLs, …).
+fn looks_like_input_prompt(line: &str) -> bool {
+    let t = line.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    if t.ends_with('?') || t.ends_with('╯') {
+        // bottom of a TUI input box (e.g. Claude Code) ends with ╯
+        return true;
+    }
+    let lower = t.to_lowercase();
+    if lower.contains("password") || lower.contains("passphrase") || lower.contains("continue?")
+    {
+        return true;
+    }
+    // Trailing-colon prompts only when short and not an obvious log/status line.
+    let Some(stripped) = t.strip_suffix(':') else {
+        return false;
+    };
+    let stripped = stripped.trim_end();
+    if stripped.is_empty() || stripped.len() > 48 {
+        return false;
+    }
+    if stripped.contains("://") {
+        return false;
+    }
+    if lower.starts_with("error")
+        || lower.starts_with("warning")
+        || lower.starts_with("note")
+        || lower.starts_with("info")
+        || lower.starts_with("debug")
+        || lower.starts_with("trace")
+        || lower.contains("compiling")
+        || lower.contains("downloading")
+        || lower.contains("fetching")
+        || lower.contains("building")
+        || lower.contains("running ")
+    {
+        return false;
+    }
+    // Must contain a letter so pure timestamps / numbers don't match.
+    stripped.chars().any(|c| c.is_alphabetic())
+}
+
 /// Pure classification over the ANSI-stripped tail of a pane's output.
 /// Agent-aware: coding agents print "esc to interrupt" while running, and a
 /// quiet agent without that marker is waiting on you.
@@ -216,15 +329,9 @@ pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
     }
 
     let last = recent.first().copied().unwrap_or("");
-    let lower = last.to_lowercase();
 
-    // Explicit question / input markers win.
-    if last.ends_with('?')
-        || lower.contains("password")
-        || lower.contains("continue?")
-        || last.ends_with(':')
-        || last.ends_with('╯') // bottom of a TUI input box (e.g. Claude Code)
-    {
+    // Explicit question / input markers win (narrower than "any trailing colon").
+    if looks_like_input_prompt(last) {
         return Activity::Waiting;
     }
     // Shell-prompt endings mean idle.
@@ -237,12 +344,14 @@ pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
     {
         return Activity::Idle;
     }
-    // A non-shell command (an agent) that stopped streaming is waiting on you;
-    // a shell sitting quiet is just idle.
+    // Quiet coding agents (or an agent name as the pane command) likely need you.
+    // Quiet batch tools (`cargo`, `pytest`, `sleep`, …) are just idle — not NEEDS YOU.
     if SHELLS.contains(&prog) {
         Activity::Idle
-    } else {
+    } else if is_known_agent(prog) {
         Activity::Waiting
+    } else {
+        Activity::Idle
     }
 }
 
@@ -400,35 +509,67 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Foreground-process detector (opt-in): identify the agent running in each
-    // pane from its foreground process group — like tmux's pane_current_command —
-    // so agents launched inside a shell still populate the AGENTS list.
+    // Process probe (~1 Hz): live cwd for every running pane, plus (opt-in)
+    // foreground-command agent detection like tmux's pane_current_command.
     {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
             loop {
                 tick.tick().await;
-                let targets: Vec<(u64, i32)> = {
+                let (targets, detect_fg) = {
                     let st = state.lock().unwrap();
-                    if !st.detect_foreground {
-                        continue;
-                    }
-                    st.panes
+                    let targets: Vec<(u64, i32)> = st
+                        .panes
                         .iter()
                         .filter(|(_, p)| p.info.status == PaneStatus::Running)
                         .filter_map(|(id, p)| p.master.process_group_leader().map(|pid| (*id, pid)))
-                        .collect()
+                        .collect();
+                    (targets, st.detect_foreground)
                 };
                 if targets.is_empty() {
                     continue;
                 }
                 let pids: Vec<i32> = targets.iter().map(|(_, pid)| *pid).collect();
-                let names = resolve_fg_names(&pids);
+                let cwds = resolve_cwds(&pids);
+                let names = if detect_fg {
+                    resolve_fg_names(&pids)
+                } else {
+                    HashMap::new()
+                };
                 let mut st = state.lock().unwrap();
                 let allow = st.agent_commands.clone();
                 let mut changed = false;
                 for (id, pid) in targets {
+                    if let Some(cwd) = cwds.get(&pid) {
+                        if let Some(p) = st.panes.get_mut(&id) {
+                            if &p.info.cwd != cwd {
+                                p.info.cwd = cwd.clone();
+                                // Keep shell pane titles in sync with the directory.
+                                let prog = p
+                                    .info
+                                    .cmd
+                                    .first()
+                                    .map(|s| basename(s))
+                                    .unwrap_or_default();
+                                if SHELLS.contains(&prog.as_str())
+                                    || matches!(
+                                        prog.as_str(),
+                                        "tcsh" | "ksh" | "pwsh"
+                                    )
+                                {
+                                    p.info.title = default_pane_title(
+                                        p.info.cmd.first().map(String::as_str).unwrap_or("sh"),
+                                        cwd,
+                                    );
+                                }
+                                changed = true;
+                            }
+                        }
+                    }
+                    if !detect_fg {
+                        continue;
+                    }
                     let base = names.get(&pid).map(|s| basename(s)).unwrap_or_default();
                     // Only known coding agents count — not transient commands (git, ls…).
                     // An empty allowlist means "any non-shell command".
@@ -577,7 +718,7 @@ fn broadcast_state(st: &State) {
 /// Kill a pane's process and drop its scrollback file (no layout cascade).
 fn drop_pane(st: &mut State, pane: u64) {
     if let Some(mut p) = st.panes.remove(&pane) {
-        let _ = p.killer.kill();
+        kill_pane_session(&mut p);
     }
     let _ = std::fs::remove_file(scrollback_path(pane));
 }
@@ -802,10 +943,11 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let Some(p) = st.panes.get_mut(&pane) else {
                 return err(format!("no pane {pane}"));
             };
-            let _ = p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-            p.resized_at = std::time::Instant::now();
-            p.screen.set_size(rows, cols);
-            p.subs.insert(conn_id, tx.clone());
+            let rows = rows.max(1);
+            let cols = cols.max(1);
+            p.subs.insert(conn_id, Sub { tx, rows, cols });
+            // Max-of-subscribers size: small clients cannot shrink a large TUI.
+            apply_max_attach_size(p);
             let scrollback = B64.encode(p.scrollback.make_contiguous());
             ServerMsg::Attached { pane, scrollback }
         }
@@ -813,6 +955,8 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let mut st = state.lock().unwrap();
             if let Some(p) = st.panes.get_mut(&pane) {
                 p.subs.remove(&conn_id);
+                // Recompute size from remaining subscribers (if any).
+                apply_max_attach_size(p);
             }
             ServerMsg::Done
         }
@@ -824,7 +968,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let Ok(bytes) = B64.decode(&data) else {
                 return err("bad base64");
             };
-            match p.writer.write_all(&bytes) {
+            match p.writer.write_all(&bytes).and_then(|_| p.writer.flush()) {
                 Ok(_) => ServerMsg::Done,
                 Err(e) => err(format!("write failed: {e}")),
             }
@@ -834,14 +978,28 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             let Some(p) = st.panes.get_mut(&pane) else {
                 return err(format!("no pane {pane}"));
             };
-            match p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
-                Ok(_) => {
-                    p.resized_at = std::time::Instant::now();
-                    p.screen.set_size(rows, cols);
-                    ServerMsg::Done
+            let rows = rows.max(1);
+            let cols = cols.max(1);
+            if let Some(sub) = p.subs.get_mut(&conn_id) {
+                sub.rows = rows;
+                sub.cols = cols;
+                apply_max_attach_size(p);
+            } else {
+                // No active attach for this conn — apply size directly (scripted resize).
+                match p.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    Ok(_) => {
+                        p.resized_at = std::time::Instant::now();
+                        p.screen.set_size(rows, cols);
+                    }
+                    Err(e) => return err(format!("resize failed: {e}")),
                 }
-                Err(e) => err(format!("resize failed: {e}")),
             }
+            ServerMsg::Done
         }
         Request::ReportActivity { pane, state: report } => {
             let mut st = state.lock().unwrap();
@@ -1077,6 +1235,53 @@ fn resolve_fg_names(pids: &[i32]) -> HashMap<i32, String> {
     map
 }
 
+/// Resolve each pid's current working directory. Linux uses `/proc/<pid>/cwd`;
+/// macOS (and other Unix) falls back to a single batched `lsof`.
+fn resolve_cwds(pids: &[i32]) -> HashMap<i32, String> {
+    let mut map = HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for &pid in pids {
+            let link = format!("/proc/{pid}/cwd");
+            if let Ok(path) = std::fs::read_link(&link) {
+                map.insert(pid, path.display().to_string());
+            }
+        }
+        return map;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // lsof -a -d cwd -Fn -p p1,p2,…
+        // emits blocks: p<pid>\n n<path>\n
+        let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+        let Ok(out) = std::process::Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fn", "-p", &list])
+            .output()
+        else {
+            return map;
+        };
+        let mut cur: Option<i32> = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.strip_prefix('p') {
+                cur = rest.trim().parse().ok();
+            } else if let Some(path) = line.strip_prefix('n') {
+                if let Some(pid) = cur {
+                    // lsof sometimes prefixes "n" already stripped; path is the rest.
+                    if !path.is_empty() {
+                        map.insert(pid, path.to_string());
+                    }
+                }
+            }
+        }
+        map
+    }
+}
+
 async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<SessionEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -1091,77 +1296,86 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 })
                 .unwrap();
 
-                let mut st = state.lock().unwrap();
-                let changed = {
-                    let Some(p) = st.panes.get_mut(&id) else { continue };
-                    p.scrollback.extend(bytes.iter().copied());
-                    while p.scrollback.len() > SCROLLBACK_MAX {
-                        p.scrollback.pop_front();
-                    }
-                    p.last_output = std::time::Instant::now();
-                    p.dirty = true;
-                    p.screen.process(&bytes);
-                    // A strong agent prompt on screen means "waiting on you", even
-                    // while the prompt animates (redraws keep output flowing, so the
-                    // quiet-classifier would otherwise never get to re-check it).
-                    // Scanning the whole screen is expensive, so throttle it to a few
-                    // times/sec and reuse the cached result in between — otherwise a
-                    // flood of redraws (Claude Code) pegs the daemon under the lock.
-                    if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250) {
-                        let text = p.screen.screen().contents().to_lowercase();
-                        p.prompt_cached = text.contains("esc to cancel")
-                            || text.contains("do you want to proceed")
-                            || text.contains("tab to amend");
-                        p.last_prompt_scan = std::time::Instant::now();
-                    }
-                    let waiting_prompt = p.prompt_cached;
-                    // Ignore repaint bursts triggered by a resize (view switch) —
-                    // otherwise idle panes flash "working" whenever you change spaces.
-                    let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
-                    let target = if waiting_prompt {
-                        Some(Activity::Waiting)
-                    } else if !repaint {
-                        Some(Activity::Working)
+                // Hold the lock only for state mutation + collecting subscriber
+                // handles. Fan-out and notifications run after unlock so a slow
+                // client cannot stall every other pane on the single mutex.
+                let (changed, notify_waiting_title, osc_change, sub_txs) = {
+                    let mut st = state.lock().unwrap();
+                    let notify_waiting = st.notify_waiting;
+                    let detect_osc = st.detect_osc133;
+                    let (changed, notify_title, sub_txs) = {
+                        let Some(p) = st.panes.get_mut(&id) else { continue };
+                        p.scrollback.extend(bytes.iter().copied());
+                        while p.scrollback.len() > SCROLLBACK_MAX {
+                            p.scrollback.pop_front();
+                        }
+                        p.last_output = std::time::Instant::now();
+                        p.dirty = true;
+                        p.screen.process(&bytes);
+                        // Throttle full-screen agent-prompt scans — Claude redraws
+                        // would otherwise peg the daemon under the lock.
+                        if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250)
+                        {
+                            let text = p.screen.screen().contents().to_lowercase();
+                            p.prompt_cached = text.contains("esc to cancel")
+                                || text.contains("do you want to proceed")
+                                || text.contains("tab to amend");
+                            p.last_prompt_scan = std::time::Instant::now();
+                        }
+                        let waiting_prompt = p.prompt_cached;
+                        // Ignore repaint bursts after resize (view switch).
+                        let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
+                        let target = if waiting_prompt {
+                            Some(Activity::Waiting)
+                        } else if !repaint {
+                            Some(Activity::Working)
+                        } else {
+                            None
+                        };
+                        // Detector owns this pane — don't let raw output override it.
+                        let changed = match target {
+                            Some(a)
+                                if p.reported.is_none()
+                                    && p.info.status == PaneStatus::Running
+                                    && p.info.activity != a =>
+                            {
+                                p.info.activity = a;
+                                Some(a)
+                            }
+                            _ => None,
+                        };
+                        let notify_title = match changed {
+                            Some(Activity::Waiting) if notify_waiting && p.subs.is_empty() => {
+                                Some(p.info.title.clone())
+                            }
+                            _ => None,
+                        };
+                        let sub_txs: Vec<Tx> =
+                            p.subs.values().map(|s| s.tx.clone()).collect();
+                        (changed, notify_title, sub_txs)
+                    }; // p borrow ends here
+                    let osc_change = if detect_osc {
+                        scan_osc133(&bytes)
+                            .and_then(|s| st.panes.get_mut(&id).and_then(|p| apply_report(p, s)))
                     } else {
                         None
                     };
-                    // A detector owns this pane's state — don't let raw output override it.
-                    match target {
-                        Some(a)
-                            if p.reported.is_none()
-                                && p.info.status == PaneStatus::Running
-                                && p.info.activity != a =>
-                        {
-                            p.info.activity = a;
-                            Some(a)
-                        }
-                        _ => None,
-                    }
+                    (changed, notify_title, osc_change, sub_txs)
                 };
-                if let Some(a) = changed {
-                    broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
-                    // Nudge if an agent started waiting on you and nobody's attached.
-                    if a == Activity::Waiting && st.notify_waiting {
-                        if let Some(p) = st.panes.get(&id) {
-                            if p.subs.is_empty() {
-                                notify_system("ruckus", &format!("🐏 {} needs you", p.info.title));
-                            }
-                        }
+                for tx in &sub_txs {
+                    let _ = tx.send(out_frame.clone());
+                }
+                if changed.is_some() || osc_change.is_some() {
+                    let st = state.lock().unwrap();
+                    if let Some(a) = changed {
+                        broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
+                    }
+                    if let Some(a) = osc_change {
+                        broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
                     }
                 }
-                // Opt-in OSC 133 detector: exact command start/finish beats the heuristic.
-                if st.detect_osc133 {
-                    if let Some(state) = scan_osc133(&bytes) {
-                        let change =
-                            st.panes.get_mut(&id).and_then(|p| apply_report(p, state));
-                        if let Some(a) = change {
-                            broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
-                        }
-                    }
-                }
-                let Some(p) = st.panes.get_mut(&id) else { continue };
-                if !p.subs.is_empty() {
-                    p.subs.retain(|_, tx| tx.send(out_frame.clone()).is_ok());
+                if let Some(title) = notify_waiting_title {
+                    notify_system("ruckus", &format!("🐏 {title} needs you"));
                 }
             }
             SessionEvent::Exited(code) => {
@@ -1259,7 +1473,7 @@ fn split(
 fn close_pane(state: &Arc<Mutex<State>>, pane: u64) -> Result<ServerMsg> {
     let mut st = state.lock().unwrap();
     if let Some(mut p) = st.panes.remove(&pane) {
-        let _ = p.killer.kill();
+        kill_pane_session(&mut p);
     }
     let _ = std::fs::remove_file(scrollback_path(pane));
     let mut empty_spaces = Vec::new();
@@ -1344,6 +1558,15 @@ mod tests {
         assert_eq!(classify_tail("python3", "continue? "), Activity::Waiting);
         assert_eq!(classify_tail("sh", "Overwrite? [y/N]"), Activity::Waiting);
         assert_eq!(classify_tail("ssh", "password:"), Activity::Waiting);
+        assert_eq!(classify_tail("sh", "Enter host name:"), Activity::Waiting);
+    }
+
+    #[test]
+    fn log_colons_are_not_waiting() {
+        assert_eq!(classify_tail("cargo", "error: could not compile `foo`"), Activity::Idle);
+        assert_eq!(classify_tail("app", "Error: something failed"), Activity::Idle);
+        assert_eq!(classify_tail("app", "https://example.com/path:"), Activity::Idle);
+        assert_eq!(classify_tail("cargo", "   Compiling foo v0.1.0"), Activity::Idle);
     }
 
     #[test]
@@ -1359,8 +1582,24 @@ mod tests {
     }
 
     #[test]
-    fn quiet_nonshell_defaults_to_waiting_and_shell_to_idle() {
-        assert_eq!(classify_tail("cargo", "Compiling foo v0.1.0"), Activity::Waiting);
+    fn quiet_agent_waits_batch_tools_idle() {
+        // Known agent command quiet without markers → needs you.
+        assert_eq!(classify_tail("claude", "some prior tool output"), Activity::Waiting);
+        assert_eq!(classify_tail("codex", "thinking done"), Activity::Waiting);
+        // Batch tools / unknown CLIs quiet → idle, not NEEDS YOU.
+        assert_eq!(classify_tail("cargo", "Compiling foo v0.1.0"), Activity::Idle);
+        assert_eq!(classify_tail("pytest", "...."), Activity::Idle);
+        assert_eq!(classify_tail("sleep", ""), Activity::Idle);
         assert_eq!(classify_tail("zsh", "some scrollback text"), Activity::Idle);
+    }
+
+    #[test]
+    fn looks_like_input_prompt_rules() {
+        assert!(looks_like_input_prompt("password:"));
+        assert!(looks_like_input_prompt("Name:"));
+        assert!(looks_like_input_prompt("continue?"));
+        assert!(!looks_like_input_prompt("Error: boom"));
+        assert!(!looks_like_input_prompt("Compiling foo:"));
+        assert!(!looks_like_input_prompt("https://x.com:"));
     }
 }

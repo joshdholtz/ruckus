@@ -17,8 +17,9 @@ ruckus ls                # compact tree
 ```
 
 `status --json` returns `{ spaces, active_space, panes }`. Each pane has
-`id`, `title`, `cmd`, `cwd`, `status` (`running` / `exited{code}`), and
-`activity` (`working` / `waiting` / `idle` / `done`). Poll it to know when an
+`id`, `title`, `cmd`, `cwd`, `status` (`running` / `exited{code}`),
+`activity` (`working` / `waiting` / `idle` / `done`), and optional `agent`.
+`cwd` is updated live from the process (~1s). Poll activity to know when an
 agent you launched needs input or has finished.
 
 ## Launch & control
@@ -54,6 +55,24 @@ Config keys are dotted paths into `config.toml`: `ui.*`, `theme.*`, `glyphs.*`,
 `keys.*`, `notify.*`. **`config set` / `unset` auto-reload a running daemon and
 every attached TUI live** — no restart. (Only `ui.spinner_ms` needs a restart.)
 `ruckus reload` forces a reload after a hand-edit of the file.
+
+## Report activity (prefer this over heuristics)
+
+Built-in detection is best-effort (screen tail + optional OSC 133 / foreground
+process). If **you** know the truth — permission prompt up, tool call running —
+report it. While a report is set, the daemon stops guessing for that pane.
+
+```sh
+ruckus report-activity <pane> waiting   # needs the user
+ruckus report-activity <pane> working   # tool call / thinking
+ruckus report-activity <pane> idle
+ruckus report-activity <pane> auto      # back to heuristics
+ruckus report-agent <pane> claude       # labels the AGENTS list
+ruckus report-agent <pane>              # clear label
+```
+
+Same via the socket as `report_activity` / `report_agent` — see
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Typical loop
 

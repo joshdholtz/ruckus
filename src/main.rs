@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod daemon;
+mod layout;
 mod protocol;
 mod render;
 mod tui;

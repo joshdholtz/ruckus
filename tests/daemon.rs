@@ -373,6 +373,36 @@ fn reload_broadcasts_config_changed() {
 }
 
 #[test]
+fn report_activity_overrides_heuristic() {
+    let d = Daemon::start("report-act");
+    let snap = snapshot(&d.dir);
+    let pane = snap["spaces"][0]["tabs"][0]["active_pane"].as_u64().unwrap();
+
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "report_activity", "pane": pane, "state": "waiting"}),
+    );
+    assert_eq!(msg["type"], "done", "{msg}");
+    let snap = snapshot(&d.dir);
+    assert_eq!(pane_by_id(&snap, pane).unwrap()["activity"], "waiting");
+
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "report_agent", "pane": pane, "name": "claude"}),
+    );
+    assert_eq!(msg["type"], "done", "{msg}");
+    let snap = snapshot(&d.dir);
+    assert_eq!(pane_by_id(&snap, pane).unwrap()["agent"], "claude");
+
+    // auto hands control back (activity may stay until heuristic re-evaluates)
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "report_activity", "pane": pane, "state": "auto"}),
+    );
+    assert_eq!(msg["type"], "done", "{msg}");
+}
+
+#[test]
 fn multiple_requests_on_one_connection() {
     // Exercises the framed reader: several newline-delimited requests sent
     // back-to-back on a single connection must each get their matching response.

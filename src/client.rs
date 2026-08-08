@@ -70,6 +70,16 @@ pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
 
 impl Client {
     pub async fn request(&self, req: Request) -> Result<ServerMsg> {
+        // Attach base64-encodes up to ~2MB of scrollback — needs a longer budget
+        // than a tiny snapshot/input. General requests get 10s (was 5s).
+        let timeout = match &req {
+            Request::Attach { .. } => Duration::from_secs(30),
+            _ => Duration::from_secs(10),
+        };
+        self.request_timeout(req, timeout).await
+    }
+
+    pub async fn request_timeout(&self, req: Request, timeout: Duration) -> Result<ServerMsg> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(seq, tx);
@@ -77,10 +87,11 @@ impl Client {
         self.tx
             .send(line)
             .map_err(|_| anyhow!("daemon connection closed"))?;
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(ServerMsg::Error { message })) => bail!("{message}"),
             Ok(Ok(msg)) => Ok(msg),
-            _ => bail!("request timed out"),
+            Ok(Err(_)) => bail!("daemon connection closed"),
+            Err(_) => bail!("request timed out"),
         }
     }
 
