@@ -1907,19 +1907,25 @@ impl App {
                         }
                         let selected = id == self.focused;
                         let hovered = hover_row == Some(y);
-                        let row_style = if selected || hovered {
+                        // Subtle selection: fill only on hover; the focused row is
+                        // marked with the accent bar instead of a full block.
+                        let row_style = if hovered {
                             Style::default().bg(th.select_bg)
                         } else {
                             Style::default()
                         };
-                        let mut spans =
-                            vec![Span::styled("  ".to_string(), row_style)];
+                        let lead = if selected {
+                            Span::styled(self.cfg.glyphs.focus.clone(), row_style.fg(th.accent))
+                        } else {
+                            Span::styled(" ".to_string(), row_style)
+                        };
+                        let mut spans = vec![lead, Span::styled(" ".to_string(), row_style)];
                         spans.extend(template_spans(
                             &tpl,
                             &icon,
                             &vars,
                             row_style,
-                            th.bar_active_fg,
+                            if selected { th.bar_active_fg } else { th.bar_fg },
                         ));
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
@@ -1954,14 +1960,20 @@ impl App {
                         }
                         let selected = pid == self.focused;
                         let hovered = hover_row == Some(y);
-                        let row_style = if selected || hovered {
+                        let row_style = if hovered {
                             Style::default().bg(th.select_bg)
                         } else {
                             Style::default()
                         };
-                        // Line 1: state dot + agent name (bold), highlight spans both lines.
+                        // Line 1: accent marker (if focused) + state dot + agent name (bold).
+                        let lead = if selected {
+                            Span::styled(self.cfg.glyphs.focus.clone(), row_style.fg(th.accent))
+                        } else {
+                            Span::styled(" ".to_string(), row_style)
+                        };
                         let mut spans = vec![
-                            Span::styled("  ".to_string(), row_style),
+                            lead,
+                            Span::styled(" ".to_string(), row_style),
                             Span::styled(format!("{g} "), row_style.fg(color)),
                             Span::styled(
                                 tab_name,
@@ -2023,7 +2035,7 @@ impl App {
                             icon.1 = th.accent; // unread badge
                         }
                         let hovered = hover_row == Some(y);
-                        let row_style = if s_active || hovered {
+                        let row_style = if hovered {
                             Style::default().bg(th.select_bg)
                         } else {
                             Style::default()
