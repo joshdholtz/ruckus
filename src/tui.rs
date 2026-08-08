@@ -28,6 +28,20 @@ use crate::render::{encode_key, screen_to_lines};
 
 /// Below this width the footer switches to compact tap-first chips.
 const FOOTER_COMPACT: u16 = 70;
+/// How long a sidebar/title row stays flashed after an activity change.
+const FLASH_MS: u128 = 900;
+
+/// Linear blend between two colors (RGB only; non-RGB returns `b`).
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
+        }
+        _ => b,
+    }
+}
 
 struct PaneView {
     parser: vt100::Parser,
@@ -155,6 +169,8 @@ struct App {
     /// Panes that changed to a notable state (finished / needs input) while
     /// unfocused. Cleared when you view the pane. Drives the "unread" badge.
     unread: HashSet<u64>,
+    /// pane id -> when its activity last changed, for the brief row-flash motion.
+    flash: HashMap<u64, Instant>,
     cwd: String,
     running: bool,
     toast: Option<(String, Instant)>,
@@ -1648,6 +1664,9 @@ impl App {
                 if let Some(p) = self.snap.pane_mut(pane) {
                     p.activity = activity;
                 }
+                if prev != Some(activity) {
+                    self.flash.insert(pane, Instant::now()); // brief row flash
+                }
                 // Flag as unread if it finished / now needs input while unfocused.
                 if pane != self.focused {
                     let notable = matches!(activity, Activity::Waiting | Activity::Done)
@@ -1662,6 +1681,7 @@ impl App {
                     p.status = PaneStatus::Exited { code };
                     p.activity = Activity::Done;
                 }
+                self.flash.insert(pane, Instant::now());
                 if pane == self.focused {
                     self.seen.insert(pane);
                 } else {
@@ -1707,6 +1727,7 @@ impl App {
                 self.toast = None;
             }
         }
+        self.flash.retain(|_, t| t.elapsed().as_millis() < FLASH_MS);
     }
 
     fn spin(&self) -> String {
@@ -1756,6 +1777,35 @@ impl App {
             Activity::Done => (g.done.clone(), th.done_ok),
             Activity::Idle => (g.idle.clone(), th.idle),
         }
+    }
+
+    /// Blend a row's background toward its state color for ~900ms after the
+    /// pane's activity changed — a brief flash that says "this just changed".
+    fn flash_bg(&self, pane: u64, base: Color) -> Color {
+        let Some(t0) = self.flash.get(&pane) else { return base };
+        let e = t0.elapsed().as_millis();
+        if e >= FLASH_MS {
+            return base;
+        }
+        let toward = self
+            .snap
+            .pane(pane)
+            .map(|p| self.static_glyph(p.activity).1)
+            .unwrap_or(base);
+        let intensity = (1.0 - e as f32 / FLASH_MS as f32) * 0.5;
+        lerp_color(base, toward, intensity)
+    }
+
+    /// A tab flashes if any of its panes just changed.
+    fn tab_flash_bg(&self, tab: &TabInfo, base: Color) -> Color {
+        let mut leaves = Vec::new();
+        tab.layout.leaves(&mut leaves);
+        leaves
+            .iter()
+            .filter_map(|p| self.flash.get(p).map(|t| (*p, *t)))
+            .min_by_key(|(_, t)| t.elapsed().as_millis())
+            .map(|(p, _)| self.flash_bg(p, base))
+            .unwrap_or(base)
     }
 
     /// Non-animated state glyph — for the SPACES aggregate so the space list
@@ -1927,12 +1977,10 @@ impl App {
                         let selected = id == self.focused;
                         let hovered = hover_row == Some(y);
                         // Subtle selection: fill only on hover; the focused row is
-                        // marked with the accent bar instead of a full block.
-                        let row_style = if hovered {
-                            Style::default().bg(th.select_bg)
-                        } else {
-                            Style::default()
-                        };
+                        // marked with the accent bar instead of a full block. A
+                        // fresh activity change briefly flashes the row background.
+                        let base_bg = if hovered { th.select_bg } else { th.sidebar_bg };
+                        let row_style = Style::default().bg(self.flash_bg(id, base_bg));
                         let lead = if selected {
                             Span::styled(self.cfg.glyphs.focus.clone(), row_style.fg(th.accent))
                         } else {
@@ -2127,11 +2175,12 @@ impl App {
                                 icon.1 = th.accent; // unread badge
                             }
                             let hovered = hover_row == Some(y);
-                            let row_style = if t_active || hovered {
-                                Style::default().bg(th.select_bg)
+                            let base_bg = if t_active || hovered {
+                                th.select_bg
                             } else {
-                                Style::default()
+                                th.sidebar_bg
                             };
+                            let row_style = Style::default().bg(self.tab_flash_bg(t, base_bg));
                             let text_fg = if t_active { th.bar_active_fg } else { th.bar_fg };
                             let active_pane = self.snap.pane(t.active_pane);
                             let vars = vec![
@@ -2533,7 +2582,8 @@ impl App {
             let mut content_y = rect.y;
             let mut content_h = rect.height;
             if titles {
-                let bar_bg = if focused { th.select_bg } else { th.bar_bg };
+                let bar_bg =
+                    self.flash_bg(*pane, if focused { th.select_bg } else { th.bar_bg });
                 let mut title_spans = vec![
                     Span::styled(
                         if focused { self.cfg.glyphs.focus.clone() } else { " ".to_string() },
@@ -2818,9 +2868,15 @@ impl App {
     }
 
     fn draw_toast(&self, f: &mut Frame) {
-        let Some((msg, _)) = &self.toast else { return };
+        let Some((msg, at)) = &self.toast else { return };
         let th = &self.cfg.theme;
         let (sw, sh) = self.size;
+        // Fade in on arrival and out near expiry via the DIM attribute — the
+        // closest a terminal gets to an alpha fade.
+        let elapsed = at.elapsed().as_millis();
+        let total = self.cfg.ui.toast_seconds as u128 * 1000;
+        let fade = elapsed < 160 || elapsed + 450 > total;
+        let dim = if fade { Modifier::DIM } else { Modifier::empty() };
         let w = (msg.chars().count() as u16 + 4).min(sw.saturating_sub(2));
         let (x, y) = match self.cfg.ui.toast_pos {
             ToastPos::BottomRight => (sw.saturating_sub(w + 2), sh.saturating_sub(4)),
@@ -2832,14 +2888,14 @@ impl App {
         f.render_widget(Clear, r);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(th.accent))
+            .border_style(Style::default().fg(th.accent).add_modifier(dim))
             .style(Style::default().bg(th.bar_bg));
         let inner = block.inner(r);
         f.render_widget(block, r);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {msg}"),
-                Style::default().fg(th.bar_active_fg),
+                Style::default().fg(th.bar_active_fg).add_modifier(dim),
             ))),
             inner,
         );
@@ -2919,6 +2975,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         focused,
         seen: HashSet::new(),
         unread: HashSet::new(),
+        flash: HashMap::new(),
         cwd: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".to_string()),
@@ -3106,5 +3163,24 @@ mod tests {
         assert_eq!(out.len(), 2);
         // gutter cell exists between the chunks
         assert!(out[1].1.x > out[0].1.x + out[0].1.width);
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    #[test]
+    fn lerp_endpoints_and_midpoint() {
+        let a = Color::Rgb(0, 0, 0);
+        let b = Color::Rgb(255, 255, 255);
+        assert_eq!(lerp_color(a, b, 0.0), a);
+        assert_eq!(lerp_color(a, b, 1.0), b);
+        assert_eq!(lerp_color(a, b, 0.5), Color::Rgb(128, 128, 128));
+        // clamps out-of-range t
+        assert_eq!(lerp_color(a, b, 2.0), b);
+        // non-rgb falls back to b
+        assert_eq!(lerp_color(Color::Red, b, 0.5), b);
     }
 }
