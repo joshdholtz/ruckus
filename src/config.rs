@@ -29,6 +29,7 @@ pub enum Action {
     ShowHelp,
     Zoom,
     Search,
+    Palette,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -51,6 +52,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::ShowHelp, "show_help", &["alt-/"]),
     (Action::Zoom, "zoom", &["alt-z"]),
     (Action::Search, "search", &["alt-f"]),
+    (Action::Palette, "palette", &["alt-p"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
@@ -855,6 +857,7 @@ jump_waiting = "alt-a"    # jump to the next pane that needs you
 show_help = "alt-/"       # keybinding overlay
 zoom = "alt-z"            # focused pane fills the whole area (toggle)
 search = "alt-f"          # search the focused pane's scrollback (n/N to cycle)
+palette = "alt-p"         # command palette: fuzzy-search every action
 
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
 

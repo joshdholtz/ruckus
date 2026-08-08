@@ -31,6 +31,60 @@ const FOOTER_COMPACT: u16 = 70;
 /// How long a sidebar/title row stays flashed after an activity change.
 const FLASH_MS: u128 = 900;
 
+/// Every action the command palette can run, with a human label.
+const PALETTE_ITEMS: &[(Action, &str)] = &[
+    (Action::JumpWaiting, "jump to next pane that needs you"),
+    (Action::SplitRight, "split pane right"),
+    (Action::SplitDown, "split pane down"),
+    (Action::NewTab, "new tab"),
+    (Action::NewSpace, "new space"),
+    (Action::ClosePane, "close pane"),
+    (Action::Zoom, "zoom focused pane"),
+    (Action::Search, "search scrollback"),
+    (Action::NextPane, "focus next pane"),
+    (Action::PrevPane, "focus previous pane"),
+    (Action::NextTab, "next tab"),
+    (Action::PrevTab, "previous tab"),
+    (Action::NextSpace, "next space"),
+    (Action::PrevSpace, "previous space"),
+    (Action::ToggleSidebar, "toggle sidebar"),
+    (Action::ShowHelp, "keyboard help"),
+    (Action::Quit, "quit (daemon keeps running)"),
+];
+
+/// Subsequence fuzzy score, or None if `q` isn't a subsequence of `cand`.
+/// Rewards early and contiguous matches so the best candidate ranks first.
+fn fuzzy_score(cand: &str, q: &str) -> Option<i32> {
+    if q.is_empty() {
+        return Some(0);
+    }
+    let cb = cand.as_bytes();
+    let qb = q.as_bytes();
+    let mut ci = 0usize;
+    let mut score = 0i32;
+    let mut prev: Option<usize> = None;
+    for &qc in qb {
+        let mut matched = false;
+        while ci < cb.len() {
+            if cb[ci].eq_ignore_ascii_case(&qc) {
+                score += if prev == Some(ci.wrapping_sub(1)) { 3 } else { 1 };
+                if ci == 0 {
+                    score += 2;
+                }
+                prev = Some(ci);
+                ci += 1;
+                matched = true;
+                break;
+            }
+            ci += 1;
+        }
+        if !matched {
+            return None;
+        }
+    }
+    Some(score)
+}
+
 /// Linear blend between two colors (RGB only; non-RGB returns `b`).
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
@@ -184,6 +238,8 @@ struct App {
     prompt: Option<Prompt>,
     /// Active scrollback search query (focused pane); drives n/N and highlight.
     search: Option<String>,
+    /// Command palette: fuzzy query + selected row index.
+    palette: Option<(String, usize)>,
     drag: Option<Drag>,
     select: Option<Sel>,
     selecting: bool,
@@ -1045,6 +1101,27 @@ impl App {
                 self.sync().await;
             }
             Action::Search => self.open_prompt(PromptKind::Search),
+            Action::Palette => self.palette = Some((String::new(), 0)),
+        }
+    }
+
+    /// Palette rows matching the current query, best match first.
+    fn palette_filtered(&self) -> Vec<(Action, &'static str)> {
+        let q = self.palette.as_ref().map(|(q, _)| q.to_lowercase()).unwrap_or_default();
+        let mut scored: Vec<(i32, (Action, &'static str))> = PALETTE_ITEMS
+            .iter()
+            .filter_map(|(a, d)| fuzzy_score(&d.to_lowercase(), &q).map(|s| (s, (*a, *d))))
+            .collect();
+        scored.sort_by(|x, y| y.0.cmp(&x.0));
+        scored.into_iter().map(|(_, it)| it).collect()
+    }
+
+    async fn palette_run(&mut self) {
+        let items = self.palette_filtered();
+        let sel = self.palette.as_ref().map(|(_, s)| *s).unwrap_or(0);
+        self.palette = None;
+        if let Some((action, _)) = items.get(sel).copied() {
+            self.do_action(action).await;
         }
     }
 
@@ -1164,6 +1241,39 @@ impl App {
             return;
         }
         let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
+
+        // Command palette: a fuzzy action launcher that swallows keys while open.
+        if self.palette.is_some() {
+            let len = self.palette_filtered().len();
+            match ev.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Enter => self.palette_run().await,
+                KeyCode::Up | KeyCode::BackTab => {
+                    if let Some((_, sel)) = self.palette.as_mut() {
+                        *sel = sel.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    if let Some((_, sel)) = self.palette.as_mut() {
+                        *sel = (*sel + 1).min(len.saturating_sub(1));
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some((q, sel)) = self.palette.as_mut() {
+                        q.pop();
+                        *sel = 0;
+                    }
+                }
+                KeyCode::Char(c) if !ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some((q, sel)) = self.palette.as_mut() {
+                        q.push(c);
+                        *sel = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Modal text input swallows every key until Enter (submit) or Esc (cancel).
         if self.prompt.is_some() {
@@ -2756,6 +2866,70 @@ impl App {
         }
     }
 
+    fn draw_palette(&self, f: &mut Frame) {
+        let Some((query, sel)) = &self.palette else { return };
+        let th = &self.cfg.theme;
+        let items = self.palette_filtered();
+        let w: u16 = 54.min(self.size.0.saturating_sub(4));
+        let rows = items.len().min(10) as u16;
+        let h = rows + 4; // border + input + blank
+        let x = self.size.0.saturating_sub(w) / 2;
+        let y = (self.size.1.saturating_sub(h) / 3).max(1);
+        let r = Rect::new(x, y, w, h.min(self.size.1));
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg))
+            .title(Line::from(Span::styled(
+                " commands ",
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+
+        let mut lines: Vec<Line> = Vec::new();
+        let cursor = if (self.tick / 4) % 2 == 0 { "▏" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(" › ", Style::default().fg(th.accent)),
+            Span::styled(query.clone(), Style::default().fg(th.bar_active_fg)),
+            Span::styled(cursor.to_string(), Style::default().fg(th.accent)),
+        ]));
+        lines.push(Line::raw(""));
+        let iw = inner.width as usize;
+        for (i, (action, desc)) in items.iter().enumerate().take(10) {
+            let selected = i == *sel;
+            let key = self.cfg.hint(*action);
+            let base = if selected {
+                Style::default().bg(th.select_bg)
+            } else {
+                Style::default()
+            };
+            let marker = if selected { "❯ " } else { "  " };
+            let left = format!("{marker}{desc}");
+            let pad = iw.saturating_sub(left.chars().count() + key.chars().count() + 1);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker.to_string(),
+                    base.fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    desc.to_string(),
+                    base.fg(if selected { th.bar_active_fg } else { th.bar_fg }),
+                ),
+                Span::styled(" ".repeat(pad), base),
+                Span::styled(format!("{key} "), base.fg(th.status_fg)),
+            ]));
+        }
+        if items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no match",
+                Style::default().fg(th.status_fg),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_search_bar(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
         let q = self.search.as_deref().unwrap_or("");
@@ -3067,6 +3241,7 @@ impl App {
         }
         self.draw_menu(f);
         self.draw_help(f);
+        self.draw_palette(f);
         self.draw_prompt(f);
         self.draw_prefix_indicator(f);
         self.draw_toast(f);
@@ -3113,6 +3288,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         menu: None,
         prompt: None,
         search: None,
+        palette: None,
         drag: None,
         select: None,
         selecting: false,
@@ -3307,5 +3483,22 @@ mod motion_tests {
         assert_eq!(lerp_color(a, b, 2.0), b);
         // non-rgb falls back to b
         assert_eq!(lerp_color(Color::Red, b, 0.5), b);
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_matches_subsequence_and_ranks() {
+        assert!(fuzzy_score("split pane right", "split").is_some());
+        assert!(fuzzy_score("split pane right", "spr").is_some()); // subsequence
+        assert!(fuzzy_score("split pane right", "xyz").is_none());
+        // contiguous prefix scores higher than a mid-string match
+        let a = fuzzy_score("split", "sp").unwrap(); // prefix + contiguous
+        let b = fuzzy_score("crispy plum", "sp").unwrap(); // contiguous, mid-string
+        assert!(a > b, "prefix {a} should beat mid-string {b}");
+        assert_eq!(fuzzy_score("anything", ""), Some(0));
     }
 }
