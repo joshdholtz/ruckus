@@ -169,6 +169,7 @@ struct App {
     zoomed: bool,
     drawer: bool,
     help: bool,
+    prefix_pending: bool,
     menu: Option<Menu>,
     prompt: Option<Prompt>,
     drag: Option<Drag>,
@@ -1087,6 +1088,30 @@ impl App {
         }
         if self.help {
             self.help = false;
+            return;
+        }
+
+        // tmux-style prefix: consume the prefix, then resolve the next key.
+        if self.prefix_pending {
+            self.prefix_pending = false;
+            if let KeyCode::Char(c @ '1'..='9') = ev.code {
+                let idx = c as usize - '1' as usize;
+                let target = self
+                    .active_space()
+                    .and_then(|s| s.tabs.get(idx).map(|t| (s.id, t.id, t.active_pane)));
+                if let Some((s, t, p)) = target {
+                    self.set_active(s, t, p).await;
+                }
+                return;
+            }
+            if let Some(a) = self.cfg.prefix_action_for(&ev) {
+                self.do_action(a).await;
+            }
+            return;
+        }
+        if self.cfg.is_prefix(&ev) {
+            self.prefix_pending = true;
+            self.toast("prefix …");
             return;
         }
 
@@ -2615,6 +2640,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         zoomed: false,
         drawer: false,
         help: false,
+        prefix_pending: false,
         menu: None,
         prompt: None,
         drag: None,

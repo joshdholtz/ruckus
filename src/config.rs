@@ -372,11 +372,37 @@ impl Default for NotifyConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
+    /// tmux-style prefix key (e.g. ctrl-b). When set, pressing it arms a pending
+    /// state and the next key is looked up in `prefix_keys`. None = disabled.
+    pub prefix: Option<Binding>,
+    /// Command keys used after the prefix (bare keys, tmux-style: c, %, ", …).
+    pub prefix_keys: HashMap<Action, Vec<Binding>>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
     pub notify: NotifyConfig,
 }
+
+/// tmux-style defaults for keys pressed *after* the prefix.
+pub const PREFIX_DEFAULTS: &[(Action, &str)] = &[
+    (Action::NewTab, "c"),
+    (Action::SplitRight, "%"),
+    (Action::SplitDown, "\""),
+    (Action::ClosePane, "x"),
+    (Action::Zoom, "z"),
+    (Action::NextTab, "n"),
+    (Action::PrevTab, "p"),
+    (Action::NextPane, "o"),
+    (Action::PrevPane, "i"),
+    (Action::NextSpace, "."),
+    (Action::PrevSpace, ","),
+    (Action::NewSpace, "C"),
+    (Action::ToggleSidebar, "b"),
+    (Action::JumpWaiting, "a"),
+    (Action::ScrollUp, "["),
+    (Action::ShowHelp, "?"),
+    (Action::Quit, "d"),
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -458,6 +484,10 @@ struct RawNotify {
 struct RawConfig {
     #[serde(default)]
     keys: HashMap<String, KeySpec>,
+    /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
+    prefix: Option<String>,
+    #[serde(default)]
+    prefix_keys: HashMap<String, KeySpec>,
     #[serde(default)]
     theme: HashMap<String, String>,
     #[serde(default)]
@@ -522,6 +552,26 @@ impl Config {
                     .collect();
             }
             keys.insert(*action, bindings);
+        }
+
+        // tmux-style prefix (default ctrl-b) + prefix command keys.
+        let prefix = match raw.prefix.as_deref() {
+            Some("") | Some("off") | Some("none") => None,
+            Some(spec) => parse_binding(spec).ok(),
+            None => parse_binding("ctrl-b").ok(),
+        };
+        let mut prefix_keys = HashMap::new();
+        for (action, default) in PREFIX_DEFAULTS {
+            let name = ACTIONS.iter().find(|(a, _, _)| a == action).map(|(_, n, _)| *n);
+            let specs: Vec<&str> = name
+                .and_then(|n| raw.prefix_keys.get(n))
+                .map(|s| s.specs())
+                .unwrap_or_else(|| vec![*default]);
+            let bindings: Vec<Binding> =
+                specs.iter().filter_map(|s| parse_binding(s).ok()).collect();
+            if !bindings.is_empty() {
+                prefix_keys.insert(*action, bindings);
+            }
         }
 
         let mut theme = Theme::default();
@@ -637,7 +687,7 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keys, theme, ui, glyphs, notify }
+        Config { keys, prefix, prefix_keys, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -655,6 +705,22 @@ impl Config {
             return Some(Action::Quit);
         }
         None
+    }
+
+    /// Does this key event match the tmux prefix?
+    pub fn is_prefix(&self, ev: &KeyEvent) -> bool {
+        let ev = normalize_key(ev, self.ui.mac_option_fallback);
+        self.prefix.as_ref().map(|b| b.matches(&ev)).unwrap_or(false)
+    }
+
+    /// Resolve a post-prefix key to an action. Matches on the key code alone
+    /// (ignoring shift) so `%`, `"`, etc. resolve regardless of layout.
+    pub fn prefix_action_for(&self, ev: &KeyEvent) -> Option<Action> {
+        let ev = normalize_key(ev, self.ui.mac_option_fallback);
+        self.prefix_keys
+            .iter()
+            .find(|(_, bs)| bs.iter().any(|b| b.code == ev.code))
+            .map(|(a, _)| *a)
     }
 
     pub fn label(&self, action: Action) -> String {
