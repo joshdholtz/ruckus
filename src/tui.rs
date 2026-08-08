@@ -1836,7 +1836,37 @@ impl App {
         );
     }
 
+    /// Split-aware sidebar: stacked (single region) or, when `sidebar_split > 0`,
+    /// the last section pinned to a fixed bottom region (herdr-style).
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
+        let sections = self.cfg.ui.sidebar_sections.clone();
+        let split = self.cfg.ui.sidebar_split;
+        self.sidebar_rows.clear();
+        self.sidebar_buttons.clear();
+        if split <= 0.0 || sections.len() < 2 || area.height < 8 {
+            self.draw_sidebar_region(f, area, &sections, true);
+            return;
+        }
+        let (top, pinned) = sections.split_at(sections.len() - 1);
+        let bottom_h = ((area.height as f64 * split) as u16).clamp(3, area.height.saturating_sub(3));
+        let top_h = area.height.saturating_sub(bottom_h + 1); // -1 for divider
+        let top_rect = Rect::new(area.x, area.y, area.width, top_h);
+        let div_row = area.y + top_h;
+        let bot_rect = Rect::new(area.x, div_row + 1, area.width, bottom_h);
+        self.draw_sidebar_region(f, top_rect, top, true);
+        // divider between the two regions
+        let bar = "─".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                bar,
+                Style::default().fg(self.cfg.theme.border).bg(self.cfg.theme.sidebar_bg),
+            ))),
+            Rect::new(area.x, div_row, area.width, 1),
+        );
+        self.draw_sidebar_region(f, bot_rect, pinned, true);
+    }
+
+    fn draw_sidebar_region(&mut self, f: &mut Frame, area: Rect, sections: &[String], append: bool) {
         let th = self.cfg.theme.clone();
         let inner = area;
         f.render_widget(
@@ -1869,7 +1899,7 @@ impl App {
 
         push!(Line::raw(""), None::<Target>);
 
-        for section in self.cfg.ui.sidebar_sections.clone() {
+        for section in sections.iter().cloned().collect::<Vec<_>>() {
             match section.as_str() {
                 "needs_you" => {
                     let attention: Vec<(u64, Vec<(&str, String)>, (String, Color))> = self
@@ -2174,8 +2204,13 @@ impl App {
         }
 
         lines.truncate(inner.height as usize);
-        self.sidebar_rows = rows;
-        self.sidebar_buttons = buttons;
+        if append {
+            self.sidebar_rows.extend(rows);
+            self.sidebar_buttons.extend(buttons);
+        } else {
+            self.sidebar_rows = rows;
+            self.sidebar_buttons = buttons;
+        }
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(th.sidebar_bg)),
             inner,

@@ -267,6 +267,10 @@ pub struct UiConfig {
     pub sidebar_start_visible: bool,
     pub sidebar_width: u16,
     pub sidebar_sections: Vec<String>,
+    /// 0 = sections stacked top-to-bottom. >0 splits the sidebar: the last
+    /// section is pinned to the bottom `sidebar_split` fraction of the height,
+    /// the rest fill the top (herdr-style fixed agents panel).
+    pub sidebar_split: f64,
     /// Blank lines inserted between space groups in the sidebar (0 = dense).
     pub sidebar_row_gap: u16,
     /// Show an accent marker on the active sidebar row.
@@ -333,6 +337,7 @@ impl Default for UiConfig {
             sidebar_start_visible: true,
             sidebar_width: 26,
             sidebar_sections: vec!["needs_you".to_string(), "spaces".to_string()],
+            sidebar_split: 0.0,
             sidebar_row_gap: 1,
             sidebar_marker: true,
             tab_numbers: true,
@@ -454,6 +459,7 @@ struct RawUi {
     sidebar: Option<String>,
     sidebar_width: Option<u16>,
     sidebar_sections: Option<Vec<String>>,
+    sidebar_split: Option<f64>,
     sidebar_row_gap: Option<u16>,
     sidebar_marker: Option<bool>,
     tab_numbers: Option<bool>,
@@ -636,6 +642,7 @@ impl Config {
             sidebar_start_visible,
             sidebar_width: raw.ui.sidebar_width.unwrap_or(d.sidebar_width).clamp(16, 60),
             sidebar_sections: raw.ui.sidebar_sections.unwrap_or(d.sidebar_sections),
+            sidebar_split: raw.ui.sidebar_split.unwrap_or(d.sidebar_split).clamp(0.0, 0.9),
             sidebar_row_gap: raw.ui.sidebar_row_gap.unwrap_or(d.sidebar_row_gap).min(3),
             sidebar_marker: raw.ui.sidebar_marker.unwrap_or(d.sidebar_marker),
             tab_numbers: raw.ui.tab_numbers.unwrap_or(d.tab_numbers),
