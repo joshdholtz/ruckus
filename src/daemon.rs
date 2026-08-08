@@ -188,10 +188,25 @@ pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
         .collect();
     let recent_lower = recent.join("\n").to_lowercase();
 
+    // Agent PROMPTS asking for your input win first — these mean "waiting on you",
+    // not "working". Covers Claude Code / Codex permission & selection prompts.
+    // (Note: "esc to cancel" / "tab to amend" appear at a prompt; "esc to
+    // interrupt" appears while actually running — those are different states.)
+    if recent_lower.contains("esc to cancel")
+        || recent_lower.contains("tab to amend")
+        || recent_lower.contains("do you want to proceed")
+        || recent_lower.contains("do you want to")
+        || recent_lower.contains("(y/n")
+        || recent_lower.contains("[y/n")
+        || recent_lower.contains("❯ 1.")
+        || recent_lower.contains("press enter")
+    {
+        return Activity::Waiting;
+    }
+
     // Agent working markers: still busy even while producing no output
     // (long tool calls run silent). Covers Claude Code, Codex, and friends.
     if recent_lower.contains("esc to interrupt")
-        || recent_lower.contains("esc to cancel")
         || recent_lower.contains("ctrl+c to interrupt")
     {
         return Activity::Working;
@@ -202,8 +217,6 @@ pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
 
     // Explicit question / input markers win.
     if last.ends_with('?')
-        || recent_lower.contains("(y/n")
-        || recent_lower.contains("[y/n")
         || lower.contains("password")
         || lower.contains("continue?")
         || last.ends_with(':')
@@ -1039,7 +1052,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
         let mut st = state.lock().unwrap();
         match ev {
             SessionEvent::Output(bytes) => {
-                let now_working = {
+                let changed = {
                     let Some(p) = st.panes.get_mut(&id) else { continue };
                     p.scrollback.extend(bytes.iter().copied());
                     while p.scrollback.len() > SCROLLBACK_MAX {
@@ -1048,21 +1061,46 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     p.last_output = std::time::Instant::now();
                     p.dirty = true;
                     p.screen.process(&bytes);
+                    // A strong agent prompt on screen means "waiting on you", even
+                    // while the prompt animates (redraws keep output flowing, so the
+                    // quiet-classifier would otherwise never get to re-check it).
+                    let text = p.screen.screen().contents().to_lowercase();
+                    let waiting_prompt = text.contains("esc to cancel")
+                        || text.contains("do you want to proceed")
+                        || text.contains("tab to amend");
                     // Ignore repaint bursts triggered by a resize (view switch) —
                     // otherwise idle panes flash "working" whenever you change spaces.
                     let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
+                    let target = if waiting_prompt {
+                        Some(Activity::Waiting)
+                    } else if !repaint {
+                        Some(Activity::Working)
+                    } else {
+                        None
+                    };
                     // A detector owns this pane's state — don't let raw output override it.
-                    let flip = !repaint
-                        && p.reported.is_none()
-                        && p.info.activity != Activity::Working
-                        && p.info.status == PaneStatus::Running;
-                    if flip {
-                        p.info.activity = Activity::Working;
+                    match target {
+                        Some(a)
+                            if p.reported.is_none()
+                                && p.info.status == PaneStatus::Running
+                                && p.info.activity != a =>
+                        {
+                            p.info.activity = a;
+                            Some(a)
+                        }
+                        _ => None,
                     }
-                    flip
                 };
-                if now_working {
-                    broadcast(&st, ServerMsg::Activity { pane: id, activity: Activity::Working });
+                if let Some(a) = changed {
+                    broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
+                    // Nudge if an agent started waiting on you and nobody's attached.
+                    if a == Activity::Waiting && st.notify_waiting {
+                        if let Some(p) = st.panes.get(&id) {
+                            if p.subs.is_empty() {
+                                notify_system("ruckus", &format!("{} is waiting for you", p.info.title));
+                            }
+                        }
+                    }
                 }
                 // Opt-in OSC 133 detector: exact command start/finish beats the heuristic.
                 if st.detect_osc133 {
