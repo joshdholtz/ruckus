@@ -136,6 +136,7 @@ enum PromptKind {
     NewSpace,
     RenameSpace(u64),
     RenameTab(u64),
+    Search,
 }
 
 /// A modal single-line text input (naming a new/renamed space or tab).
@@ -181,6 +182,8 @@ struct App {
     prefix_pending: bool,
     menu: Option<Menu>,
     prompt: Option<Prompt>,
+    /// Active scrollback search query (focused pane); drives n/N and highlight.
+    search: Option<String>,
     drag: Option<Drag>,
     select: Option<Sel>,
     selecting: bool,
@@ -870,8 +873,55 @@ impl App {
                 "rename tab",
                 self.snap.spaces.iter().flat_map(|s| &s.tabs).find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_default(),
             ),
+            PromptKind::Search => ("search scrollback", String::new()),
         };
         self.prompt = Some(Prompt { kind, label, buffer });
+    }
+
+    /// Scan the focused pane's scrollback for the active query and scroll to a
+    /// match. `older` searches back into history, else toward the live tail.
+    fn run_search(&mut self, older: bool) {
+        let Some(q) = self.search.clone() else { return };
+        if q.is_empty() {
+            return;
+        }
+        let ql = q.to_lowercase();
+        let (found, missed) = {
+            let Some(v) = self.views.get_mut(&self.focused) else { return };
+            let step = (v.rows.max(1) as usize).max(1);
+            let max_off = 10_000usize;
+            let mut off = v.scroll;
+            let mut hit = None;
+            for _ in 0..(max_off / step + 2) {
+                off = if older {
+                    (off + step).min(max_off)
+                } else {
+                    off.saturating_sub(step)
+                };
+                v.parser.set_scrollback(off);
+                if v.parser.screen().contents().to_lowercase().contains(&ql) {
+                    hit = Some(off);
+                    break;
+                }
+                if (older && off == max_off) || (!older && off == 0) {
+                    break;
+                }
+            }
+            match hit {
+                Some(o) => {
+                    v.scroll = o;
+                    v.parser.set_scrollback(o);
+                    (true, false)
+                }
+                None => {
+                    v.parser.set_scrollback(v.scroll); // restore view
+                    (false, true)
+                }
+            }
+        };
+        if missed && !found {
+            self.toast(format!("no match for “{q}”"));
+        }
     }
 
     /// Commit the active prompt: create or rename with the typed name.
@@ -894,6 +944,14 @@ impl App {
                     if let Err(e) = self.client.request(Request::RenameTab { tab, name }).await {
                         self.toast(e.to_string());
                     }
+                }
+            }
+            PromptKind::Search => {
+                if name.is_empty() {
+                    self.search = None;
+                } else {
+                    self.search = Some(name);
+                    self.run_search(true);
                 }
             }
         }
@@ -986,6 +1044,7 @@ impl App {
                 self.zoomed = !self.zoomed;
                 self.sync().await;
             }
+            Action::Search => self.open_prompt(PromptKind::Search),
         }
     }
 
@@ -1126,6 +1185,28 @@ impl App {
             return;
         }
 
+        // Search-nav: while a query is active, n/N cycle matches and Esc clears.
+        // Only bare (or shift-only) keys, so modified bindings still reach the pane.
+        if self.search.is_some()
+            && (ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT)
+        {
+            match ev.code {
+                KeyCode::Esc => {
+                    self.search = None;
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    self.run_search(true);
+                    return;
+                }
+                KeyCode::Char('N') => {
+                    self.run_search(false);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if self.menu.is_some() {
             self.menu = None;
             if ev.code == KeyCode::Esc {
@@ -1206,6 +1287,7 @@ impl App {
             return;
         }
         if let Some(bytes) = encode_key(&ev) {
+            self.search = None; // typing into the pane leaves search mode
             if let Some(v) = self.views.get_mut(&self.focused) {
                 if v.scroll != 0 {
                     v.scroll = 0;
@@ -2649,13 +2731,49 @@ impl App {
                     f.set_cursor_position((cx, cy));
                     placed_real = true;
                 }
-                let lines = screen_to_lines(screen, live && !placed_real, dimmed);
+                let mut lines = screen_to_lines(screen, live && !placed_real, dimmed);
+                // Highlight scrollback-search matches on the focused pane: tint any
+                // visible row that contains the query.
+                if focused {
+                    if let Some(q) = self.search.as_ref().filter(|q| !q.is_empty()) {
+                        let ql = q.to_lowercase();
+                        let row_texts: Vec<String> =
+                            screen.contents().split('\n').map(|s| s.to_lowercase()).collect();
+                        for (i, line) in lines.iter_mut().enumerate() {
+                            if row_texts.get(i).is_some_and(|t| t.contains(&ql)) {
+                                for sp in &mut line.spans {
+                                    sp.style = sp.style.bg(th.waiting).fg(th.bg);
+                                }
+                            }
+                        }
+                    }
+                }
                 f.render_widget(
                     Paragraph::new(lines).style(Style::default().bg(th.surface)),
                     content,
                 );
             }
         }
+    }
+
+    fn draw_search_bar(&self, f: &mut Frame, area: Rect) {
+        let th = &self.cfg.theme;
+        let q = self.search.as_deref().unwrap_or("");
+        let spans = vec![
+            Span::styled(" 🔍 ", Style::default().bg(th.bar_bg).fg(th.accent)),
+            Span::styled(
+                format!("{q}  "),
+                Style::default().bg(th.bar_bg).fg(th.bar_active_fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "n/N next·prev   esc clear",
+                Style::default().bg(th.bar_bg).fg(th.status_fg),
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+            area,
+        );
     }
 
     /// Draw a subtle line in each split gutter so seams read as intentional.
@@ -2774,6 +2892,7 @@ impl App {
             (self.cfg.hint(Action::ScrollDown), "scroll history down"),
             (self.cfg.hint(Action::ToggleSidebar), "toggle sidebar"),
             (self.cfg.hint(Action::Zoom), "zoom focused pane"),
+            (self.cfg.hint(Action::Search), "search scrollback (n/N cycle)"),
             ("alt+1..9".into(), "jump to tab"),
             ("enter".into(), "restart a finished pane"),
             (self.cfg.hint(Action::Quit), "quit (daemon keeps running)"),
@@ -2932,7 +3051,12 @@ impl App {
         self.draw_dividers(f);
         self.draw_selection(f);
         if let Some(r) = self.frame.footer {
-            self.draw_footer(f, Rect::new(0, r, area.width, 1));
+            // A search bar replaces the footer while a query is active.
+            if self.search.is_some() && self.prompt.is_none() {
+                self.draw_search_bar(f, Rect::new(0, r, area.width, 1));
+            } else {
+                self.draw_footer(f, Rect::new(0, r, area.width, 1));
+            }
         }
         if self.drawer && self.narrow() {
             let r = self.drawer_rect();
@@ -2988,6 +3112,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         prefix_pending: false,
         menu: None,
         prompt: None,
+        search: None,
         drag: None,
         select: None,
         selecting: false,
