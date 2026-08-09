@@ -1907,7 +1907,7 @@ impl App {
                 if self.mobile_focus() {
                     if let Some(h) = self.frame.header {
                         if row == h || row == h + 1 {
-                            if col < 6 {
+                            if col < 10 {
                                 self.deck = true;
                                 self.sync_deck_sel();
                                 self.sync().await;
@@ -2256,25 +2256,12 @@ impl App {
         }
     }
 
-    /// Two-row header for the mobile focus view. Left: a BIG 2-row-tall back
-    /// button (easy thumb target). Right: nav row (breadcrumb + state) over an
-    /// info row (loc · pane · elapsed + jump-to-live).
+    /// Clean two-row header for the mobile focus view — calm like the deck, no
+    /// heavy button. Row 1: subtle "‹ back" + pane name + state. Row 2: loc ·
+    /// elapsed (+ jump-to-live). The whole left of both rows is the back tap zone.
     fn draw_mobile_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
-        let bw = 6u16; // back-button width; it spans BOTH header rows
         let w = area.width;
-        let cw = w.saturating_sub(bw); // content width to the right of the button
-
-        // The 2-row back button, filled accent, spanning area.y and area.y+1.
-        let bstyle = Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("  ‹  ", bstyle))).style(bstyle),
-            Rect::new(area.x, area.y, bw, 1),
-        );
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(" back ", bstyle))).style(bstyle),
-            Rect::new(area.x, area.y + 1, bw, 1),
-        );
 
         let info = self.snap.pane(self.focused);
         let act = info.map(|p| p.activity).unwrap_or(Activity::Idle);
@@ -2286,24 +2273,23 @@ impl App {
             Activity::Idle => "idle",
         };
 
-        // Nav row (right of the button): space › tab … state.
-        let sname = self.active_space().map(|s| s.name).unwrap_or_default();
-        let tname = self.active_tab().map(|t| t.name).unwrap_or_default();
-        let crumb = format!(" {sname} › {tname}");
+        // Row 1 (screen bg): ‹ back   name … ● state
+        let name = self.active_tab().map(|t| t.name).unwrap_or_default();
+        let lead = format!(" ‹ back   ");
         let right = format!("{g} {sword} ");
-        let pad = (cw as usize).saturating_sub(crumb.chars().count() + right.chars().count());
+        let pad = (w as usize)
+            .saturating_sub(lead.chars().count() + name.chars().count() + right.chars().count());
+        let bg = Style::default().bg(th.bg);
         let nav = Line::from(vec![
-            Span::styled(crumb, Style::default().fg(th.bar_active_fg).bg(th.bar_bg).add_modifier(Modifier::BOLD)),
-            Span::styled(" ".repeat(pad), Style::default().bg(th.bar_bg)),
-            Span::styled(right, Style::default().fg(scol).bg(th.bar_bg).add_modifier(Modifier::BOLD)),
+            Span::styled(" ‹ back  ", Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {name}"), Style::default().fg(th.bar_active_fg).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(" ".repeat(pad), bg),
+            Span::styled(right, Style::default().fg(scol).bg(th.bg).add_modifier(Modifier::BOLD)),
         ]);
-        f.render_widget(
-            Paragraph::new(nav).style(Style::default().bg(th.bar_bg)),
-            Rect::new(area.x + bw, area.y, cw, 1),
-        );
+        f.render_widget(Paragraph::new(nav).style(bg), Rect::new(area.x, area.y, w, 1));
 
-        // Info row (right of the button): loc · pane · elapsed  … ↓ live.
-        let cwd = info.map(pane_loc).unwrap_or_default();
+        // Row 2 (screen bg, dim): loc · pane · elapsed … ↓ live
+        let loc = info.map(pane_loc).unwrap_or_default();
         let mut leaves = Vec::new();
         if let Some(t) = self.active_tab() {
             t.layout.leaves(&mut leaves);
@@ -2328,19 +2314,16 @@ impl App {
         let scroll = self.views.get(&self.focused).map(|v| v.scroll).unwrap_or(0);
         let live = if scroll > 0 { format!("↑{scroll}  ↓ live ") } else { String::new() };
         let livew = live.chars().count();
-        let leftmax = (cw as usize).saturating_sub(livew + 1);
+        let leftmax = (w as usize).saturating_sub(livew + 1);
         let left: String =
-            format!(" {cwd}{pane_part}{el_part}").chars().take(leftmax).collect();
-        let pad2 = (cw as usize).saturating_sub(left.chars().count() + livew);
+            format!("   {loc}{pane_part}{el_part}").chars().take(leftmax).collect();
+        let pad2 = (w as usize).saturating_sub(left.chars().count() + livew);
         let info_line = Line::from(vec![
-            Span::styled(left, Style::default().fg(th.status_fg).bg(th.surface)),
-            Span::styled(" ".repeat(pad2), Style::default().bg(th.surface)),
-            Span::styled(live, Style::default().fg(th.accent).bg(th.surface).add_modifier(Modifier::BOLD)),
+            Span::styled(left, Style::default().fg(th.status_fg).bg(th.bg)),
+            Span::styled(" ".repeat(pad2), bg),
+            Span::styled(live, Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
         ]);
-        f.render_widget(
-            Paragraph::new(info_line).style(Style::default().bg(th.surface)),
-            Rect::new(area.x + bw, area.y + 1, cw, 1),
-        );
+        f.render_widget(Paragraph::new(info_line).style(bg), Rect::new(area.x, area.y + 1, w, 1));
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -3537,31 +3520,25 @@ impl App {
         self.deck_sel = self.deck_sel.min(ncards + 1);
         let sel = self.deck_sel;
 
-        // ---- Bottom create buttons (2 rows, inset). Focused = filled accent. ----
-        let brow = area.y + area.height - 2;
-        let gap = 2u16;
-        let bw = cw.saturating_sub(gap) / 2;
-        for (i, (bx, lbl, hit)) in
-            [(cx, "+ tab", DeckHit::NewTab), (cx + bw + gap, "+ space", DeckHit::NewSpace)]
-                .into_iter()
-                .enumerate()
+        // ---- Bottom action row: subtle 1-row "+ tab" / "+ space" pills ----
+        let brow = area.y + area.height - 1;
+        let mut bx = cx;
+        for (i, (lbl, hit)) in
+            [(" + tab ", DeckHit::NewTab), (" + space ", DeckHit::NewSpace)].into_iter().enumerate()
         {
             let focused = sel == ncards + i;
-            let bstyle = if focused {
+            let st = if focused {
                 Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().bg(th.surface).fg(th.accent).add_modifier(Modifier::BOLD)
+                Style::default().bg(th.surface).fg(th.accent)
             };
-            let lpad = (bw as usize).saturating_sub(lbl.chars().count()) / 2;
+            let bwid = lbl.chars().count() as u16;
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(format!("{}{}", " ".repeat(lpad), lbl), bstyle))).style(bstyle),
-                Rect::new(bx, brow, bw, 1),
+                Paragraph::new(Line::from(Span::styled(lbl, st))).style(st),
+                Rect::new(bx, brow, bwid, 1),
             );
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(" ".repeat(bw as usize), bstyle))).style(bstyle),
-                Rect::new(bx, brow + 1, bw, 1),
-            );
-            self.deck_hits.push((Rect::new(bx, brow, bw, 2), hit));
+            self.deck_hits.push((Rect::new(bx, brow, bwid, 1), hit));
+            bx += bwid + 2;
         }
 
         // ---- Cards: floating inset surface blocks, smart height ----
