@@ -51,6 +51,8 @@ enum Cmd {
     Kill { target: String },
     /// Print a pane's scrollback and follow its output (by id or title)
     Tail { target: String },
+    /// Stream ruckus lifecycle events as JSON lines (for plugins and agents)
+    Events,
     /// Full state as pretty text or JSON (for scripts and agents)
     Status {
         #[arg(long)]
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Attach { target }) => tui::run(Some(target)).await,
         Some(Cmd::Kill { target }) => kill(target).await,
         Some(Cmd::Tail { target }) => tail(target).await,
+        Some(Cmd::Events) => events_cmd().await,
         Some(Cmd::Status { json }) => status(json).await,
         Some(Cmd::Send { target, no_enter, text }) => send(target, no_enter, text).await,
         Some(Cmd::Split { target, direction, cmd }) => split(target, direction, cmd).await,
@@ -526,6 +529,23 @@ async fn kill(target: String) -> Result<()> {
     let pane = resolve_pane(&snap, &target)?;
     client.request(Request::ClosePane { pane: pane.id }).await?;
     println!("killed pane {} ({})", pane.id, pane.title);
+    Ok(())
+}
+
+/// Stream granular lifecycle events (not the bulky full-state snapshots) as
+/// newline-delimited JSON — the observe half of the plugin/agent API.
+async fn events_cmd() -> Result<()> {
+    use std::io::Write;
+    ensure_daemon().await?;
+    let (_client, mut events) = connect().await?;
+    let mut out = std::io::stdout();
+    while let Some(msg) = events.recv().await {
+        if matches!(msg, ServerMsg::State { .. } | ServerMsg::Output { .. }) {
+            continue;
+        }
+        writeln!(out, "{}", serde_json::to_string(&msg)?)?;
+        out.flush()?;
+    }
     Ok(())
 }
 

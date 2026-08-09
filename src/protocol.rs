@@ -72,6 +72,11 @@ pub enum ServerMsg {
     Output { pane: u64, data: String },
     Exited { pane: u64, code: u32 },
     Activity { pane: u64, activity: Activity },
+    /// Lifecycle events (broadcast to every connection) so external subscribers
+    /// can react without diffing full-state snapshots.
+    PaneOpened { space: u64, tab: u64, pane: u64 },
+    PaneClosed { pane: u64 },
+    Focus { space: u64, tab: u64, pane: u64 },
     /// Pushed to every client when config should be reloaded from disk.
     ConfigChanged,
 }
@@ -410,6 +415,16 @@ mod tests {
         let zero =
             Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![0, 1] };
         assert!(!zero.valid_weights());
+    }
+
+    #[test]
+    fn lifecycle_events_wire_format() {
+        let j = serde_json::to_string(&ServerMsg::PaneOpened { space: 1, tab: 2, pane: 3 }).unwrap();
+        assert_eq!(j, r#"{"type":"pane_opened","space":1,"tab":2,"pane":3}"#);
+        let j = serde_json::to_string(&ServerMsg::PaneClosed { pane: 3 }).unwrap();
+        assert_eq!(j, r#"{"type":"pane_closed","pane":3}"#);
+        let j = serde_json::to_string(&ServerMsg::Focus { space: 1, tab: 2, pane: 3 }).unwrap();
+        assert_eq!(j, r#"{"type":"focus","space":1,"tab":2,"pane":3}"#);
     }
 
     #[test]

@@ -921,6 +921,7 @@ fn broadcast_state(st: &State) {
 fn drop_pane(st: &mut State, pane: u64) {
     if let Some(mut p) = st.panes.remove(&pane) {
         kill_pane_session(&mut p);
+        broadcast(st, ServerMsg::PaneClosed { pane });
     }
     let _ = std::fs::remove_file(scrollback_path(pane));
 }
@@ -1135,6 +1136,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 }
             }
             broadcast_state(&st);
+            broadcast(&st, ServerMsg::Focus { space, tab, pane });
             ServerMsg::Done
         }
         Request::Attach { pane, rows, cols } => {
@@ -1679,6 +1681,7 @@ fn new_space(state: &Arc<Mutex<State>>, name: Option<String>, cwd: Option<String
     });
     st.active_space = space_id;
     broadcast_state(&st);
+    broadcast(&st, ServerMsg::PaneOpened { space: space_id, tab: tab_id, pane });
     Ok(ServerMsg::Created { space: space_id, tab: tab_id, pane })
 }
 
@@ -1700,6 +1703,7 @@ fn new_tab(
     s.tabs.push(Tab { id: tab_id, name: tab_name, active_pane: pane, layout: Node::Leaf { pane } });
     s.active_tab = tab_id;
     broadcast_state(&st);
+    broadcast(&st, ServerMsg::PaneOpened { space, tab: tab_id, pane });
     Ok(ServerMsg::Created { space, tab: tab_id, pane })
 }
 
@@ -1721,6 +1725,7 @@ fn split(
     t.layout.split_at(target, dir, pane);
     t.active_pane = pane;
     broadcast_state(&st);
+    broadcast(&st, ServerMsg::PaneOpened { space: space_id, tab: tab_id, pane });
     Ok(ServerMsg::Created { space: space_id, tab: tab_id, pane })
 }
 

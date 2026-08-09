@@ -81,9 +81,20 @@ CLI equivalents: `ruckus report-activity 4 waiting`, `ruckus report-agent 4 clau
 |---|---|---|
 | `output` | `pane`, `data` (base64) | pane produced output (attached panes only) |
 | `activity` | `pane`, `activity` | activity changed: `working` / `waiting` / `idle` / `done` |
+| `pane_opened` | `space`, `tab`, `pane` | a pane was created (split / new tab / new space) |
+| `pane_closed` | `pane` | a pane was killed/removed |
+| `focus` | `space`, `tab`, `pane` | the active space/tab/pane changed |
 | `exited` | `pane`, `code` | pane's process exited |
 | `state` | `snapshot` | tree changed (created/closed/moved/active/cwd/agent) — every connection |
 | `config_changed` | — | config should be reloaded from disk (after a `reload`) |
+
+Granular events save you diffing snapshots. `ruckus events` streams all of the
+above (except `output`/`state`) as newline-delimited JSON — the observe half of
+the plugin/agent API:
+
+```sh
+ruckus events | while read -r ev; do echo "got: $ev"; done
+```
 
 ## Snapshot shape
 
