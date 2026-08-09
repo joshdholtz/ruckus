@@ -3504,10 +3504,15 @@ impl App {
             let extra = if leaves.len() > 1 { format!(" ·{}", leaves.len()) } else { String::new() };
             let name = format!("{}{extra}", t.name);
 
-            // Line 1 (select_bg): ▎ glyph name  cwd(dim, fills middle)  STATE(right).
+            // Line 1 (select_bg): ▎ glyph name  cwd(dim, fills middle)  STATE Ns(right).
             let lead_w = 1 + 1 + g.chars().count() + 1; // ▎ + space + glyph + space
             let name_w = name.chars().count();
-            let label_s = format!("{label} ");
+            let el = self.elapsed_label(t.active_pane);
+            let label_s = if el.is_empty() {
+                format!("{label} ")
+            } else {
+                format!("{label} {el} ")
+            };
             let label_w = label_s.chars().count();
             let room = (w as usize).saturating_sub(lead_w + name_w + label_w + 4);
             let cwd_disp = if cwd.is_empty() || room < 3 {
