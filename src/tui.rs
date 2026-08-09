@@ -130,6 +130,9 @@ enum DeckHit {
     Tab { space: u64, tab: u64, pane: u64 },
     NewTab,
     NewSpace,
+    Jump,
+    ScrollUp,
+    ScrollDown,
 }
 
 /// What a context menu acts on.
@@ -1563,6 +1566,19 @@ impl App {
                         }
                         Some(DeckHit::NewTab) => self.open_prompt(PromptKind::NewTab),
                         Some(DeckHit::NewSpace) => self.open_prompt(PromptKind::NewSpace),
+                        Some(DeckHit::Jump) => {
+                            if let Some(p) = self.attention().first().map(|p| p.id) {
+                                self.goto_pane(p).await;
+                                self.deck = false;
+                                self.sync().await;
+                            }
+                        }
+                        Some(DeckHit::ScrollUp) => {
+                            self.deck_scroll = self.deck_scroll.saturating_sub(3)
+                        }
+                        Some(DeckHit::ScrollDown) => {
+                            self.deck_scroll = self.deck_scroll.saturating_add(3)
+                        }
                         None => {}
                     }
                 }
@@ -3240,21 +3256,18 @@ impl App {
         self.deck_hits.clear();
         f.render_widget(Paragraph::new("").style(Style::default().bg(th.bg)), area);
 
-        // Header: ☰ ruckus … attention summary.
+        // Header: ☰ ruckus … tappable attention summary (jumps to first waiting).
         let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
         let (sumtxt, sumcol) = if waiting > 0 {
-            (format!("● {waiting} needs you "), th.waiting)
+            (format!(" ● {waiting} needs you "), th.waiting)
         } else {
-            ("🐏 all quiet ".to_string(), th.status_fg)
+            (" 🐏 all quiet ".to_string(), th.status_fg)
         };
         let left = "  ☰  ruckus";
-        let pad = (area.width as usize)
-            .saturating_sub(left.chars().count() + sumtxt.chars().count());
+        let sumw = sumtxt.chars().count() as u16;
+        let pad = (area.width as usize).saturating_sub(left.chars().count() + sumw as usize);
         let header = Line::from(vec![
-            Span::styled(
-                left,
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(left, Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
             Span::raw(" ".repeat(pad)),
             Span::styled(sumtxt, Style::default().fg(sumcol).add_modifier(Modifier::BOLD)),
         ]);
@@ -3262,6 +3275,10 @@ impl App {
             Paragraph::new(header).style(Style::default().bg(th.bar_bg)),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        if waiting > 0 {
+            self.deck_hits
+                .push((Rect::new(area.x + area.width - sumw, area.y, sumw, 1), DeckHit::Jump));
+        }
 
         // Space chips.
         let spaces = self.snap.spaces.clone();
@@ -3286,48 +3303,47 @@ impl App {
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
 
-        // Footer buttons.
-        let fy = area.y + area.height - 1;
-        let nt = " + tab ";
-        let ns = " + space ";
-        let ntw = nt.chars().count() as u16;
-        let nsw = ns.chars().count() as u16;
-        let gap = 2u16;
-        let total = ntw + gap + nsw;
-        let fx = area.x + (area.width.saturating_sub(total)) / 2;
-        let btn = |lbl: &str| {
-            Span::styled(
-                lbl.to_string(),
-                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD),
-            )
+        // Two-row create buttons pinned to the bottom.
+        let brow = area.y + area.height - 2;
+        let bw = (area.width.saturating_sub(3)) / 2;
+        let make_btn = |x: u16, label: &str, hit: DeckHit, hits: &mut Vec<(Rect, DeckHit)>| -> Vec<(Rect, Line<'static>)> {
+            let r = Rect::new(x, brow, bw, 2);
+            hits.push((r, hit));
+            let lpad = (bw as usize).saturating_sub(label.chars().count()) / 2;
+            let text = format!("{}{}", " ".repeat(lpad), label);
+            let style = Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD);
+            vec![
+                (Rect::new(x, brow, bw, 1), Line::from(Span::styled(text, style))),
+                (Rect::new(x, brow + 1, bw, 1), Line::from(Span::styled(" ".repeat(bw as usize), style))),
+            ]
         };
-        let footer = Line::from(vec![
-            Span::raw(" ".repeat(fx.saturating_sub(area.x) as usize)),
-            btn(nt),
-            Span::raw(" ".repeat(gap as usize)),
-            btn(ns),
-        ]);
-        f.render_widget(
-            Paragraph::new(footer).style(Style::default().bg(th.bg)),
-            Rect::new(area.x, fy, area.width, 1),
-        );
-        self.deck_hits.push((Rect::new(fx, fy, ntw, 1), DeckHit::NewTab));
-        self.deck_hits.push((Rect::new(fx + ntw + gap, fy, nsw, 1), DeckHit::NewSpace));
+        for (r, line) in make_btn(area.x + 1, "+ tab", DeckHit::NewTab, &mut self.deck_hits) {
+            f.render_widget(Paragraph::new(line).style(Style::default().bg(th.select_bg)), r);
+        }
+        for (r, line) in make_btn(area.x + 2 + bw, "+ space", DeckHit::NewSpace, &mut self.deck_hits) {
+            f.render_widget(Paragraph::new(line).style(Style::default().bg(th.select_bg)), r);
+        }
 
-        // Cards.
+        // Cards — STABLE tab order (matches the tab strip / sidebar), so nothing
+        // jumps around as states change. Flat background-layer style to match the
+        // pane view: a filled title band + surface content + a gutter between.
         let Some(sp) = self.active_space() else { return };
-        let mut tabs = sp.tabs.clone();
-        tabs.sort_by_key(|t| std::cmp::Reverse(tab_activity(&self.snap, t).urgency()));
-        let card_h = 4u16; // 3 drawn rows + 1 gap
-        let list_top = area.y + 3;
-        let list_bottom = fy.saturating_sub(1);
-        let mut y = list_top;
         let sp_id = sp.id;
-        for t in tabs.iter().skip(self.deck_scroll) {
-            if y + card_h - 1 > list_bottom {
+        let tabs = sp.tabs.clone();
+        let card_stride = 3u16; // 2 drawn rows + 1 gutter
+        let list_top = area.y + 2;
+        let hint_row = brow.saturating_sub(1);
+        let list_bottom = hint_row.saturating_sub(1); // leave a row for the scroll hint
+        let capacity = ((list_bottom + 1).saturating_sub(list_top) / card_stride).max(1) as usize;
+        let max_scroll = tabs.len().saturating_sub(capacity);
+        self.deck_scroll = self.deck_scroll.min(max_scroll);
+        let start = self.deck_scroll;
+
+        let mut y = list_top;
+        for t in tabs.iter().skip(start) {
+            if y + 1 > list_bottom {
                 break;
             }
-            let rect = Rect::new(area.x + 1, y, area.width.saturating_sub(2), card_h - 1);
             let act = tab_activity(&self.snap, t);
             let (g, color) = self.state_glyph(act);
             let (label, lcol) = match act {
@@ -3341,34 +3357,68 @@ impl App {
             let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
             let mut leaves = Vec::new();
             t.layout.leaves(&mut leaves);
-            let npanes = leaves.len();
-            let name = if npanes > 1 {
-                format!("{}  ·{npanes}", t.name)
-            } else {
-                t.name.clone()
-            };
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(color))
-                .style(Style::default().bg(th.surface))
-                .title(Line::from(vec![
-                    Span::styled(format!(" {g} "), Style::default().fg(color)),
-                    Span::styled(name, Style::default().fg(th.bar_active_fg).add_modifier(Modifier::BOLD)),
-                ]))
-                .title(Line::from(Span::styled(format!(" {label} "), Style::default().fg(lcol).add_modifier(Modifier::BOLD))).right_aligned());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            let iw = inner.width as usize;
-            let clip = |s: String| -> String { s.chars().take(iw.saturating_sub(1)).collect() };
-            let lines = vec![Line::from(vec![
-                Span::styled(clip(format!("{cwd}   › {preview}")), Style::default().fg(th.status_fg)),
-            ])];
-            f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.surface)), inner);
+            let extra = if leaves.len() > 1 { format!("  ·{}", leaves.len()) } else { String::new() };
+
+            let w = area.width.saturating_sub(2);
+            let title_rect = Rect::new(area.x + 1, y, w, 1);
+            let body_rect = Rect::new(area.x + 1, y + 1, w, 1);
+            // Title band (select_bg) with a state-colored left bar + glyph + name, state label right.
+            let name = format!("{}{extra}", t.name);
+            let head_used = 2 + g.chars().count() + 1 + name.chars().count();
+            let head_pad =
+                (w as usize).saturating_sub(head_used + label.chars().count() + 1);
+            let title = Line::from(vec![
+                Span::styled("▎", Style::default().fg(color).bg(th.select_bg)),
+                Span::styled(format!(" {g} "), Style::default().fg(color).bg(th.select_bg)),
+                Span::styled(
+                    name,
+                    Style::default().fg(th.bar_active_fg).bg(th.select_bg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(head_pad), Style::default().bg(th.select_bg)),
+                Span::styled(
+                    format!("{label} "),
+                    Style::default().fg(lcol).bg(th.select_bg).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(title).style(Style::default().bg(th.select_bg)), title_rect);
+            // Body (surface): cwd › preview.
+            let iw = w as usize;
+            let body_txt: String = format!("  {cwd}  › {preview}").chars().take(iw).collect();
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(body_txt, Style::default().fg(th.status_fg))))
+                    .style(Style::default().bg(th.surface)),
+                body_rect,
+            );
             self.deck_hits.push((
-                rect,
+                Rect::new(area.x + 1, y, w, 2),
                 DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane },
             ));
-            y += card_h;
+            y += card_stride;
+        }
+
+        // Scroll hint (tappable): ▲ above / ▼ N more below.
+        let shown = tabs.len().saturating_sub(start).min(capacity);
+        let below = tabs.len().saturating_sub(start + shown);
+        let mut hint: Vec<Span> = Vec::new();
+        if start > 0 {
+            self.deck_hits.push((Rect::new(area.x, hint_row, area.width / 2, 1), DeckHit::ScrollUp));
+            hint.push(Span::styled("  ▲ more", Style::default().fg(th.accent)));
+        }
+        if below > 0 {
+            self.deck_hits.push((
+                Rect::new(area.x + area.width / 2, hint_row, area.width / 2, 1),
+                DeckHit::ScrollDown,
+            ));
+            let pad = (area.width as usize)
+                .saturating_sub(hint.iter().map(|s| s.content.chars().count()).sum::<usize>() + format!("▼ {below} more  ").chars().count());
+            hint.push(Span::raw(" ".repeat(pad)));
+            hint.push(Span::styled(format!("▼ {below} more  "), Style::default().fg(th.accent)));
+        }
+        if !hint.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(hint)).style(Style::default().bg(th.bg)),
+                Rect::new(area.x, hint_row, area.width, 1),
+            );
         }
     }
 
