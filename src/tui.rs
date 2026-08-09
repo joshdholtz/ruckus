@@ -477,6 +477,13 @@ impl App {
         self.deck && self.narrow()
     }
 
+    /// Viewing a single pane on mobile (entered from the deck): strip the tab
+    /// strip / footer / pane-title chrome so the pane is near-fullscreen. Only
+    /// when the deck is the home to return to (☰ goes back).
+    fn mobile_focus(&self) -> bool {
+        self.cfg.ui.deck && self.narrow() && !self.deck
+    }
+
     fn sidebar_shown(&self) -> bool {
         self.sidebar && !self.narrow()
     }
@@ -496,6 +503,9 @@ impl App {
     fn compute_frame(&self) -> FrameLayout {
         let (w, h) = self.size;
         let ui = &self.cfg.ui;
+        // On mobile, a pane entered from the deck is near-fullscreen: no tab
+        // strip, no footer status bar (the deck is the nav; ☰ goes home).
+        let minimal = self.mobile_focus();
         let mut top: u16 = ui.top_margin.min(h.saturating_sub(2));
         let mut bot: u16 = h;
         let mut header = None;
@@ -505,11 +515,11 @@ impl App {
             header = Some(top);
             top += 1;
         }
-        if ui.footer == BarPos::Top {
+        if ui.footer == BarPos::Top && !minimal {
             footer = Some(top);
             top += 1;
         }
-        if ui.footer == BarPos::Bottom && bot > top {
+        if ui.footer == BarPos::Bottom && bot > top && !minimal {
             bot -= 1;
             footer = Some(bot);
         }
@@ -540,7 +550,7 @@ impl App {
             (None, 0, w)
         };
         let main = Rect::new(main_x, body.y, main_w, body.height);
-        let (tabs, panes) = if ui.tab_strip && main.height > 1 {
+        let (tabs, panes) = if ui.tab_strip && main.height > 1 && !minimal {
             // Reserve one extra row under the tab strip for a divider line.
             let border = if ui.tab_border && main.height > 2 { 1 } else { 0 };
             (
@@ -2127,14 +2137,23 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
-        let logo_text = if self.narrow() { " ☰ ruckus " } else { "  ruckus  " };
+        // In mobile focus the ☰ is a back button to the deck.
+        let logo_text = if self.mobile_focus() {
+            " ‹ back "
+        } else if self.narrow() {
+            " ☰ ruckus "
+        } else {
+            "  ruckus  "
+        };
         let logo = Span::styled(
             logo_text,
             Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
         );
-        // On narrow screens the tab strip already shows the active tab, so the
-        // header only names the space — no redundant "space › tab" breadcrumb.
-        let crumb = if self.narrow() {
+        // Mobile focus names the pane; narrow names the space (the tab strip shows
+        // tabs); wide shows the full space › tab breadcrumb.
+        let crumb = if self.mobile_focus() {
+            self.active_tab().map(|t| format!("  {}", t.name)).unwrap_or_default()
+        } else if self.narrow() {
             self.active_space().map(|s| format!("  {}", s.name)).unwrap_or_default()
         } else {
             match (self.active_space(), self.active_tab()) {
@@ -2878,7 +2897,8 @@ impl App {
         let th = self.cfg.theme.clone();
         let rects = self.pane_rects.clone();
         let many = rects.len() > 1;
-        let titles = self.cfg.ui.pane_titles;
+        // No per-pane title band in the mobile focus view — the header names the pane.
+        let titles = self.cfg.ui.pane_titles && !self.mobile_focus();
         let pad = self.cfg.ui.pane_padding;
         for (pane, rect) in &rects {
             if rect.width < 3 || rect.height < 2 {
