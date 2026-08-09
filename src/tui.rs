@@ -3291,28 +3291,29 @@ impl App {
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
-        // Mobile focus: a prefix-helper style command bar — "key label" pairs,
-        // consistent every time, tappable. Keys mirror the tmux prefix (⌃b then …).
+        // Mobile focus: a tappable command bar. Icons (not fake key letters, which
+        // collided with the real tmux prefix) so nothing you press misfires.
         if self.mobile_focus() {
             let th = self.cfg.theme.clone();
-            let cmds: [(&str, &str, ChipAction); 5] = [
-                ("d", "back", ChipAction::Back),
-                ("n", "next", ChipAction::Next),
-                ("z", "zoom", ChipAction::Zoom),
-                ("/", "find", ChipAction::Search),
-                ("x", "close", ChipAction::Close),
+            let cmds: [(&str, ChipAction); 5] = [
+                ("‹ back", ChipAction::Back),
+                ("next ›", ChipAction::Next),
+                ("⤢ zoom", ChipAction::Zoom),
+                ("⌕ find", ChipAction::Search),
+                ("✕ close", ChipAction::Close),
             ];
             let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(th.bar_bg))];
             let mut hits = Vec::new();
             let mut x = area.x + 1;
-            for (key, label, act) in cmds {
-                let text = format!("{key} {label}");
-                let width = text.chars().count() as u16;
+            for (label, act) in cmds {
+                let width = label.chars().count() as u16;
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
-                let kbg = if hovered { th.select_bg } else { th.bar_bg };
-                spans.push(Span::styled(key.to_string(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
-                spans.push(Span::styled(format!(" {label}"), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
+                let style = Style::default()
+                    .fg(if hovered { th.bg } else { th.accent })
+                    .bg(if hovered { th.accent } else { th.bar_bg })
+                    .add_modifier(Modifier::BOLD);
+                spans.push(Span::styled(label.to_string(), style));
                 spans.push(Span::styled("   ", Style::default().bg(th.bar_bg)));
                 hits.push((act, area.y, range));
                 x += width + 3;
