@@ -114,12 +114,25 @@ enum Target {
     Pane(u64),
 }
 
+/// A row in the command palette: either an action to run, or a space/tab to
+/// jump straight into.
+#[derive(Clone)]
+enum PaletteItem {
+    Action(Action, &'static str),
+    Jump {
+        space: u64,
+        tab: u64,
+        pane: u64,
+        label: String,
+        act: Activity,
+        is_space: bool,
+    },
+}
+
 
 /// A clickable affordance rendered in the sidebar.
 #[derive(Clone, Copy)]
 enum SidebarBtn {
-    NewSpace,
-    NewTab,
     CloseSpace(u64),
 }
 
@@ -273,8 +286,6 @@ struct App {
     was_narrow: bool,
     drawer: bool,
     help: bool,
-    /// Shown once on first ever launch; dismissed by any key/click.
-    welcome: bool,
     prefix_pending: bool,
     menu: Option<Menu>,
     prompt: Option<Prompt>,
@@ -382,7 +393,10 @@ fn copy_to_clipboard(text: &str) {
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
-        if let Some(si) = child.stdin.as_mut() {
+        // Take the pipe so it drops (closing stdin) once we've written — pbcopy
+        // reads until EOF and only commits the clipboard then. Leaving it open
+        // (the old `as_mut`) made pbcopy block on read forever and never copy.
+        if let Some(mut si) = child.stdin.take() {
             let _ = si.write_all(text.as_bytes());
         }
         let _ = child.wait();
@@ -401,6 +415,16 @@ fn tab_activity(snap: &Snapshot, tab: &TabInfo) -> Activity {
 
 fn space_activity(snap: &Snapshot, space: &SpaceInfo) -> Activity {
     agg_activity(space.tabs.iter().map(|t| tab_activity(snap, t)))
+}
+
+/// Lowercase one-word label for an activity state (headers, info bars).
+fn activity_word(a: Activity) -> &'static str {
+    match a {
+        Activity::Waiting => "waiting",
+        Activity::Working => "working",
+        Activity::Done => "done",
+        Activity::Idle => "idle",
+    }
 }
 
 /// Expand a row template like "{icon} {title}" into styled spans.
@@ -554,15 +578,19 @@ impl App {
         self.sidebar && !self.narrow()
     }
 
-    /// Focused pane wants triage chips: waiting on you, or exited.
+    /// Focused pane wants a touch action/triage bar. This is a phone affordance
+    /// only — on desktop you drive a waiting/exited pane straight from the
+    /// keyboard (type into it, Enter restarts a dead pane), so no bottom bar.
     fn action_bar_kind(&self) -> Option<&'static str> {
+        if !self.narrow() {
+            return None;
+        }
         let p = self.snap.pane(self.focused)?;
         match p.status {
             PaneStatus::Exited { .. } => Some("exited"),
             PaneStatus::Running if p.activity == Activity::Waiting => Some("waiting"),
             // Narrow idle/working still gets a slim nav strip for phone thumbs.
-            PaneStatus::Running if self.narrow() => Some("narrow"),
-            _ => None,
+            PaneStatus::Running => Some("narrow"),
         }
     }
 
@@ -1186,28 +1214,77 @@ impl App {
         }
     }
 
-    fn dismiss_welcome(&mut self) {
-        self.welcome = false;
-        let _ = std::fs::write(crate::protocol::ruckus_dir().join(".welcomed"), b"1");
+    /// Everything the palette can match: every space, every tab (as jump
+    /// targets), then the actions. Each paired with the lowercase string to
+    /// fuzzy-match against. Insertion order also sets tie-break priority —
+    /// jumps rank above actions when scores are equal (e.g. an empty query).
+    fn palette_candidates(&self) -> Vec<(String, PaletteItem)> {
+        let mut v: Vec<(String, PaletteItem)> = Vec::new();
+        for s in &self.snap.spaces {
+            let (tab, pane) = s
+                .tabs
+                .iter()
+                .find(|t| t.id == s.active_tab)
+                .or_else(|| s.tabs.first())
+                .map(|t| (t.id, t.active_pane))
+                .unwrap_or((s.active_tab, 0));
+            v.push((
+                format!("space {}", s.name).to_lowercase(),
+                PaletteItem::Jump {
+                    space: s.id,
+                    tab,
+                    pane,
+                    label: s.name.clone(),
+                    act: space_activity(&self.snap, s),
+                    is_space: true,
+                },
+            ));
+            for t in &s.tabs {
+                v.push((
+                    format!("{} {}", s.name, t.name).to_lowercase(),
+                    PaletteItem::Jump {
+                        space: s.id,
+                        tab: t.id,
+                        pane: t.active_pane,
+                        label: format!("{} › {}", s.name, t.name),
+                        act: tab_activity(&self.snap, t),
+                        is_space: false,
+                    },
+                ));
+            }
+        }
+        for (a, d) in PALETTE_ITEMS {
+            v.push((d.to_lowercase(), PaletteItem::Action(*a, d)));
+        }
+        v
     }
 
     /// Palette rows matching the current query, best match first.
-    fn palette_filtered(&self) -> Vec<(Action, &'static str)> {
+    fn palette_filtered(&self) -> Vec<PaletteItem> {
         let q = self.palette.as_ref().map(|(q, _)| q.to_lowercase()).unwrap_or_default();
-        let mut scored: Vec<(i32, (Action, &'static str))> = PALETTE_ITEMS
-            .iter()
-            .filter_map(|(a, d)| fuzzy_score(&d.to_lowercase(), &q).map(|s| (s, (*a, *d))))
+        let mut scored: Vec<(i32, usize, PaletteItem)> = self
+            .palette_candidates()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, (search, item))| fuzzy_score(&search, &q).map(|s| (s, i, item)))
             .collect();
-        scored.sort_by(|x, y| y.0.cmp(&x.0));
-        scored.into_iter().map(|(_, it)| it).collect()
+        // Higher score first; original order breaks ties (jumps before actions).
+        scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        scored.into_iter().map(|(_, _, it)| it).collect()
     }
 
     async fn palette_run(&mut self) {
         let items = self.palette_filtered();
         let sel = self.palette.as_ref().map(|(_, s)| *s).unwrap_or(0);
         self.palette = None;
-        if let Some((action, _)) = items.get(sel).copied() {
-            self.do_action(action).await;
+        match items.into_iter().nth(sel) {
+            Some(PaletteItem::Action(action, _)) => self.do_action(action).await,
+            Some(PaletteItem::Jump { space, tab, pane, .. }) => {
+                self.set_active(space, tab, pane).await;
+                self.deck = false; // if we jumped from the deck, enter the pane
+                self.sync().await;
+            }
+            None => {}
         }
     }
 
@@ -1328,12 +1405,6 @@ impl App {
         }
         let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
 
-        // First-run welcome: any key dismisses it and it never shows again.
-        if self.welcome {
-            self.dismiss_welcome();
-            return;
-        }
-
         // Deck view: keyboard selection cursor (vim + arrows) plus action bindings.
         if self.deck_active() && self.palette.is_none() && self.prompt.is_none() {
             let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
@@ -1419,7 +1490,10 @@ impl App {
 
         // Search-nav: while a query is active, n/N cycle matches and Esc clears.
         // Only bare (or shift-only) keys, so modified bindings still reach the pane.
+        // Skip it while the prefix is armed, or `prefix n`/`N` would run search-nav
+        // instead of NextTab and leave the prefix stuck (the reset lives below).
         if self.search.is_some()
+            && !self.prefix_pending
             && (ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT)
         {
             match ev.code {
@@ -1641,10 +1715,6 @@ impl App {
                 MouseEventKind::ScrollDown => self.deck_scroll = self.deck_scroll.saturating_add(1),
                 MouseEventKind::ScrollUp => self.deck_scroll = self.deck_scroll.saturating_sub(1),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if self.welcome {
-                        self.dismiss_welcome();
-                        return;
-                    }
                     let hit = self
                         .deck_hits
                         .iter()
@@ -1659,6 +1729,7 @@ impl App {
                                     .map(|t| (s.id, t.id, t.active_pane))
                             });
                             if let Some((s, t, p)) = t {
+                                self.deck_sel = 0;
                                 self.deck_scroll = 0;
                                 self.set_active(s, t, p).await;
                             }
@@ -1858,10 +1929,6 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.welcome {
-                    self.dismiss_welcome();
-                    return;
-                }
                 // Any fresh left-press clears a prior selection.
                 self.select = None;
                 self.selecting = false;
@@ -1966,7 +2033,7 @@ impl App {
                 }
                 if let Some(sb) = self.frame.sidebar {
                     if col >= sb.x && col < sb.x + sb.width && row >= sb.y {
-                        // Visible buttons (+ new space, × close space) win over row-select.
+                        // Visible buttons (× close space) win over row-select.
                         if let Some(btn) = self
                             .sidebar_buttons
                             .iter()
@@ -1974,8 +2041,6 @@ impl App {
                             .map(|(_, _, b)| *b)
                         {
                             match btn {
-                                SidebarBtn::NewSpace => self.open_prompt(PromptKind::NewSpace),
-                                SidebarBtn::NewTab => self.open_prompt(PromptKind::NewTab),
                                 SidebarBtn::CloseSpace(id) => {
                                     if let Err(e) =
                                         self.client.request(Request::CloseSpace { space: id }).await
@@ -2064,7 +2129,19 @@ impl App {
         match msg {
             ServerMsg::State { snapshot } => {
                 self.drag = None;
+                // If a background update shrinks the tab list, keep the deck cursor
+                // on a real card. Without this a cursor that was on the last card
+                // slides onto the +tab/+space slot and Enter opens a dialog. Leave
+                // it alone if the user had deliberately selected a button.
+                let was_on_button = self
+                    .active_space()
+                    .map(|s| self.deck_sel >= s.tabs.len())
+                    .unwrap_or(false);
                 self.snap = snapshot;
+                if self.deck && !was_on_button {
+                    let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
+                    self.deck_sel = self.deck_sel.min(ncards.saturating_sub(1));
+                }
                 self.sync().await;
             }
             ServerMsg::Output { pane, data } => {
@@ -2271,12 +2348,7 @@ impl App {
         let info = self.snap.pane(self.focused);
         let act = info.map(|p| p.activity).unwrap_or(Activity::Idle);
         let (g, scol) = self.state_glyph(act);
-        let sword = match act {
-            Activity::Waiting => "waiting",
-            Activity::Working => "working",
-            Activity::Done => "done",
-            Activity::Idle => "idle",
-        };
+        let sword = activity_word(act);
         let name = self.active_tab().map(|t| t.name).unwrap_or_default();
         let loc = info.map(pane_loc).unwrap_or_default();
         let el = self.elapsed_label(self.focused);
@@ -2304,23 +2376,16 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
-        // In mobile focus the ☰ is a back button to the deck.
-        let logo_text = if self.mobile_focus() {
-            " ‹ back "
-        } else if self.narrow() {
-            " ☰ ruckus "
-        } else {
-            "  ruckus  "
-        };
+        // draw_mobile_header owns the mobile-focus case; here narrow shows ☰, wide
+        // shows the plain logo.
+        let logo_text = if self.narrow() { " ☰ ruckus " } else { "  ruckus  " };
         let logo = Span::styled(
             logo_text,
             Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
         );
-        // Mobile focus names the pane; narrow names the space (the tab strip shows
-        // tabs); wide shows the full space › tab breadcrumb.
-        let crumb = if self.mobile_focus() {
-            self.active_tab().map(|t| format!("  {}", t.name)).unwrap_or_default()
-        } else if self.narrow() {
+        // Narrow names the space (the tab strip shows tabs); wide shows the full
+        // space › tab breadcrumb.
+        let crumb = if self.narrow() {
             self.active_space().map(|s| format!("  {}", s.name)).unwrap_or_default()
         } else {
             match (self.active_space(), self.active_tab()) {
@@ -2341,14 +2406,14 @@ impl App {
             .count();
         let mut right: Vec<Span> = Vec::new();
         let mut right_len = 0usize;
-        for (n, label, activity) in [
-            (waiting, "waiting", Activity::Waiting),
-            (working, "working", Activity::Working),
-            (done, "done", Activity::Done),
+        for (n, activity) in [
+            (waiting, Activity::Waiting),
+            (working, Activity::Working),
+            (done, Activity::Done),
         ] {
             if n > 0 {
                 let (g, color) = self.state_glyph(activity);
-                let text = format!("{n} {label}   ");
+                let text = format!("{n} {}   ", activity_word(activity));
                 right_len += g.chars().count() + 1 + text.chars().count();
                 right.push(Span::styled(format!("{g} "), Style::default().fg(color)));
                 right.push(Span::styled(text, Style::default().fg(th.bar_active_fg)));
@@ -2557,27 +2622,6 @@ impl App {
                         )),
                         None::<Target>
                     );
-                    // Persistent, discoverable "new tab" + "new space" buttons.
-                    {
-                        let hov = hover_row == Some(y);
-                        let style = if hov {
-                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(th.accent)
-                        };
-                        buttons.push((y, inner.x + 1..inner.x + 11, SidebarBtn::NewTab));
-                        push!(Line::from(Span::styled("  + new tab", style)), None::<Target>);
-                    }
-                    {
-                        let hov = hover_row == Some(y);
-                        let style = if hov {
-                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(th.status_fg)
-                        };
-                        buttons.push((y, inner.x + 1..inner.x + 13, SidebarBtn::NewSpace));
-                        push!(Line::from(Span::styled("  + new space", style)), None::<Target>);
-                    }
                     let spaces = self.snap.spaces.clone();
                     let space_tpl = self.cfg.ui.space_row.clone();
                     let tab_tpl = self.cfg.ui.tab_row.clone();
@@ -3242,7 +3286,7 @@ impl App {
             .border_style(Style::default().fg(th.accent))
             .style(Style::default().bg(th.sidebar_bg))
             .title(Line::from(Span::styled(
-                " commands ",
+                " go to / run ",
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             )));
         let inner = block.inner(r);
@@ -3257,29 +3301,42 @@ impl App {
         ]));
         lines.push(Line::raw(""));
         let iw = inner.width as usize;
-        for (i, (action, desc)) in items.iter().enumerate().take(10) {
+        for (i, item) in items.iter().enumerate().take(10) {
             let selected = i == *sel;
-            let key = self.cfg.hint(*action);
             let base = if selected {
                 Style::default().bg(th.select_bg)
             } else {
                 Style::default()
             };
             let marker = if selected { "❯ " } else { "  " };
-            let left = format!("{marker}{desc}");
-            let pad = iw.saturating_sub(left.chars().count() + key.chars().count() + 1);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    marker.to_string(),
-                    base.fg(th.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    desc.to_string(),
-                    base.fg(if selected { th.bar_active_fg } else { th.bar_fg }),
-                ),
-                Span::styled(" ".repeat(pad), base),
-                Span::styled(format!("{key} "), base.fg(th.status_fg)),
-            ]));
+            let name_fg = if selected { th.bar_active_fg } else { th.bar_fg };
+            let mut spans = vec![Span::styled(
+                marker.to_string(),
+                base.fg(th.accent).add_modifier(Modifier::BOLD),
+            )];
+            match item {
+                PaletteItem::Action(action, desc) => {
+                    let key = self.cfg.hint(*action);
+                    let pad = iw.saturating_sub(2 + desc.chars().count() + key.chars().count() + 1);
+                    spans.push(Span::styled(desc.to_string(), base.fg(name_fg)));
+                    spans.push(Span::styled(" ".repeat(pad), base));
+                    spans.push(Span::styled(format!("{key} "), base.fg(th.status_fg)));
+                }
+                PaletteItem::Jump { label, act, is_space, .. } => {
+                    let (g, gcol) = self.state_glyph(*act);
+                    let tag = if *is_space { "space" } else { "jump" };
+                    let used = 2 + g.chars().count() + 1 + label.chars().count() + tag.chars().count() + 1;
+                    let pad = iw.saturating_sub(used);
+                    spans.push(Span::styled(format!("{g} "), base.fg(gcol)));
+                    spans.push(Span::styled(
+                        label.clone(),
+                        base.fg(name_fg).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(" ".repeat(pad), base));
+                    spans.push(Span::styled(format!("{tag} "), base.fg(th.status_fg)));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         if items.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -3303,19 +3360,23 @@ impl App {
                 ("find", ChipAction::Search, Action::Search),
                 ("close", ChipAction::Close, Action::ClosePane),
             ];
-            let tmux = self.cfg.keymap == crate::config::Keymap::Tmux && self.cfg.prefix.is_some();
+            // Whenever a prefix exists (tmux or both), render which-key style: one
+            // leading "⌃b" indicator, then the bare prefix keys. This matches the
+            // help overlay's hint() and never shows "⌥d" for back (which collides
+            // with prefix+d = detach). Only pure-alt mode shows the ⌥ chords.
+            let prefixed = self.cfg.prefix.is_some();
             let bar_bg = Style::default().bg(th.bar_bg);
             let mut spans: Vec<Span> = vec![Span::styled(" ", bar_bg)];
             let mut hits = Vec::new();
             let mut x = area.x + 1;
-            if tmux {
+            if prefixed {
                 let pfx = self.cfg.prefix.map(|b| b.compact()).unwrap_or_default();
                 let t = format!("{pfx} ");
                 x += t.chars().count() as u16;
                 spans.push(Span::styled(t, Style::default().fg(th.status_fg).bg(th.bar_bg)));
             }
             for (label, chip, action) in cmds {
-                let key = if tmux {
+                let key = if prefixed {
                     self.cfg.prefix_keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
                 } else {
                     self.cfg.keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
@@ -3425,67 +3486,6 @@ impl App {
         );
     }
 
-    fn draw_welcome(&self, f: &mut Frame) {
-        if !self.welcome {
-            return;
-        }
-        let th = &self.cfg.theme;
-        let key = |a: Action| self.cfg.hint(a);
-        let body: Vec<(String, String)> = vec![
-            (String::new(), String::new()),
-            ("your agents keep running in the".into(), String::new()),
-            ("background. this window is just".into(), String::new()),
-            ("how you watch and step in.".into(), String::new()),
-            (String::new(), String::new()),
-            (key(Action::JumpWaiting), "jump to what needs you".into()),
-            (key(Action::Palette), "find any command".into()),
-            (key(Action::ShowHelp), "all keys".into()),
-            (key(Action::ToggleSidebar), "sidebar (☰ on phones)".into()),
-            (key(Action::Quit), "quit — agents keep running".into()),
-            (String::new(), String::new()),
-            ("press any key to start".into(), String::new()),
-        ];
-        let w: u16 = 42.min(self.size.0.saturating_sub(4));
-        let h = body.len() as u16 + 4;
-        let x = self.size.0.saturating_sub(w) / 2;
-        let y = self.size.1.saturating_sub(h) / 2;
-        let r = Rect::new(x, y, w, h.min(self.size.1));
-        f.render_widget(Clear, r);
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(th.accent))
-            .style(Style::default().bg(th.sidebar_bg));
-        let inner = block.inner(r);
-        f.render_widget(block, r);
-
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            "  🐏  ruckus",
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        ))];
-        let iw = inner.width as usize;
-        for (a, b) in &body {
-            if b.is_empty() {
-                // centered prose / heading line
-                let calm = a == "press any key to start";
-                lines.push(Line::from(Span::styled(
-                    format!("  {a}"),
-                    Style::default().fg(if calm { th.status_fg } else { th.bar_active_fg }),
-                )));
-            } else {
-                let pad = iw.saturating_sub(2 + a.chars().count() + b.chars().count() + 2);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {a}"),
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" ".repeat(pad + 2), Style::default()),
-                    Span::styled(b.clone(), Style::default().fg(th.bar_fg)),
-                ]));
-            }
-        }
-        f.render_widget(Paragraph::new(lines), inner);
-    }
-
     /// The touch-first mobile deck: big state-colored cards for each tab in the
     /// current space, attention-sorted. Tap a card to enter it fullscreen.
     fn draw_deck(&mut self, f: &mut Frame) {
@@ -3574,7 +3574,12 @@ impl App {
         let hint_row = brow.saturating_sub(1);
         let list_bottom = hint_row.saturating_sub(1);
         let region = (list_bottom + 1).saturating_sub(list_top);
-        let capacity_loose = (region / 2).max(1) as usize;
+        // Worst case a card is 2 rows + a 1-row gap = 3 cells (WAITING/DONE); using
+        // /2 overestimated capacity so the max-scroll clamp pinned tail cards
+        // off-screen and the selection cursor could sit below the fold. /3 is the
+        // conservative bound: it may scroll a hair early for 1-row cards but never
+        // hides the selected card or strands one.
+        let capacity_loose = (region / 3).max(1) as usize;
         // Keep the selected card in view (auto-scroll).
         if sel < ncards {
             if sel < self.deck_scroll {
@@ -3940,7 +3945,6 @@ impl App {
             self.draw_menu(f);
             self.draw_palette(f);
             self.draw_prompt(f);
-            self.draw_welcome(f);
             self.draw_toast(f);
             return;
         }
@@ -4004,7 +4008,6 @@ impl App {
         }
         self.draw_menu(f);
         self.draw_help(f);
-        self.draw_welcome(f);
         self.draw_palette(f);
         self.draw_prompt(f);
         self.draw_prefix_indicator(f);
@@ -4029,8 +4032,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let sidebar = cfg.ui.sidebar_start_visible;
     let deck_default = cfg.ui.deck;
-    // Welcome overlay removed by request.
-    let welcome = false;
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
     let mut app = App {
@@ -4052,7 +4053,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         was_narrow: false,
         drawer: false,
         help: false,
-        welcome,
         prefix_pending: false,
         menu: None,
         prompt: None,

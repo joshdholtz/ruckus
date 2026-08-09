@@ -479,8 +479,6 @@ pub enum Keymap {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Chosen base keymap preset (alt / tmux / both).
-    pub keymap: Keymap,
     pub keys: HashMap<Action, Vec<Binding>>,
     /// tmux-style prefix key (e.g. ctrl-b). When set, pressing it arms a pending
     /// state and the next key is looked up in `prefix_keys`. None = disabled.
@@ -832,24 +830,15 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keymap, keys, prefix, prefix_keys, theme, ui, glyphs, notify }
+        Config { keys, prefix, prefix_keys, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
         let ev = normalize_key(ev, self.ui.mac_option_fallback);
-        if let Some(a) = self
-            .keys
+        self.keys
             .iter()
             .find(|(_, bs)| bs.iter().any(|b| b.matches(&ev)))
             .map(|(a, _)| *a)
-        {
-            return Some(a);
-        }
-        // Escape hatch: ctrl+q always quits unless the user bound it to something else.
-        if ev.modifiers.contains(KeyModifiers::CONTROL) && ev.code == KeyCode::Char('q') {
-            return Some(Action::Quit);
-        }
-        None
     }
 
     /// Does this key event match the tmux prefix?
@@ -888,18 +877,6 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// The real key to reach `action` under the active keymap, compact form:
-    /// tmux → "⌃b z"; alt/both → "⌥z". None if the action has no key in this map.
-    pub fn keyhint(&self, action: Action) -> Option<String> {
-        match self.keymap {
-            Keymap::Tmux => {
-                let p = self.prefix?;
-                let k = self.prefix_keys.get(&action).and_then(|b| b.first())?;
-                Some(format!("{} {}", p.compact(), k.compact()))
-            }
-            _ => self.keys.get(&action).and_then(|b| b.first()).map(|b| b.compact()),
-        }
-    }
 }
 
 const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
@@ -1063,10 +1040,17 @@ system = false
     }
 
     #[test]
-    fn ctrl_q_escape_hatch_survives_user_config() {
+    fn quit_is_a_plain_overridable_binding() {
+        // Default: both alt-q and ctrl-q quit (two bindings on one command).
+        let cfg = Config::from_toml_str("");
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let alt_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+        assert_eq!(cfg.action_for(&ctrl_q), Some(Action::Quit));
+        assert_eq!(cfg.action_for(&alt_q), Some(Action::Quit));
+        // Override it and ruckus honors you — no hardwired ctrl-q behind your back.
         let cfg = Config::from_toml_str("[keys]\nquit = \"alt-q\"\n");
-        let ev = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
-        assert_eq!(cfg.action_for(&ev), Some(Action::Quit));
+        assert_eq!(cfg.action_for(&ctrl_q), None);
+        assert_eq!(cfg.action_for(&alt_q), Some(Action::Quit));
     }
 
     #[test]

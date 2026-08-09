@@ -31,8 +31,8 @@ struct Pty {
 fn reap(pid: i32) -> u32 {
     let mut status = 0i32;
     let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if r > 0 && unsafe { libc::WIFEXITED(status) } {
-        unsafe { libc::WEXITSTATUS(status) as u32 }
+    if r > 0 && libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status) as u32
     } else {
         1
     }
