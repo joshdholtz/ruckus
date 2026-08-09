@@ -124,6 +124,27 @@ impl Binding {
         });
         parts.join("+")
     }
+
+    /// Compact glyph form for tight UI: ⌃⌥⇧ + key, e.g. "⌥z", "⌃b".
+    pub fn compact(&self) -> String {
+        let mut s = String::new();
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            s.push('⌃');
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            s.push('⌥');
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            s.push('⇧');
+        }
+        s.push_str(&match self.code {
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::PageUp => "pgup".to_string(),
+            KeyCode::PageDown => "pgdn".to_string(),
+            other => format!("{other:?}").to_lowercase(),
+        });
+        s
+    }
 }
 
 pub fn parse_binding(spec: &str) -> Result<Binding> {
@@ -444,8 +465,22 @@ impl Default for NotifyConfig {
     }
 }
 
+/// Which base keymap drives commands. Presets you can switch with one setting;
+/// individual [keys]/[prefix_keys] still override on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keymap {
+    /// One-step alt+key (alt-z zoom…); no tmux prefix.
+    Alt,
+    /// tmux prefix (ctrl-b then key); alt keys stay as a fallback.
+    Tmux,
+    /// Both active at once (the original behavior).
+    Both,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Chosen base keymap preset (alt / tmux / both).
+    pub keymap: Keymap,
     pub keys: HashMap<Action, Vec<Binding>>,
     /// tmux-style prefix key (e.g. ctrl-b). When set, pressing it arms a pending
     /// state and the next key is looked up in `prefix_keys`. None = disabled.
@@ -457,6 +492,8 @@ pub struct Config {
     pub glyphs: Glyphs,
     pub notify: NotifyConfig,
 }
+
+pub const KEYMAP_NAMES: &[&str] = &["tmux", "alt", "both"];
 
 /// tmux-style defaults for keys pressed *after* the prefix.
 pub const PREFIX_DEFAULTS: &[(Action, &str)] = &[
@@ -475,6 +512,7 @@ pub const PREFIX_DEFAULTS: &[(Action, &str)] = &[
     (Action::ToggleSidebar, "b"),
     (Action::JumpWaiting, "a"),
     (Action::ScrollUp, "["),
+    (Action::Search, "/"),
     (Action::ShowHelp, "?"),
     (Action::Quit, "d"),
 ];
@@ -563,6 +601,8 @@ struct RawNotify {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
+    /// Base keymap preset: "tmux" | "alt" | "both".
+    keymap: Option<String>,
     #[serde(default)]
     keys: HashMap<String, KeySpec>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
@@ -635,10 +675,17 @@ impl Config {
             keys.insert(*action, bindings);
         }
 
-        // tmux-style prefix (default ctrl-b) + prefix command keys.
+        // Keymap preset (default tmux). "alt" turns the prefix off; "tmux"/"both"
+        // keep it on. An explicit `prefix = …` always wins over the preset.
+        let keymap = match raw.keymap.as_deref().map(|s| s.to_lowercase()).as_deref() {
+            Some("alt") => Keymap::Alt,
+            Some("both") => Keymap::Both,
+            _ => Keymap::Tmux,
+        };
         let prefix = match raw.prefix.as_deref() {
             Some("") | Some("off") | Some("none") => None,
             Some(spec) => parse_binding(spec).ok(),
+            None if keymap == Keymap::Alt => None,
             None => parse_binding("ctrl-b").ok(),
         };
         let mut prefix_keys = HashMap::new();
@@ -783,7 +830,7 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keys, prefix, prefix_keys, theme, ui, glyphs, notify }
+        Config { keymap, keys, prefix, prefix_keys, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -838,6 +885,19 @@ impl Config {
             .map(|b| b.label())
             .unwrap_or_default()
     }
+
+    /// The real key to reach `action` under the active keymap, compact form:
+    /// tmux → "⌃b z"; alt/both → "⌥z". None if the action has no key in this map.
+    pub fn keyhint(&self, action: Action) -> Option<String> {
+        match self.keymap {
+            Keymap::Tmux => {
+                let p = self.prefix?;
+                let k = self.prefix_keys.get(&action).and_then(|b| b.first())?;
+                Some(format!("{} {}", p.compact(), k.compact()))
+            }
+            _ => self.keys.get(&action).and_then(|b| b.first()).map(|b| b.compact()),
+        }
+    }
 }
 
 const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
@@ -848,6 +908,11 @@ const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
 # ruckus maps those back automatically (mac_option_fallback below). For dead
 # keys (alt-i, alt-n) enable "Use Option as Meta" (Terminal: Profiles →
 # Keyboard) or "Esc+" (iTerm: Profiles → Keys) for the full experience.
+
+# keymap: the base scheme. "tmux" = ctrl-b prefix (n next, z zoom, x close…);
+# "alt" = one-step alt+key; "both" = both at once. Switch with `ruckus keymap
+# <name>`. The [keys] / [prefix_keys] overrides below still win over the preset.
+keymap = "tmux"
 
 [keys]
 quit = ["alt-q", "ctrl-q"]  # leave the TUI (everything keeps running in the daemon)

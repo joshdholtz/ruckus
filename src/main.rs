@@ -106,6 +106,8 @@ enum Cmd {
     },
     /// List built-in themes, or switch to one: `ruckus theme nord`
     Theme { name: Option<String> },
+    /// Show or switch the base keymap: `ruckus keymap tmux` (or alt / both)
+    Keymap { name: Option<String> },
     /// Tell the daemon and every attached TUI to reload config.toml now
     Reload,
     /// Upgrade the running daemon to the current binary WITHOUT killing panes
@@ -169,6 +171,7 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
         Some(Cmd::Theme { name }) => theme_cmd(name).await,
+        Some(Cmd::Keymap { name }) => keymap_cmd(name).await,
         Some(Cmd::Reload) => reload().await,
         Some(Cmd::Upgrade) => upgrade().await,
     }
@@ -217,6 +220,37 @@ async fn theme_cmd(name: Option<String>) -> Result<()> {
     std::fs::write(&path, doc.to_string())?;
     reload_if_running().await;
     println!("theme set to {name}");
+    Ok(())
+}
+
+async fn keymap_cmd(name: Option<String>) -> Result<()> {
+    let path = config::ensure_config_file();
+    let current = {
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
+        doc.get("keymap").and_then(|v| v.as_str()).unwrap_or("tmux").to_string()
+    };
+    let Some(name) = name else {
+        println!("keymaps:");
+        for n in config::KEYMAP_NAMES {
+            let mark = if *n == current { "●" } else { " " };
+            let desc = match *n {
+                "tmux" => "ctrl-b then a key (tmux prefix)",
+                "alt" => "one-step alt+key",
+                _ => "both at once",
+            };
+            println!("  {mark} {n:<6} {desc}");
+        }
+        println!("\nswitch with: ruckus keymap <name>");
+        return Ok(());
+    };
+    if !config::KEYMAP_NAMES.contains(&name.as_str()) {
+        anyhow::bail!("unknown keymap '{name}' — try: {}", config::KEYMAP_NAMES.join(", "));
+    }
+    let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
+    doc["keymap"] = toml_edit::value(name.as_str());
+    std::fs::write(&path, doc.to_string())?;
+    reload_if_running().await;
+    println!("keymap set to {name}");
     Ok(())
 }
 

@@ -3291,32 +3291,43 @@ impl App {
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
-        // Mobile focus: a tappable command bar. Icons (not fake key letters, which
-        // collided with the real tmux prefix) so nothing you press misfires.
+        // Mobile focus: tappable command bar that shows the REAL key for each
+        // command under the active keymap (⌥z in alt mode, ⌃b z in tmux mode).
         if self.mobile_focus() {
             let th = self.cfg.theme.clone();
-            let cmds: [(&str, ChipAction); 5] = [
-                ("‹ back", ChipAction::Back),
-                ("next ›", ChipAction::Next),
-                ("⤢ zoom", ChipAction::Zoom),
-                ("⌕ find", ChipAction::Search),
-                ("✕ close", ChipAction::Close),
+            // (label, chip, action for the key hint)
+            let cmds: [(&str, ChipAction, Action); 5] = [
+                ("back", ChipAction::Back, Action::Deck),
+                ("next", ChipAction::Next, Action::NextTab),
+                ("zoom", ChipAction::Zoom, Action::Zoom),
+                ("find", ChipAction::Search, Action::Search),
+                ("close", ChipAction::Close, Action::ClosePane),
             ];
             let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(th.bar_bg))];
             let mut hits = Vec::new();
             let mut x = area.x + 1;
-            for (label, act) in cmds {
-                let width = label.chars().count() as u16;
+            for (label, chip, action) in cmds {
+                let key = self.cfg.keyhint(action);
+                let text = match &key {
+                    Some(k) => format!("{k} {label}"),
+                    None => label.to_string(),
+                };
+                let width = text.chars().count() as u16;
+                if x + width > area.x + area.width {
+                    break;
+                }
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
-                let style = Style::default()
-                    .fg(if hovered { th.bg } else { th.accent })
-                    .bg(if hovered { th.accent } else { th.bar_bg })
-                    .add_modifier(Modifier::BOLD);
-                spans.push(Span::styled(label.to_string(), style));
-                spans.push(Span::styled("   ", Style::default().bg(th.bar_bg)));
-                hits.push((act, area.y, range));
-                x += width + 3;
+                let kbg = if hovered { th.select_bg } else { th.bar_bg };
+                if let Some(k) = &key {
+                    spans.push(Span::styled(k.clone(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(format!(" {label}"), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
+                } else {
+                    spans.push(Span::styled(label.to_string(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
+                }
+                spans.push(Span::styled("  ", Style::default().bg(th.bar_bg)));
+                hits.push((chip, area.y, range));
+                x += width + 2;
             }
             self.action_hits = hits;
             f.render_widget(
