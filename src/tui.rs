@@ -3291,11 +3291,11 @@ impl App {
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
-        // Mobile focus: tappable command bar that shows the REAL key for each
-        // command under the active keymap (⌥z in alt mode, ⌃b z in tmux mode).
+        // Mobile focus: tappable command bar showing the REAL keys for the active
+        // keymap. tmux → a single "⌃b" indicator then bare keys (which-key style);
+        // alt → the ⌥key per command. Tapping and pressing agree.
         if self.mobile_focus() {
             let th = self.cfg.theme.clone();
-            // (label, chip, action for the key hint)
             let cmds: [(&str, ChipAction, Action); 5] = [
                 ("back", ChipAction::Back, Action::Deck),
                 ("next", ChipAction::Next, Action::NextTab),
@@ -3303,37 +3303,41 @@ impl App {
                 ("find", ChipAction::Search, Action::Search),
                 ("close", ChipAction::Close, Action::ClosePane),
             ];
-            let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(th.bar_bg))];
+            let tmux = self.cfg.keymap == crate::config::Keymap::Tmux && self.cfg.prefix.is_some();
+            let bar_bg = Style::default().bg(th.bar_bg);
+            let mut spans: Vec<Span> = vec![Span::styled(" ", bar_bg)];
             let mut hits = Vec::new();
             let mut x = area.x + 1;
+            if tmux {
+                let pfx = self.cfg.prefix.map(|b| b.compact()).unwrap_or_default();
+                let t = format!("{pfx} ");
+                x += t.chars().count() as u16;
+                spans.push(Span::styled(t, Style::default().fg(th.status_fg).bg(th.bar_bg)));
+            }
             for (label, chip, action) in cmds {
-                let key = self.cfg.keyhint(action);
-                let text = match &key {
-                    Some(k) => format!("{k} {label}"),
-                    None => label.to_string(),
+                let key = if tmux {
+                    self.cfg.prefix_keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
+                } else {
+                    self.cfg.keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
                 };
-                let width = text.chars().count() as u16;
-                if x + width > area.x + area.width {
+                let width = (key.as_ref().map(|k| k.chars().count() + 1).unwrap_or(0)
+                    + label.chars().count()) as u16;
+                if x + width + 2 > area.x + area.width {
                     break;
                 }
                 let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
                 let kbg = if hovered { th.select_bg } else { th.bar_bg };
                 if let Some(k) = &key {
-                    spans.push(Span::styled(k.clone(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
-                    spans.push(Span::styled(format!(" {label}"), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
-                } else {
-                    spans.push(Span::styled(label.to_string(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(format!("{k} "), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
                 }
-                spans.push(Span::styled("  ", Style::default().bg(th.bar_bg)));
+                spans.push(Span::styled(label.to_string(), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
+                spans.push(Span::styled("   ", bar_bg));
                 hits.push((chip, area.y, range));
-                x += width + 2;
+                x += width + 3;
             }
             self.action_hits = hits;
-            f.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
-                area,
-            );
+            f.render_widget(Paragraph::new(Line::from(spans)).style(bar_bg), area);
             return;
         }
         let Some(kind) = self.action_bar_kind() else {

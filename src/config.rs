@@ -513,6 +513,8 @@ pub const PREFIX_DEFAULTS: &[(Action, &str)] = &[
     (Action::JumpWaiting, "a"),
     (Action::ScrollUp, "["),
     (Action::Search, "/"),
+    // Deck / overview — like tmux's prefix+w window tree.
+    (Action::Deck, "w"),
     (Action::ShowHelp, "?"),
     (Action::Quit, "d"),
 ];
