@@ -362,6 +362,8 @@ pub struct UiConfig {
     pub status_left: String,
     pub status_right: String,
     pub tab_strip: bool,
+    /// Draw a divider line under the tab strip so it reads as its own bar.
+    pub tab_border: bool,
     pub mouse: bool,
     /// Drag to select text in a pane and copy it (OSC 52 + local clipboard).
     pub mouse_select: bool,
@@ -412,6 +414,7 @@ impl Default for UiConfig {
             status_left: "{space} › {tab}".to_string(),
             status_right: "#[accent]⚡{agents}#[] ◉{needs}  #[bar_active_fg]{clock:%H:%M}".to_string(),
             tab_strip: true,
+            tab_border: true,
             mouse: true,
             mouse_select: true,
             mac_option_fallback: true,
@@ -527,6 +530,7 @@ struct RawUi {
     status_left: Option<String>,
     status_right: Option<String>,
     tab_strip: Option<bool>,
+    tab_border: Option<bool>,
     mouse: Option<bool>,
     mouse_select: Option<bool>,
     mac_option_fallback: Option<bool>,
@@ -742,6 +746,7 @@ impl Config {
             status_left: raw.ui.status_left.unwrap_or(d.status_left),
             status_right: raw.ui.status_right.unwrap_or(d.status_right),
             tab_strip: raw.ui.tab_strip.unwrap_or(d.tab_strip),
+            tab_border: raw.ui.tab_border.unwrap_or(d.tab_border),
             mouse: raw.ui.mouse.unwrap_or(d.mouse),
             mouse_select: raw.ui.mouse_select.unwrap_or(d.mouse_select),
             mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(d.mac_option_fallback),

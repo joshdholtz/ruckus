@@ -519,9 +519,11 @@ impl App {
         };
         let main = Rect::new(main_x, body.y, main_w, body.height);
         let (tabs, panes) = if ui.tab_strip && main.height > 1 {
+            // Reserve one extra row under the tab strip for a divider line.
+            let border = if ui.tab_border && main.height > 2 { 1 } else { 0 };
             (
                 Some(main.y),
-                Rect::new(main.x, main.y + 1, main.width, main.height - 1),
+                Rect::new(main.x, main.y + 1 + border, main.width, main.height - 1 - border),
             )
         } else {
             (None, main)
@@ -3436,6 +3438,18 @@ impl App {
         if let Some(r) = self.frame.tabs {
             let m = self.frame.main;
             self.draw_tab_strip(f, Rect::new(m.x, r, m.width, 1));
+            // Divider under the tab strip so it reads as its own bar.
+            if self.cfg.ui.tab_border && self.frame.panes.y > r + 1 {
+                let th = &self.cfg.theme;
+                let bar = "─".repeat(m.width as usize);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        bar,
+                        Style::default().fg(th.border).bg(th.bg),
+                    ))),
+                    Rect::new(m.x, r + 1, m.width, 1),
+                );
+            }
         }
         self.draw_panes(f);
         self.draw_dividers(f);
