@@ -297,6 +297,10 @@ pub struct PaneInfo {
     /// happening" for the mobile deck. Filled in at snapshot time.
     #[serde(default)]
     pub preview: String,
+    /// Unix seconds when this pane's activity last changed — drives elapsed
+    /// labels ("waiting 45s", "done 2m ago").
+    #[serde(default)]
+    pub activity_since: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

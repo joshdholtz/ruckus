@@ -664,6 +664,7 @@ pub async fn run() -> Result<()> {
                         let next = classify_quiet(p);
                         if next != p.info.activity {
                             p.info.activity = next;
+                            p.info.activity_since = unix_now();
                             changes.push((*id, next));
                         }
                     }
@@ -1312,6 +1313,7 @@ fn spawn_pane_with_id(
         created: unix_now(),
         agent: None,
         preview: String::new(),
+        activity_since: unix_now(),
     };
     install_pane(state, st, info, pty, reader, scrollback.unwrap_or_default(), 24, 80);
     Ok(())
@@ -1408,6 +1410,7 @@ fn apply_report(p: &mut PaneSession, state: &str) -> Option<Activity> {
     p.reported = Some(target);
     if p.info.status == PaneStatus::Running && p.info.activity != target {
         p.info.activity = target;
+        p.info.activity_since = unix_now();
         Some(target)
     } else {
         None
@@ -1569,6 +1572,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                                     && p.info.activity != a =>
                             {
                                 p.info.activity = a;
+                                p.info.activity_since = unix_now();
                                 Some(a)
                             }
                             _ => None,
@@ -1612,6 +1616,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 let known = if let Some(p) = st.panes.get_mut(&id) {
                     p.info.status = PaneStatus::Exited { code };
                     p.info.activity = Activity::Done;
+                    p.info.activity_since = unix_now();
                     true
                 } else {
                     false

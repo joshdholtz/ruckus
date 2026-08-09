@@ -513,7 +513,7 @@ impl App {
         let mut action = None;
         if ui.header == BarPos::Top {
             header = Some(top);
-            top += 1;
+            top += if minimal { 2 } else { 1 }; // mobile focus gets a 2-row header
         }
         if ui.footer == BarPos::Top && !minimal {
             footer = Some(top);
@@ -1823,7 +1823,7 @@ impl App {
                 }
                 if Some(row) == self.frame.header {
                     if col < 10 {
-                        // On mobile the ☰ is the home button — back to the deck.
+                        // On mobile the ☰ / ‹ is the home button — back to the deck.
                         if self.cfg.ui.deck && self.narrow() {
                             self.deck = true;
                             self.sync().await;
@@ -1832,6 +1832,14 @@ impl App {
                         }
                     } else if col > self.size.0.saturating_sub(40) {
                         self.do_action(Action::JumpWaiting).await;
+                    }
+                    return;
+                }
+                // Mobile-focus info row: tap jumps the pane back to live.
+                if self.mobile_focus() && Some(row) == self.frame.header.map(|h| h + 1) {
+                    if let Some(v) = self.views.get_mut(&self.focused) {
+                        v.scroll = 0;
+                        v.parser.set_scrollback(0);
                     }
                     return;
                 }
@@ -2133,6 +2141,105 @@ impl App {
         self.hover
             .map(|(c, r)| r == row && col_range.contains(&c))
             .unwrap_or(false)
+    }
+
+    /// Compact elapsed since a pane last changed state: "45s" / "12m" / "3h".
+    fn elapsed_label(&self, pane: u64) -> String {
+        let since = self.snap.pane(pane).map(|p| p.activity_since).unwrap_or(0);
+        if since == 0 {
+            return String::new();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let s = now.saturating_sub(since);
+        if s < 60 {
+            format!("{s}s")
+        } else if s < 3600 {
+            format!("{}m", s / 60)
+        } else {
+            format!("{}h", s / 3600)
+        }
+    }
+
+    /// Two-row header for the mobile focus view: a nav row (big back button,
+    /// space › tab breadcrumb, this pane's state) and an info row (cwd · pane
+    /// index · elapsed, plus a jump-to-live control when scrolled back).
+    fn draw_mobile_header(&self, f: &mut Frame, area: Rect) {
+        let th = &self.cfg.theme;
+        let w = area.width;
+
+        // Nav row.
+        let back = Span::styled(
+            "  ‹  ",
+            Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
+        );
+        let sname = self.active_space().map(|s| s.name).unwrap_or_default();
+        let tname = self.active_tab().map(|t| t.name).unwrap_or_default();
+        let crumb = format!("  {sname} › {tname}");
+        let info = self.snap.pane(self.focused);
+        let act = info.map(|p| p.activity).unwrap_or(Activity::Idle);
+        let (g, scol) = self.state_glyph(act);
+        let sword = match act {
+            Activity::Waiting => "waiting",
+            Activity::Working => "working",
+            Activity::Done => "done",
+            Activity::Idle => "idle",
+        };
+        let right = format!("{g} {sword} ");
+        let used = 5 + crumb.chars().count() + right.chars().count();
+        let pad = (w as usize).saturating_sub(used);
+        let nav = Line::from(vec![
+            back,
+            Span::styled(crumb, Style::default().fg(th.bar_active_fg).bg(th.bar_bg)),
+            Span::styled(" ".repeat(pad), Style::default().bg(th.bar_bg)),
+            Span::styled(right, Style::default().fg(scol).bg(th.bar_bg).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(
+            Paragraph::new(nav).style(Style::default().bg(th.bar_bg)),
+            Rect::new(area.x, area.y, w, 1),
+        );
+
+        // Info row.
+        let cwd = info.map(|p| home_relative(&p.cwd)).unwrap_or_default();
+        let mut leaves = Vec::new();
+        if let Some(t) = self.active_tab() {
+            t.layout.leaves(&mut leaves);
+        }
+        let pane_part = if leaves.len() > 1 {
+            let i = leaves.iter().position(|p| *p == self.focused).map(|i| i + 1).unwrap_or(1);
+            format!("  ·  pane {i}/{}", leaves.len())
+        } else {
+            String::new()
+        };
+        let el = self.elapsed_label(self.focused);
+        let el_part = if el.is_empty() {
+            String::new()
+        } else {
+            match act {
+                Activity::Waiting => format!("  ·  waiting {el}"),
+                Activity::Working => format!("  ·  running {el}"),
+                Activity::Done => format!("  ·  done {el} ago"),
+                Activity::Idle => format!("  ·  idle {el}"),
+            }
+        };
+        let scroll = self.views.get(&self.focused).map(|v| v.scroll).unwrap_or(0);
+        let live = if scroll > 0 { format!("↑{scroll}  ↓ live ") } else { String::new() };
+        let livew = live.chars().count();
+        let leftmax = (w as usize).saturating_sub(livew + 1);
+        let left: String =
+            format!(" {cwd}{pane_part}{el_part}").chars().take(leftmax).collect();
+        let pad2 = (w as usize).saturating_sub(left.chars().count() + livew);
+        let info_line = Line::from(vec![
+            Span::styled(left, Style::default().fg(th.status_fg).bg(th.surface)),
+            Span::styled(" ".repeat(pad2), Style::default().bg(th.surface)),
+            Span::styled(live, Style::default().fg(th.accent).bg(th.surface).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(
+            Paragraph::new(info_line).style(Style::default().bg(th.surface)),
+            Rect::new(area.x, area.y + 1, w, 1),
+        );
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -3748,7 +3855,11 @@ impl App {
         );
 
         if let Some(r) = self.frame.header {
-            self.draw_header(f, Rect::new(0, r, area.width, 1));
+            if self.mobile_focus() {
+                self.draw_mobile_header(f, Rect::new(0, r, area.width, 2));
+            } else {
+                self.draw_header(f, Rect::new(0, r, area.width, 1));
+            }
         }
         if let Some(sb) = self.frame.sidebar {
             self.draw_sidebar(f, sb);
