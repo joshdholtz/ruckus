@@ -565,8 +565,10 @@ impl App {
         out
     }
 
-    fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now()));
+    fn toast(&mut self, _msg: impl Into<String>) {
+        // Toasts removed by request — the floating popups were more annoying than
+        // useful. Errors are silent here (see ~/.ruckus/daemon.log); pane/deck
+        // state colors already show what's happening.
     }
 
     /// The content sub-rect of a pane rect (inside title bar + padding).
@@ -3788,9 +3790,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let sidebar = cfg.ui.sidebar_start_visible;
     let deck_default = cfg.ui.deck;
-    // Show the welcome overlay until the user has seen it once.
-    let welcome_marker = crate::protocol::ruckus_dir().join(".welcomed");
-    let welcome = !welcome_marker.exists();
+    // Welcome overlay removed by request.
+    let welcome = false;
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
     let mut app = App {
