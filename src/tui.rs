@@ -2091,13 +2091,10 @@ impl App {
         let div_row = area.y + top_h;
         let bot_rect = Rect::new(area.x, div_row + 1, area.width, bottom_h);
         self.draw_sidebar_region(f, top_rect, top, true);
-        // divider between the two regions
-        let bar = "─".repeat(area.width as usize);
+        // Flat: a blank gap row (no line) separates the two regions; the section
+        // header does the labeling.
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                bar,
-                Style::default().fg(self.cfg.theme.border).bg(self.cfg.theme.sidebar_bg),
-            ))),
+            Paragraph::new(" ").style(Style::default().bg(self.cfg.theme.sidebar_bg)),
             Rect::new(area.x, div_row, area.width, 1),
         );
         self.draw_sidebar_region(f, bot_rect, pinned, true);
