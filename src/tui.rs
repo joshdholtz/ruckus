@@ -133,6 +133,7 @@ enum DeckHit {
     Jump,
     ScrollUp,
     ScrollDown,
+    Menu,
 }
 
 /// What a context menu acts on.
@@ -1602,6 +1603,7 @@ impl App {
                         Some(DeckHit::ScrollDown) => {
                             self.deck_scroll = self.deck_scroll.saturating_add(3)
                         }
+                        Some(DeckHit::Menu) => self.palette = Some((String::new(), 0)),
                         None => {}
                     }
                 }
@@ -1832,9 +1834,27 @@ impl App {
                         return;
                     }
                 }
+                // Mobile focus: the big 2-row back button (left) spans both header
+                // rows; the info row's right side jumps the pane back to live.
+                if self.mobile_focus() {
+                    if let Some(h) = self.frame.header {
+                        if row == h || row == h + 1 {
+                            if col < 6 {
+                                self.deck = true;
+                                self.sync().await;
+                            } else if row == h + 1 {
+                                if let Some(v) = self.views.get_mut(&self.focused) {
+                                    v.scroll = 0;
+                                    v.parser.set_scrollback(0);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
                 if Some(row) == self.frame.header {
                     if col < 10 {
-                        // On mobile the ☰ / ‹ is the home button — back to the deck.
+                        // On mobile the ☰ is the home button — back to the deck.
                         if self.cfg.ui.deck && self.narrow() {
                             self.deck = true;
                             self.sync().await;
@@ -1843,14 +1863,6 @@ impl App {
                         }
                     } else if col > self.size.0.saturating_sub(40) {
                         self.do_action(Action::JumpWaiting).await;
-                    }
-                    return;
-                }
-                // Mobile-focus info row: tap jumps the pane back to live.
-                if self.mobile_focus() && Some(row) == self.frame.header.map(|h| h + 1) {
-                    if let Some(v) = self.views.get_mut(&self.focused) {
-                        v.scroll = 0;
-                        v.parser.set_scrollback(0);
                     }
                     return;
                 }
@@ -2174,21 +2186,26 @@ impl App {
         }
     }
 
-    /// Two-row header for the mobile focus view: a nav row (big back button,
-    /// space › tab breadcrumb, this pane's state) and an info row (cwd · pane
-    /// index · elapsed, plus a jump-to-live control when scrolled back).
+    /// Two-row header for the mobile focus view. Left: a BIG 2-row-tall back
+    /// button (easy thumb target). Right: nav row (breadcrumb + state) over an
+    /// info row (loc · pane · elapsed + jump-to-live).
     fn draw_mobile_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
+        let bw = 6u16; // back-button width; it spans BOTH header rows
         let w = area.width;
+        let cw = w.saturating_sub(bw); // content width to the right of the button
 
-        // Nav row.
-        let back = Span::styled(
-            "  ‹  ",
-            Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
+        // The 2-row back button, filled accent, spanning area.y and area.y+1.
+        let bstyle = Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("  ‹  ", bstyle))).style(bstyle),
+            Rect::new(area.x, area.y, bw, 1),
         );
-        let sname = self.active_space().map(|s| s.name).unwrap_or_default();
-        let tname = self.active_tab().map(|t| t.name).unwrap_or_default();
-        let crumb = format!("  {sname} › {tname}");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(" back ", bstyle))).style(bstyle),
+            Rect::new(area.x, area.y + 1, bw, 1),
+        );
+
         let info = self.snap.pane(self.focused);
         let act = info.map(|p| p.activity).unwrap_or(Activity::Idle);
         let (g, scol) = self.state_glyph(act);
@@ -2198,21 +2215,24 @@ impl App {
             Activity::Done => "done",
             Activity::Idle => "idle",
         };
+
+        // Nav row (right of the button): space › tab … state.
+        let sname = self.active_space().map(|s| s.name).unwrap_or_default();
+        let tname = self.active_tab().map(|t| t.name).unwrap_or_default();
+        let crumb = format!(" {sname} › {tname}");
         let right = format!("{g} {sword} ");
-        let used = 5 + crumb.chars().count() + right.chars().count();
-        let pad = (w as usize).saturating_sub(used);
+        let pad = (cw as usize).saturating_sub(crumb.chars().count() + right.chars().count());
         let nav = Line::from(vec![
-            back,
-            Span::styled(crumb, Style::default().fg(th.bar_active_fg).bg(th.bar_bg)),
+            Span::styled(crumb, Style::default().fg(th.bar_active_fg).bg(th.bar_bg).add_modifier(Modifier::BOLD)),
             Span::styled(" ".repeat(pad), Style::default().bg(th.bar_bg)),
             Span::styled(right, Style::default().fg(scol).bg(th.bar_bg).add_modifier(Modifier::BOLD)),
         ]);
         f.render_widget(
             Paragraph::new(nav).style(Style::default().bg(th.bar_bg)),
-            Rect::new(area.x, area.y, w, 1),
+            Rect::new(area.x + bw, area.y, cw, 1),
         );
 
-        // Info row.
+        // Info row (right of the button): loc · pane · elapsed  … ↓ live.
         let cwd = info.map(pane_loc).unwrap_or_default();
         let mut leaves = Vec::new();
         if let Some(t) = self.active_tab() {
@@ -2238,10 +2258,10 @@ impl App {
         let scroll = self.views.get(&self.focused).map(|v| v.scroll).unwrap_or(0);
         let live = if scroll > 0 { format!("↑{scroll}  ↓ live ") } else { String::new() };
         let livew = live.chars().count();
-        let leftmax = (w as usize).saturating_sub(livew + 1);
+        let leftmax = (cw as usize).saturating_sub(livew + 1);
         let left: String =
             format!(" {cwd}{pane_part}{el_part}").chars().take(leftmax).collect();
-        let pad2 = (w as usize).saturating_sub(left.chars().count() + livew);
+        let pad2 = (cw as usize).saturating_sub(left.chars().count() + livew);
         let info_line = Line::from(vec![
             Span::styled(left, Style::default().fg(th.status_fg).bg(th.surface)),
             Span::styled(" ".repeat(pad2), Style::default().bg(th.surface)),
@@ -2249,7 +2269,7 @@ impl App {
         ]);
         f.render_widget(
             Paragraph::new(info_line).style(Style::default().bg(th.surface)),
-            Rect::new(area.x, area.y + 1, w, 1),
+            Rect::new(area.x + bw, area.y + 1, cw, 1),
         );
     }
 
@@ -3403,9 +3423,24 @@ impl App {
         } else {
             (" 🐏 all quiet ".to_string(), th.status_fg)
         };
-        let left = "  ☰  ruckus";
+        // Big 2-row ☰ menu button (opens the command palette).
+        let bw = 6u16;
+        let bstyle = Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("  ☰  ", bstyle))).style(bstyle),
+            Rect::new(area.x, area.y, bw, 1),
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(" menu ", bstyle))).style(bstyle),
+            Rect::new(area.x, area.y + 1, bw, 1),
+        );
+        self.deck_hits.push((Rect::new(area.x, area.y, bw, 2), DeckHit::Menu));
+
+        let hx = area.x + bw; // header content starts right of the button
+        let hw = area.width.saturating_sub(bw);
+        let left = " ruckus";
         let sumw = sumtxt.chars().count() as u16;
-        let pad = (area.width as usize).saturating_sub(left.chars().count() + sumw as usize);
+        let pad = (hw as usize).saturating_sub(left.chars().count() + sumw as usize);
         let header = Line::from(vec![
             Span::styled(left, Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
             Span::raw(" ".repeat(pad)),
@@ -3413,17 +3448,17 @@ impl App {
         ]);
         f.render_widget(
             Paragraph::new(header).style(Style::default().bg(th.bar_bg)),
-            Rect::new(area.x, area.y, area.width, 1),
+            Rect::new(hx, area.y, hw, 1),
         );
         if waiting > 0 {
             self.deck_hits
                 .push((Rect::new(area.x + area.width - sumw, area.y, sumw, 1), DeckHit::Jump));
         }
 
-        // Space chips.
+        // Space chips (row 2, right of the button).
         let spaces = self.snap.spaces.clone();
         let mut spans = vec![Span::raw(" ")];
-        let mut x = area.x + 1;
+        let mut x = hx + 1;
         for s in &spaces {
             let active = s.id == self.snap.active_space;
             let label = format!(" {} ", s.name);
@@ -3440,7 +3475,7 @@ impl App {
         }
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
-            Rect::new(area.x, area.y + 1, area.width, 1),
+            Rect::new(hx, area.y + 1, hw, 1),
         );
 
         // Two-row create buttons pinned to the bottom.
