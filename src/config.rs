@@ -30,6 +30,7 @@ pub enum Action {
     Zoom,
     Search,
     Palette,
+    Deck,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -53,6 +54,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::Zoom, "zoom", &["alt-z"]),
     (Action::Search, "search", &["alt-f"]),
     (Action::Palette, "palette", &["alt-p"]),
+    (Action::Deck, "deck", &["alt-d"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
@@ -365,6 +367,8 @@ pub struct UiConfig {
     /// Draw a divider line under the tab strip so it reads as its own bar.
     pub tab_border: bool,
     pub mouse: bool,
+    /// Use the touch-first deck view (big cards) when the screen is narrow.
+    pub deck: bool,
     /// Drag to select text in a pane and copy it (OSC 52 + local clipboard).
     pub mouse_select: bool,
     pub mac_option_fallback: bool,
@@ -416,6 +420,7 @@ impl Default for UiConfig {
             tab_strip: true,
             tab_border: false,
             mouse: true,
+            deck: true,
             mouse_select: true,
             mac_option_fallback: true,
             space_row: "{icon} {name}".to_string(),
@@ -532,6 +537,7 @@ struct RawUi {
     tab_strip: Option<bool>,
     tab_border: Option<bool>,
     mouse: Option<bool>,
+    deck: Option<bool>,
     mouse_select: Option<bool>,
     mac_option_fallback: Option<bool>,
     space_row: Option<String>,
@@ -748,6 +754,7 @@ impl Config {
             tab_strip: raw.ui.tab_strip.unwrap_or(d.tab_strip),
             tab_border: raw.ui.tab_border.unwrap_or(d.tab_border),
             mouse: raw.ui.mouse.unwrap_or(d.mouse),
+            deck: raw.ui.deck.unwrap_or(d.deck),
             mouse_select: raw.ui.mouse_select.unwrap_or(d.mouse_select),
             mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(d.mac_option_fallback),
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
@@ -874,6 +881,7 @@ gutter = 1                  # cells between panes: 0 = dense, 2 = airy
 pane_padding = 0            # cells of breathing room inside each pane
 pane_titles = true          # false = pure grid, no per-pane title bars
 narrow_below = 70           # sidebar auto-collapses under this width; 0 = never
+deck = true                 # touch-first card view when narrow (alt-d toggles); false = panes
 spinner_ms = 120            # working-spinner speed
 toast = { position = "bottom-right", seconds = 4 }  # also: top-left/right, bottom-left
 header = "top"              # top | bottom | off

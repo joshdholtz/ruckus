@@ -293,6 +293,10 @@ pub struct PaneInfo {
     /// the foreground-process detector or an external plugin via report_agent.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Last non-empty line of the pane's rendered screen — a one-line "what's
+    /// happening" for the mobile deck. Filled in at snapshot time.
+    #[serde(default)]
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

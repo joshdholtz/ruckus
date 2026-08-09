@@ -123,6 +123,15 @@ enum SidebarBtn {
     CloseSpace(u64),
 }
 
+/// A tappable region in the mobile deck view.
+#[derive(Clone, Copy)]
+enum DeckHit {
+    Space(u64),
+    Tab { space: u64, tab: u64, pane: u64 },
+    NewTab,
+    NewSpace,
+}
+
 /// What a context menu acts on.
 #[derive(Clone, Copy)]
 enum MenuTarget {
@@ -266,6 +275,11 @@ struct App {
     search: Option<String>,
     /// Command palette: fuzzy query + selected row index.
     palette: Option<(String, usize)>,
+    /// Touch-first deck view (big cards) — the mobile home screen. Gated by narrow().
+    deck: bool,
+    deck_scroll: usize,
+    /// Tap regions in the deck: (rect, what it does).
+    deck_hits: Vec<(Rect, DeckHit)>,
     drag: Option<Drag>,
     select: Option<Sel>,
     selecting: bool,
@@ -453,6 +467,11 @@ impl App {
 
     fn narrow(&self) -> bool {
         self.cfg.ui.narrow_below > 0 && self.size.0 < self.cfg.ui.narrow_below
+    }
+
+    /// The deck (mobile card home) shows only when narrow and the toggle is on.
+    fn deck_active(&self) -> bool {
+        self.deck && self.narrow()
     }
 
     fn sidebar_shown(&self) -> bool {
@@ -1067,6 +1086,10 @@ impl App {
             }
             Action::Search => self.open_prompt(PromptKind::Search),
             Action::Palette => self.palette = Some((String::new(), 0)),
+            Action::Deck => {
+                self.deck = !self.deck;
+                self.sync().await;
+            }
         }
     }
 
@@ -1215,6 +1238,22 @@ impl App {
         // First-run welcome: any key dismisses it and it never shows again.
         if self.welcome {
             self.dismiss_welcome();
+            return;
+        }
+
+        // Deck view is mouse-first: honor action bindings (alt-d out, palette,
+        // quit, jump-to-waiting…) but swallow raw keys — there's no pane to type into.
+        if self.deck_active() && self.palette.is_none() && self.prompt.is_none() {
+            if let Some(a) = self.cfg.action_for(&ev) {
+                self.do_action(a).await;
+            } else if ev.code == KeyCode::Enter {
+                // Enter opens the first attention item fullscreen.
+                if let Some(p) = self.attention().first().map(|p| p.id) {
+                    self.goto_pane(p).await;
+                    self.deck = false;
+                    self.sync().await;
+                }
+            }
             return;
         }
 
@@ -1488,6 +1527,49 @@ impl App {
     async fn on_mouse(&mut self, ev: MouseEvent) {
         let (col, row) = (ev.column, ev.row);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
+        // Deck view has its own tap/scroll model.
+        if self.deck_active() {
+            match ev.kind {
+                MouseEventKind::Moved => self.hover = Some((col, row)),
+                MouseEventKind::ScrollDown => self.deck_scroll = self.deck_scroll.saturating_add(1),
+                MouseEventKind::ScrollUp => self.deck_scroll = self.deck_scroll.saturating_sub(1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.welcome {
+                        self.dismiss_welcome();
+                        return;
+                    }
+                    let hit = self
+                        .deck_hits
+                        .iter()
+                        .find(|(r, _)| {
+                            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+                        })
+                        .map(|(_, h)| *h);
+                    match hit {
+                        Some(DeckHit::Space(id)) => {
+                            let t = self.snap.spaces.iter().find(|s| s.id == id).and_then(|s| {
+                                s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first())
+                                    .map(|t| (s.id, t.id, t.active_pane))
+                            });
+                            if let Some((s, t, p)) = t {
+                                self.deck_scroll = 0;
+                                self.set_active(s, t, p).await;
+                            }
+                        }
+                        Some(DeckHit::Tab { space, tab, pane }) => {
+                            self.set_active(space, tab, pane).await;
+                            self.deck = false; // enter the pane fullscreen
+                            self.sync().await;
+                        }
+                        Some(DeckHit::NewTab) => self.open_prompt(PromptKind::NewTab),
+                        Some(DeckHit::NewSpace) => self.open_prompt(PromptKind::NewSpace),
+                        None => {}
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match ev.kind {
             MouseEventKind::Moved => {
                 self.hover = Some((col, row));
@@ -1713,7 +1795,13 @@ impl App {
                 }
                 if Some(row) == self.frame.header {
                     if col < 10 {
-                        self.do_action(Action::ToggleSidebar).await;
+                        // On mobile the ☰ is the home button — back to the deck.
+                        if self.cfg.ui.deck && self.narrow() {
+                            self.deck = true;
+                            self.sync().await;
+                        } else {
+                            self.do_action(Action::ToggleSidebar).await;
+                        }
                     } else if col > self.size.0.saturating_sub(40) {
                         self.do_action(Action::JumpWaiting).await;
                     }
@@ -3144,6 +3232,146 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// The touch-first mobile deck: big state-colored cards for each tab in the
+    /// current space, attention-sorted. Tap a card to enter it fullscreen.
+    fn draw_deck(&mut self, f: &mut Frame) {
+        let area = f.area();
+        let th = self.cfg.theme.clone();
+        self.deck_hits.clear();
+        f.render_widget(Paragraph::new("").style(Style::default().bg(th.bg)), area);
+
+        // Header: ☰ ruckus … attention summary.
+        let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
+        let (sumtxt, sumcol) = if waiting > 0 {
+            (format!("● {waiting} needs you "), th.waiting)
+        } else {
+            ("🐏 all quiet ".to_string(), th.status_fg)
+        };
+        let left = "  ☰  ruckus";
+        let pad = (area.width as usize)
+            .saturating_sub(left.chars().count() + sumtxt.chars().count());
+        let header = Line::from(vec![
+            Span::styled(
+                left,
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(sumtxt, Style::default().fg(sumcol).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(
+            Paragraph::new(header).style(Style::default().bg(th.bar_bg)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+
+        // Space chips.
+        let spaces = self.snap.spaces.clone();
+        let mut spans = vec![Span::raw(" ")];
+        let mut x = area.x + 1;
+        for s in &spaces {
+            let active = s.id == self.snap.active_space;
+            let label = format!(" {} ", s.name);
+            let w = label.chars().count() as u16;
+            let style = if active {
+                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(th.select_bg).fg(th.bar_fg)
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+            self.deck_hits.push((Rect::new(x, area.y + 1, w, 1), DeckHit::Space(s.id)));
+            x += w + 1;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+
+        // Footer buttons.
+        let fy = area.y + area.height - 1;
+        let nt = " + tab ";
+        let ns = " + space ";
+        let ntw = nt.chars().count() as u16;
+        let nsw = ns.chars().count() as u16;
+        let gap = 2u16;
+        let total = ntw + gap + nsw;
+        let fx = area.x + (area.width.saturating_sub(total)) / 2;
+        let btn = |lbl: &str| {
+            Span::styled(
+                lbl.to_string(),
+                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD),
+            )
+        };
+        let footer = Line::from(vec![
+            Span::raw(" ".repeat(fx.saturating_sub(area.x) as usize)),
+            btn(nt),
+            Span::raw(" ".repeat(gap as usize)),
+            btn(ns),
+        ]);
+        f.render_widget(
+            Paragraph::new(footer).style(Style::default().bg(th.bg)),
+            Rect::new(area.x, fy, area.width, 1),
+        );
+        self.deck_hits.push((Rect::new(fx, fy, ntw, 1), DeckHit::NewTab));
+        self.deck_hits.push((Rect::new(fx + ntw + gap, fy, nsw, 1), DeckHit::NewSpace));
+
+        // Cards.
+        let Some(sp) = self.active_space() else { return };
+        let mut tabs = sp.tabs.clone();
+        tabs.sort_by_key(|t| std::cmp::Reverse(tab_activity(&self.snap, t).urgency()));
+        let card_h = 4u16; // 3 drawn rows + 1 gap
+        let list_top = area.y + 3;
+        let list_bottom = fy.saturating_sub(1);
+        let mut y = list_top;
+        let sp_id = sp.id;
+        for t in tabs.iter().skip(self.deck_scroll) {
+            if y + card_h - 1 > list_bottom {
+                break;
+            }
+            let rect = Rect::new(area.x + 1, y, area.width.saturating_sub(2), card_h - 1);
+            let act = tab_activity(&self.snap, t);
+            let (g, color) = self.state_glyph(act);
+            let (label, lcol) = match act {
+                Activity::Waiting => ("WAITING", th.waiting),
+                Activity::Working => ("working", th.working),
+                Activity::Done => ("done", th.done_ok),
+                Activity::Idle => ("idle", th.idle),
+            };
+            let pane = self.snap.pane(t.active_pane);
+            let cwd = pane.map(|p| home_relative(&p.cwd)).unwrap_or_default();
+            let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
+            let mut leaves = Vec::new();
+            t.layout.leaves(&mut leaves);
+            let npanes = leaves.len();
+            let name = if npanes > 1 {
+                format!("{}  ·{npanes}", t.name)
+            } else {
+                t.name.clone()
+            };
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color))
+                .style(Style::default().bg(th.surface))
+                .title(Line::from(vec![
+                    Span::styled(format!(" {g} "), Style::default().fg(color)),
+                    Span::styled(name, Style::default().fg(th.bar_active_fg).add_modifier(Modifier::BOLD)),
+                ]))
+                .title(Line::from(Span::styled(format!(" {label} "), Style::default().fg(lcol).add_modifier(Modifier::BOLD))).right_aligned());
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let iw = inner.width as usize;
+            let clip = |s: String| -> String { s.chars().take(iw.saturating_sub(1)).collect() };
+            let lines = vec![Line::from(vec![
+                Span::styled(clip(format!("{cwd}   › {preview}")), Style::default().fg(th.status_fg)),
+            ])];
+            f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.surface)), inner);
+            self.deck_hits.push((
+                rect,
+                DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane },
+            ));
+            y += card_h;
+        }
+    }
+
     fn draw_search_bar(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
         let q = self.search.as_deref().unwrap_or("");
@@ -3282,6 +3510,7 @@ impl App {
             (self.cfg.hint(Action::Zoom), "zoom focused pane"),
             (self.cfg.hint(Action::Search), "search scrollback (n/N cycle)"),
             (self.cfg.hint(Action::Palette), "command palette"),
+            (self.cfg.hint(Action::Deck), "mobile deck view (cards)"),
             ("alt+1..9".into(), "jump to tab"),
             ("enter".into(), "restart a finished pane"),
             (self.cfg.hint(Action::Quit), "quit (daemon keeps running)"),
@@ -3418,6 +3647,17 @@ impl App {
             return;
         }
 
+        // Mobile deck view: a self-contained screen of cards. Overlays still stack.
+        if self.deck_active() {
+            self.draw_deck(f);
+            self.draw_menu(f);
+            self.draw_palette(f);
+            self.draw_prompt(f);
+            self.draw_welcome(f);
+            self.draw_toast(f);
+            return;
+        }
+
         // Root layer: darkest background, visible as gutters between panes.
         f.render_widget(
             Paragraph::new("").style(Style::default().bg(self.cfg.theme.bg)),
@@ -3497,6 +3737,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         .unwrap_or(0);
 
     let sidebar = cfg.ui.sidebar_start_visible;
+    let deck_default = cfg.ui.deck;
     // Show the welcome overlay until the user has seen it once.
     let welcome_marker = crate::protocol::ruckus_dir().join(".welcomed");
     let welcome = !welcome_marker.exists();
@@ -3527,6 +3768,9 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         prompt: None,
         search: None,
         palette: None,
+        deck: deck_default,
+        deck_scroll: 0,
+        deck_hits: Vec::new(),
         drag: None,
         select: None,
         selecting: false,

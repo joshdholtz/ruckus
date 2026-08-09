@@ -552,9 +552,30 @@ impl State {
                 })
                 .collect(),
             active_space: self.active_space,
-            panes: self.panes.values().map(|p| p.info.clone()).collect(),
+            panes: self
+                .panes
+                .values()
+                .map(|p| {
+                    let mut info = p.info.clone();
+                    info.preview = pane_preview(&p.screen);
+                    info
+                })
+                .collect(),
         }
     }
+}
+
+/// Last non-empty line of a pane's rendered screen, trimmed and length-capped —
+/// the one-line preview shown on mobile deck cards.
+fn pane_preview(screen: &vt100::Parser) -> String {
+    let text = screen.screen().contents();
+    let line = text
+        .lines()
+        .rev()
+        .map(|l| l.trim_end())
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    line.chars().take(80).collect()
 }
 
 pub async fn run() -> Result<()> {
@@ -1290,6 +1311,7 @@ fn spawn_pane_with_id(
         activity: Activity::Working,
         created: unix_now(),
         agent: None,
+        preview: String::new(),
     };
     install_pane(state, st, info, pty, reader, scrollback.unwrap_or_default(), 24, 80);
     Ok(())
