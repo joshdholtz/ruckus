@@ -231,6 +231,9 @@ enum ChipAction {
     Reply,
     ToggleSidebar,
     Palette,
+    Back,
+    Next,
+    Search,
 }
 
 /// Where every chrome element lives this frame, derived from config + size.
@@ -1072,6 +1075,15 @@ impl App {
             ChipAction::Reply => self.open_prompt(PromptKind::Reply),
             ChipAction::ToggleSidebar => self.do_action(Action::ToggleSidebar).await,
             ChipAction::Palette => self.do_action(Action::Palette).await,
+            ChipAction::Back => {
+                if self.cfg.ui.deck {
+                    self.deck = true;
+                    self.sync_deck_sel();
+                    self.sync().await;
+                }
+            }
+            ChipAction::Next => self.do_action(Action::NextTab).await,
+            ChipAction::Search => self.do_action(Action::Search).await,
         }
     }
 
@@ -3315,6 +3327,40 @@ impl App {
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
+        // Mobile focus: one clean, consistent command bar (not the context-
+        // switching y/n/needs-you strip). Same commands every time = predictable.
+        if self.mobile_focus() {
+            let th = self.cfg.theme.clone();
+            let cmds: [(&str, ChipAction); 5] = [
+                ("‹ back", ChipAction::Back),
+                ("next", ChipAction::Next),
+                ("zoom", ChipAction::Zoom),
+                ("find", ChipAction::Search),
+                ("close", ChipAction::Close),
+            ];
+            let mut spans: Vec<Span> = Vec::new();
+            let mut hits = Vec::new();
+            let mut x = area.x + 1;
+            for (label, act) in cmds {
+                let w = label.chars().count() as u16;
+                let range = x..x + w;
+                let hovered = self.hover_at(&range, area.y);
+                let style = Style::default()
+                    .fg(if hovered { th.accent } else { th.bar_fg })
+                    .bg(th.bar_bg)
+                    .add_modifier(if hovered { Modifier::BOLD } else { Modifier::empty() });
+                spans.push(Span::styled(label.to_string(), style));
+                spans.push(Span::styled("     ", Style::default().bg(th.bar_bg)));
+                hits.push((act, area.y, range));
+                x += w + 5;
+            }
+            self.action_hits = hits;
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bar_bg)),
+                area,
+            );
+            return;
+        }
         let Some(kind) = self.action_bar_kind() else {
             self.action_hits.clear();
             return;
