@@ -21,8 +21,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
 use crate::config::{
-    normalize_key, Action, BarPos, CommandBind, Config, FooterMode, Placement, SidebarPos,
-    ToastPos, WorkingStyle,
+    normalize_key, Action, BarPos, CommandBind, Config, FooterMode, LinkClick, Placement,
+    SidebarPos, ToastPos, WorkingStyle,
 };
 use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
@@ -1100,6 +1100,41 @@ impl App {
             .map(|p| p.cwd.clone())
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// If a link handler matches the text at pane cell (row,col), return the
+    /// matched text and the rule's command template.
+    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, String)> {
+        let screen = self.views.get(&pane)?.parser.screen();
+        let contents = screen.contents();
+        let line = contents.lines().nth(row as usize)?;
+        for rule in &self.cfg.links {
+            for m in rule.pattern.find_iter(line) {
+                let start = line[..m.start()].chars().count();
+                let end = start + m.as_str().chars().count();
+                if (col as usize) >= start && (col as usize) < end {
+                    return Some((m.as_str().to_string(), rule.run.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Run a link handler. The matched text is substituted as a SINGLE argv
+    /// element (never through a shell), so pane content can't inject commands.
+    fn run_link(&mut self, run_template: &str, matched: &str) {
+        let argv: Vec<String> = run_template
+            .split_whitespace()
+            .map(|tok| tok.replace("${url}", matched).replace("${match}", matched))
+            .collect();
+        let Some((prog, args)) = argv.split_first() else { return };
+        let _ = std::process::Command::new(prog)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.notify(format!("↗ {matched}"));
     }
 
     /// Run a user command shortcut: open its command in a split or new tab,
@@ -2497,6 +2532,20 @@ impl App {
                         None => {}
                     }
                 } else if let Some(pane) = self.pane_at(col, row) {
+                    // Link handler: a (modified) click on matched text runs its rule.
+                    let link_trigger = match self.cfg.ui.link_click {
+                        LinkClick::Ctrl => ev.modifiers.contains(KeyModifiers::CONTROL),
+                        LinkClick::Shift => ev.modifiers.contains(KeyModifiers::SHIFT),
+                        LinkClick::Plain => true,
+                    };
+                    if link_trigger {
+                        if let Some((p, (r, c))) = self.cell_at(col, row) {
+                            if let Some((matched, run)) = self.link_at(p, r, c) {
+                                self.run_link(&run, &matched);
+                                return;
+                            }
+                        }
+                    }
                     if let Some((s, t)) = self.locate(pane) {
                         self.set_active(s, t, pane).await;
                     }

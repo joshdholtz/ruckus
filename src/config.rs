@@ -393,6 +393,8 @@ pub struct UiConfig {
     /// Drag to select text in a pane and copy it (OSC 52 + local clipboard).
     pub mouse_select: bool,
     pub mac_option_fallback: bool,
+    /// What click fires a link handler: ctrl | shift | plain.
+    pub link_click: LinkClick,
     pub space_row: String,
     pub tab_row: String,
     pub queue_row: String,
@@ -444,6 +446,7 @@ impl Default for UiConfig {
             deck: true,
             mouse_select: true,
             mac_option_fallback: true,
+            link_click: LinkClick::Ctrl,
             space_row: "{icon} {name}".to_string(),
             tab_row: "{icon} {title}".to_string(),
             queue_row: "{icon} {title}".to_string(),
@@ -494,6 +497,23 @@ pub struct CommandBind {
     pub placement: Placement,
 }
 
+/// A link handler (config `[[link]]`): text matching `pattern` becomes clickable
+/// and runs `run` (argv; `${url}` / `${match}` are replaced with the matched
+/// text as a single argument — never shell-interpreted). Plugin-extensible.
+#[derive(Debug, Clone)]
+pub struct LinkRule {
+    pub pattern: regex::Regex,
+    pub run: String,
+}
+
+/// What click opens a link. `Plain` = any click; else a held modifier is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkClick {
+    Ctrl,
+    Shift,
+    Plain,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
@@ -504,6 +524,8 @@ pub struct Config {
     pub prefix_keys: HashMap<Action, Vec<Binding>>,
     /// User-defined key → command shortcuts.
     pub commands: Vec<CommandBind>,
+    /// Link handlers: pattern → command. Defaults to opening URLs.
+    pub links: Vec<LinkRule>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -597,6 +619,7 @@ struct RawUi {
     deck: Option<bool>,
     mouse_select: Option<bool>,
     mac_option_fallback: Option<bool>,
+    link_click: Option<String>,
     space_row: Option<String>,
     tab_row: Option<String>,
     queue_row: Option<String>,
@@ -626,6 +649,12 @@ struct RawBind {
     place: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawLink {
+    pattern: String,
+    run: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     /// Base keymap preset: "tmux" | "alt" | "both".
@@ -635,6 +664,9 @@ struct RawConfig {
     /// Key → run-a-command shortcuts.
     #[serde(default)]
     bind: Vec<RawBind>,
+    /// Link handlers: pattern → command.
+    #[serde(default)]
+    link: Vec<RawLink>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -736,6 +768,21 @@ impl Config {
                 Some(CommandBind { binding, cmd, placement })
             })
             .collect();
+
+        // Link handlers: user rules, or a built-in "open URLs" default.
+        let mut links: Vec<LinkRule> = raw
+            .link
+            .iter()
+            .filter_map(|l| {
+                let pattern = regex::Regex::new(&l.pattern).ok()?;
+                Some(LinkRule { pattern, run: l.run.clone() })
+            })
+            .collect();
+        if links.is_empty() {
+            if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
+                links.push(LinkRule { pattern, run: "open ${url}".to_string() });
+            }
+        }
 
         let mut prefix_keys = HashMap::new();
         for (action, default) in PREFIX_DEFAULTS {
@@ -853,6 +900,11 @@ impl Config {
             deck: raw.ui.deck.unwrap_or(d.deck),
             mouse_select: raw.ui.mouse_select.unwrap_or(d.mouse_select),
             mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(d.mac_option_fallback),
+            link_click: match raw.ui.link_click.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("shift") => LinkClick::Shift,
+                Some("plain") | Some("click") => LinkClick::Plain,
+                _ => LinkClick::Ctrl,
+            },
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
             tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
             queue_row: raw.ui.queue_row.unwrap_or(d.queue_row),
@@ -879,7 +931,7 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keys, prefix, prefix_keys, commands, theme, ui, glyphs, notify }
+        Config { keys, prefix, prefix_keys, commands, links, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -978,7 +1030,20 @@ palette = "alt-p"         # command palette: fuzzy-search every action
 # run = "htop"
 # where = "tab"
 
+# Link handlers: text matching `pattern` (Rust regex) becomes clickable and
+# runs `run` — ${url}/${match} are replaced with the matched text as ONE
+# argument (never shell-interpreted). Defaults to opening URLs if none set.
+# link_click below picks the trigger: ctrl | shift | plain.
+# [[link]]
+# pattern = 'https?://\S+'
+# run = "open ${url}"
+#
+# [[link]]                       # e.g. jump Linear IDs to the browser
+# pattern = '[A-Z]{2,}-[0-9]+'
+# run = "open https://linear.app/issue/${match}"
+
 [ui]
+link_click = "ctrl"          # ctrl | shift | plain — how a click fires a link
 sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
 sidebar_sections = ["needs_you", "spaces"]  # order them, or drop one
@@ -1148,6 +1213,29 @@ run = "nope"
         assert_eq!(cfg.commands[1].placement, Placement::Tab);
         let ev = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
         assert!(cfg.commands[0].binding.matches(&ev));
+    }
+
+    #[test]
+    fn link_rules_default_and_custom() {
+        // No [[link]] → a built-in URL opener, ctrl trigger by default.
+        let cfg = Config::from_toml_str("");
+        assert_eq!(cfg.links.len(), 1);
+        assert!(cfg.links[0].pattern.is_match("see https://example.com/x now"));
+        assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
+        // Custom rules replace the default; link_click is configurable.
+        let cfg = Config::from_toml_str(
+            r#"
+[ui]
+link_click = "plain"
+[[link]]
+pattern = '[A-Z]{2,}-[0-9]+'
+run = "open https://linear.app/issue/${match}"
+"#,
+        );
+        assert_eq!(cfg.links.len(), 1);
+        let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
+        assert_eq!(m.as_str(), "FIS-42");
+        assert_eq!(cfg.ui.link_click, LinkClick::Plain);
     }
 
     #[test]
