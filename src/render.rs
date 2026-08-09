@@ -69,6 +69,27 @@ pub fn screen_to_lines(screen: &vt100::Screen, cursor: bool, dim: bool) -> Vec<L
     lines
 }
 
+/// Encode a mouse-wheel notch as the bytes a mouse-aware app expects, at the
+/// 0-based (col,row) within the pane. Wheel-up is button 64, wheel-down 65.
+pub fn encode_mouse_wheel(
+    up: bool,
+    col0: u16,
+    row0: u16,
+    enc: vt100::MouseProtocolEncoding,
+) -> Vec<u8> {
+    let btn: u16 = if up { 64 } else { 65 };
+    let cx = col0 + 1; // reports are 1-based
+    let cy = row0 + 1;
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{btn};{cx};{cy}M").into_bytes(),
+        // X10 / UTF-8: a printable-offset triplet, capped so it stays one byte.
+        _ => {
+            let b = |v: u16| (32 + v.min(223)) as u8;
+            vec![0x1b, b'[', b'M', (32 + btn) as u8, b(cx), b(cy)]
+        }
+    }
+}
+
 /// Encode a key event as the bytes a terminal would send to the PTY.
 pub fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -129,4 +150,32 @@ pub fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_encodes_sgr_1based() {
+        // wheel-up at content cell (0,0) → button 64 at col 1, row 1, press (M)
+        assert_eq!(
+            encode_mouse_wheel(true, 0, 0, vt100::MouseProtocolEncoding::Sgr),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+        // wheel-down at (col=4,row=2) → button 65 at col 5, row 3
+        assert_eq!(
+            encode_mouse_wheel(false, 4, 2, vt100::MouseProtocolEncoding::Sgr),
+            b"\x1b[<65;5;3M".to_vec()
+        );
+    }
+
+    #[test]
+    fn wheel_encodes_x10_offset() {
+        // X10: ESC [ M, then 32+button, 32+col, 32+row
+        assert_eq!(
+            encode_mouse_wheel(true, 0, 0, vt100::MouseProtocolEncoding::Default),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+    }
 }

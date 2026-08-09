@@ -5,8 +5,8 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -27,7 +27,7 @@ use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
 };
 use crate::protocol::*;
-use crate::render::{encode_key, screen_to_lines};
+use crate::render::{encode_key, encode_mouse_wheel, screen_to_lines};
 
 /// Below this width the footer switches to compact tap-first chips.
 const FOOTER_COMPACT: u16 = 70;
@@ -399,6 +399,9 @@ struct App {
     drag: Option<Drag>,
     select: Option<Sel>,
     selecting: bool,
+    /// When the last selection was copied — flashes the selection green briefly
+    /// as confirmation (toasts are gone), then clears it.
+    copied_at: Option<Instant>,
     hover: Option<(u16, u16)>,
     tick: usize,
     size: (u16, u16),
@@ -415,6 +418,10 @@ struct App {
     drag_target: Option<u64>,
     /// Alt+drag a pane onto another to swap them.
     swap_from: Option<u64>,
+    /// Live sidebar width from dragging its edge; None = use the configured width.
+    sidebar_w: Option<u16>,
+    /// True while dragging the sidebar's edge to resize it.
+    sidebar_resizing: bool,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     /// Triage chips: (action, row, col range).
     action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
@@ -723,7 +730,7 @@ impl App {
         }
         let body = Rect::new(0, top, w, bot.saturating_sub(top));
         let shown = self.sidebar_shown();
-        let sw = if shown { ui.sidebar_width.min(w.saturating_sub(20)) } else { 0 };
+        let sw = if shown { self.sidebar_width().min(w.saturating_sub(20)) } else { 0 };
         let (sidebar, main_x, main_w) = if shown {
             match ui.sidebar_pos {
                 SidebarPos::Left => {
@@ -765,9 +772,16 @@ impl App {
     }
 
     fn toast(&mut self, _msg: impl Into<String>) {
-        // Toasts removed by request — the floating popups were more annoying than
-        // useful. Errors are silent here (see ~/.ruckus/daemon.log); pane/deck
-        // state colors already show what's happening.
+        // Automatic toasts stay silent — the unsolicited popups (errors,
+        // reconnecting, activity) were more annoying than useful; pane/deck state
+        // colors already show what's happening. User-initiated confirmations go
+        // through `notify` instead (see `copy_selection`).
+    }
+
+    /// A popup for something the user just did on purpose (e.g. copy) — worth an
+    /// explicit confirmation, unlike the automatic toasts above.
+    fn notify(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
     }
 
     /// The content sub-rect of a pane rect (inside title bar + padding).
@@ -831,8 +845,14 @@ impl App {
             return;
         }
         let n = text.chars().count();
+        let lines = text.lines().count().max(1);
         copy_to_clipboard(&text);
-        self.toast(format!("copied {n} chars"));
+        self.copied_at = Some(Instant::now()); // flash the selection green
+        self.notify(if lines > 1 {
+            format!("✓ copied {n} chars · {lines} lines")
+        } else {
+            format!("✓ copied {n} chars")
+        });
     }
 
     fn pane_size(&self, rect: Rect) -> (u16, u16) {
@@ -943,8 +963,41 @@ impl App {
         }
     }
 
+    /// Sidebar width in cells — the live dragged width if any, else configured.
+    fn sidebar_width(&self) -> u16 {
+        self.sidebar_w.unwrap_or(self.cfg.ui.sidebar_width)
+    }
+
+    /// Resize the sidebar so its edge follows the cursor column, then refit panes.
+    async fn resize_sidebar(&mut self, col: u16) {
+        let w = self.size.0;
+        let new = match self.cfg.ui.sidebar_pos {
+            SidebarPos::Left => col,
+            SidebarPos::Right => w.saturating_sub(col),
+        };
+        let new = new.clamp(12, w.saturating_sub(24).max(12));
+        if self.sidebar_w != Some(new) {
+            self.sidebar_w = Some(new);
+            self.sync().await; // panes refit to the new main area
+        }
+    }
+
+    /// Persist the dragged sidebar width to config.toml so it survives relaunch
+    /// (comment-preserving, like `ruckus config`).
+    fn persist_sidebar_width(&self) {
+        let Some(w) = self.sidebar_w else { return };
+        let path = crate::config::ensure_config_file();
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else { return };
+        if !doc.contains_key("ui") {
+            doc["ui"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["ui"]["sidebar_width"] = toml_edit::value(w as i64);
+        let _ = std::fs::write(&path, doc.to_string());
+    }
+
     fn drawer_width(&self) -> u16 {
-        self.cfg.ui.sidebar_width.min(self.size.0.saturating_sub(4))
+        self.sidebar_width().min(self.size.0.saturating_sub(4))
     }
 
     fn drawer_rect(&self) -> Rect {
@@ -1038,8 +1091,19 @@ impl App {
         s.tabs.iter().any(|t| self.tab_unread(t))
     }
 
+    /// The cwd to seed a new pane with: the reference pane's working directory
+    /// (so a split/new tab opens where you already are), else ruckus's launch dir.
+    fn seed_cwd(&self, from: u64) -> String {
+        self.snap
+            .pane(from)
+            .map(|p| p.cwd.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
     async fn split_action(&mut self, pane: u64, dir: Dir) {
-        let req = Request::Split { pane, dir, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
+        let cwd = Some(self.seed_cwd(pane));
+        let req = Request::Split { pane, dir, cmd: Vec::new(), cwd };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -1049,8 +1113,8 @@ impl App {
 
     async fn new_tab_action(&mut self, name: Option<String>) {
         let Some(space) = self.active_space().map(|s| s.id) else { return };
-        let req =
-            Request::NewTab { space, name, cmd: Vec::new(), cwd: Some(self.cwd.clone()) };
+        let cwd = Some(self.seed_cwd(self.focused));
+        let req = Request::NewTab { space, name, cmd: Vec::new(), cwd };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -1059,7 +1123,7 @@ impl App {
     }
 
     async fn new_space_action(&mut self, name: Option<String>) {
-        let req = Request::NewSpace { name, cwd: Some(self.cwd.clone()) };
+        let req = Request::NewSpace { name, cwd: Some(self.seed_cwd(self.focused)) };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -2055,7 +2119,9 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.hover = Some((col, row));
-                if self.drag.is_some() {
+                if self.sidebar_resizing {
+                    self.resize_sidebar(col).await;
+                } else if self.drag.is_some() {
                     self.apply_drag(col, row);
                 } else if let Some(tab) = self.tab_drag {
                     // Reorder: move the dragged tab into the slot under the cursor.
@@ -2112,6 +2178,10 @@ impl App {
                 self.tab_drag = None;
                 self.space_drag = None;
                 self.drag_target = None;
+                if self.sidebar_resizing {
+                    self.sidebar_resizing = false;
+                    self.persist_sidebar_width(); // remember the new width next launch
+                }
                 if let Some(from) = self.swap_from.take() {
                     if let Some(to) = self.pane_at(col, row) {
                         if to != from {
@@ -2223,6 +2293,18 @@ impl App {
                 if alt {
                     if let Some(pane) = self.pane_at(col, row) {
                         self.swap_from = Some(pane);
+                        return;
+                    }
+                }
+                // Grab the sidebar's edge to resize it (the two columns straddling
+                // the sidebar/main boundary).
+                if let Some(sb) = self.frame.sidebar {
+                    let div = match self.cfg.ui.sidebar_pos {
+                        SidebarPos::Left => sb.x + sb.width,
+                        SidebarPos::Right => sb.x,
+                    };
+                    if row >= sb.y && row < sb.y + sb.height && (col == div || col + 1 == div) {
+                        self.sidebar_resizing = true;
                         return;
                     }
                 }
@@ -2398,17 +2480,63 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp => {
-                if let Some(pane) = self.pane_at(col, row) {
-                    self.scroll_by(pane, 3);
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if let Some(pane) = self.pane_at(col, row) {
-                    self.scroll_by(pane, -3);
-                }
-            }
+            MouseEventKind::ScrollUp => self.pane_wheel(col, row, true).await,
+            MouseEventKind::ScrollDown => self.pane_wheel(col, row, false).await,
             _ => {}
+        }
+    }
+
+    /// Route a wheel notch over a pane. If the app inside enabled mouse tracking
+    /// (claude, vim, htop…) forward the event so *it* scrolls; if it's just on
+    /// the alternate screen (a pager) translate the wheel to arrow keys; only a
+    /// plain shell falls through to ruckus's own scrollback.
+    async fn pane_wheel(&mut self, col: u16, row: u16, up: bool) {
+        // Content-relative cell; falls back to raw scrollback off the content area.
+        let Some((pane, (crow, ccol))) = self.cell_at(col, row) else {
+            if let Some(pane) = self.pane_at(col, row) {
+                self.scroll_by(pane, if up { 3 } else { -3 });
+            }
+            return;
+        };
+        let (mode, enc, altscreen, appcursor) = match self.views.get(&pane) {
+            Some(v) => {
+                let s = v.parser.screen();
+                (
+                    s.mouse_protocol_mode(),
+                    s.mouse_protocol_encoding(),
+                    s.alternate_screen(),
+                    s.application_cursor(),
+                )
+            }
+            None => (
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+                false,
+                false,
+            ),
+        };
+        let bytes = if mode != vt100::MouseProtocolMode::None {
+            Some(encode_mouse_wheel(up, ccol, crow, enc))
+        } else if altscreen {
+            // Alternate-scroll: most terminals send arrow keys here.
+            let seq: &[u8] = match (up, appcursor) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            Some(seq.repeat(3))
+        } else {
+            None
+        };
+        match bytes {
+            Some(bytes) => {
+                let req = Request::Input { pane, data: B64.encode(&bytes) };
+                if let Err(e) = self.client.request(req).await {
+                    self.toast(e.to_string());
+                }
+            }
+            None => self.scroll_by(pane, if up { 3 } else { -3 }),
         }
     }
 
@@ -2494,8 +2622,48 @@ impl App {
         match ev {
             Event::Key(k) => self.on_key(k).await,
             Event::Mouse(m) => self.on_mouse(m).await,
+            Event::Paste(text) => self.on_paste(text).await,
             Event::Resize(_, _) => self.sync().await,
             _ => {}
+        }
+    }
+
+    /// Forward a clipboard paste to the focused pane. If the app enabled
+    /// bracketed paste (shells, claude, editors) we wrap it in the 200~/201~
+    /// markers so multi-line text lands as literal text instead of running each
+    /// line. Newlines go on the wire as CR (what Enter sends).
+    async fn on_paste(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        // Overlays that take text input get the paste as typed characters.
+        if let Some(p) = self.palette.as_mut() {
+            p.query.push_str(&text.replace(['\r', '\n'], ""));
+            p.sel = 0;
+            return;
+        }
+        if let Some(p) = self.prompt.as_mut() {
+            p.buffer.push_str(&text.replace(['\r', '\n'], " "));
+            return;
+        }
+        let pane = self.focused;
+        let bracketed = self
+            .views
+            .get(&pane)
+            .map(|v| v.parser.screen().bracketed_paste())
+            .unwrap_or(false);
+        let body = text.replace("\r\n", "\r").replace('\n', "\r");
+        let mut data = Vec::new();
+        if bracketed {
+            data.extend_from_slice(b"\x1b[200~");
+        }
+        data.extend_from_slice(body.as_bytes());
+        if bracketed {
+            data.extend_from_slice(b"\x1b[201~");
+        }
+        let req = Request::Input { pane, data: B64.encode(&data) };
+        if let Err(e) = self.client.request(req).await {
+            self.toast(e.to_string());
         }
     }
 
@@ -2507,6 +2675,13 @@ impl App {
             }
         }
         self.flash.retain(|_, t| t.elapsed().as_millis() < FLASH_MS);
+        // Clear the copied selection once its green flash has run.
+        if let Some(t) = self.copied_at {
+            if t.elapsed().as_millis() >= 1000 {
+                self.copied_at = None;
+                self.select = None;
+            }
+        }
     }
 
     fn spin(&self) -> String {
@@ -4073,7 +4248,9 @@ impl App {
             return;
         }
         let ((sr, sc), (er, ec)) = sel.ordered();
-        let bg = self.cfg.theme.select_bg;
+        // Flash green briefly right after a copy, else the normal selection tint.
+        let copied = self.copied_at.map(|t| t.elapsed().as_millis() < 1000).unwrap_or(false);
+        let bg = if copied { self.cfg.theme.done_ok } else { self.cfg.theme.select_bg };
         let last_row = c.height.saturating_sub(1);
         let last_col = c.width.saturating_sub(1);
         let buf = f.buffer_mut();
@@ -4421,6 +4598,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         drag: None,
         select: None,
         selecting: false,
+        copied_at: None,
         hover: None,
         tick: 0,
         size: crossterm::terminal::size().unwrap_or((80, 24)),
@@ -4433,6 +4611,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         space_drag: None,
         drag_target: None,
         swap_from: None,
+        sidebar_w: None,
+        sidebar_resizing: false,
         footer_hits: Vec::new(),
         action_hits: Vec::new(),
         pane_rects: Vec::new(),
@@ -4452,10 +4632,17 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     }
 
     enable_raw_mode()?;
+    // Bracketed paste lets us receive a paste as one Event::Paste and forward it
+    // wrapped, so multi-line pastes go in as text instead of executing line by line.
     if mouse {
-        crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
     } else {
-        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     }
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -4528,7 +4715,12 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     }
 
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
