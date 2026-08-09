@@ -21,7 +21,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
 use crate::config::{
-    normalize_key, Action, BarPos, Config, FooterMode, SidebarPos, ToastPos, WorkingStyle,
+    normalize_key, Action, BarPos, CommandBind, Config, FooterMode, Placement, SidebarPos,
+    ToastPos, WorkingStyle,
 };
 use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
@@ -1101,6 +1102,29 @@ impl App {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// Run a user command shortcut: open its command in a split or new tab,
+    /// seeded with the focused pane's cwd.
+    async fn run_command_bind(&mut self, cb: CommandBind) {
+        let cwd = Some(self.seed_cwd(self.focused));
+        let req = match cb.placement {
+            Placement::SplitRight => {
+                Request::Split { pane: self.focused, dir: Dir::Right, cmd: cb.cmd, cwd }
+            }
+            Placement::SplitDown => {
+                Request::Split { pane: self.focused, dir: Dir::Down, cmd: cb.cmd, cwd }
+            }
+            Placement::Tab => {
+                let Some(space) = self.active_space().map(|s| s.id) else { return };
+                Request::NewTab { space, name: None, cmd: cb.cmd, cwd }
+            }
+        };
+        match self.client.request(req).await {
+            Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
+            Err(e) => self.toast(e.to_string()),
+            _ => {}
+        }
+    }
+
     async fn split_action(&mut self, pane: u64, dir: Dir) {
         let cwd = Some(self.seed_cwd(pane));
         let req = Request::Split { pane, dir, cmd: Vec::new(), cwd };
@@ -1893,6 +1917,11 @@ impl App {
                 }
                 return;
             }
+        }
+        // User command shortcuts win over built-in actions on the same key.
+        if let Some(cb) = self.cfg.commands.iter().find(|c| c.binding.matches(&ev)).cloned() {
+            self.run_command_bind(cb).await;
+            return;
         }
         if let Some(a) = self.cfg.action_for(&ev) {
             self.do_action(a).await;

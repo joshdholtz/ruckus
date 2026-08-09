@@ -477,6 +477,23 @@ pub enum Keymap {
     Both,
 }
 
+/// Where a command shortcut opens its pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    SplitRight,
+    SplitDown,
+    Tab,
+}
+
+/// A user-defined key → run-a-command shortcut (config `[[bind]]`). The first
+/// step toward plugin-defined command bindings.
+#[derive(Debug, Clone)]
+pub struct CommandBind {
+    pub binding: Binding,
+    pub cmd: Vec<String>,
+    pub placement: Placement,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
@@ -485,6 +502,8 @@ pub struct Config {
     pub prefix: Option<Binding>,
     /// Command keys used after the prefix (bare keys, tmux-style: c, %, ", …).
     pub prefix_keys: HashMap<Action, Vec<Binding>>,
+    /// User-defined key → command shortcuts.
+    pub commands: Vec<CommandBind>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -599,12 +618,23 @@ struct RawNotify {
     events: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawBind {
+    key: String,
+    run: String,
+    #[serde(rename = "where")]
+    place: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     /// Base keymap preset: "tmux" | "alt" | "both".
     keymap: Option<String>,
     #[serde(default)]
     keys: HashMap<String, KeySpec>,
+    /// Key → run-a-command shortcuts.
+    #[serde(default)]
+    bind: Vec<RawBind>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -688,6 +718,25 @@ impl Config {
             None if keymap == Keymap::Alt => None,
             None => parse_binding("ctrl-b").ok(),
         };
+        // User command shortcuts: key → run a command in a split/tab.
+        let commands: Vec<CommandBind> = raw
+            .bind
+            .iter()
+            .filter_map(|b| {
+                let binding = parse_binding(&b.key).ok()?;
+                let cmd: Vec<String> = b.run.split_whitespace().map(String::from).collect();
+                if cmd.is_empty() {
+                    return None;
+                }
+                let placement = match b.place.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                    Some("down") | Some("split-down") | Some("v") => Placement::SplitDown,
+                    Some("tab") | Some("window") => Placement::Tab,
+                    _ => Placement::SplitRight,
+                };
+                Some(CommandBind { binding, cmd, placement })
+            })
+            .collect();
+
         let mut prefix_keys = HashMap::new();
         for (action, default) in PREFIX_DEFAULTS {
             let name = ACTIONS.iter().find(|(a, _, _)| a == action).map(|(_, n, _)| *n);
@@ -830,7 +879,7 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keys, prefix, prefix_keys, theme, ui, glyphs, notify }
+        Config { keys, prefix, prefix_keys, commands, theme, ui, glyphs, notify }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -916,6 +965,18 @@ search = "alt-f"          # search the focused pane's scrollback (n/N to cycle)
 palette = "alt-p"         # command palette: fuzzy-search every action
 
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
+
+# Command shortcuts: bind a key to open a pane running a command.
+# where = "right" (split →, default) | "down" (split ↓) | "tab" (new tab)
+# [[bind]]
+# key = "alt-g"
+# run = "lazygit"
+# where = "right"
+#
+# [[bind]]
+# key = "alt-e"
+# run = "htop"
+# where = "tab"
 
 [ui]
 sidebar = "left"            # left | right | off (off = hidden until toggled)
@@ -1060,6 +1121,33 @@ system = false
         assert_eq!(cfg.action_for(&ev), Some(Action::Quit));
         let ev = KeyEvent::new(KeyCode::Char('√'), KeyModifiers::NONE);
         assert_eq!(cfg.action_for(&ev), Some(Action::SplitRight));
+    }
+
+    #[test]
+    fn command_shortcuts_parse() {
+        let cfg = Config::from_toml_str(
+            r#"
+[[bind]]
+key = "alt-g"
+run = "lazygit --help"
+where = "right"
+
+[[bind]]
+key = "alt-e"
+run = "htop"
+where = "tab"
+
+[[bind]]
+key = "bogus-key"
+run = "nope"
+"#,
+        );
+        assert_eq!(cfg.commands.len(), 2); // the bogus binding is dropped
+        assert_eq!(cfg.commands[0].cmd, vec!["lazygit", "--help"]);
+        assert_eq!(cfg.commands[0].placement, Placement::SplitRight);
+        assert_eq!(cfg.commands[1].placement, Placement::Tab);
+        let ev = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
+        assert!(cfg.commands[0].binding.matches(&ev));
     }
 
     #[test]
