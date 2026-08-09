@@ -3416,104 +3416,81 @@ impl App {
         self.deck_hits.clear();
         f.render_widget(Paragraph::new("").style(Style::default().bg(th.bg)), area);
 
-        // Header: ☰ ruckus … tappable attention summary (jumps to first waiting).
+        let inset = 2u16;
+        let cx = area.x + inset;
+        let cw = area.width.saturating_sub(inset * 2);
+        let bgstyle = Style::default().bg(th.bg);
+
+        // ---- Title row: ☰  ruckus … ● N needs you ----
         let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
         let (sumtxt, sumcol) = if waiting > 0 {
-            (format!(" ● {waiting} needs you "), th.waiting)
+            (format!("● {waiting} needs you"), th.waiting)
         } else {
-            (" 🐏 all quiet ".to_string(), th.status_fg)
+            ("all quiet".to_string(), th.status_fg)
         };
-        // Big 2-row ☰ menu button (opens the command palette).
-        let bw = 6u16;
-        let bstyle = Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("  ☰  ", bstyle))).style(bstyle),
-            Rect::new(area.x, area.y, bw, 1),
-        );
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(" menu ", bstyle))).style(bstyle),
-            Rect::new(area.x, area.y + 1, bw, 1),
-        );
-        self.deck_hits.push((Rect::new(area.x, area.y, bw, 2), DeckHit::Menu));
-
-        let hx = area.x + bw; // header content starts right of the button
-        let hw = area.width.saturating_sub(bw);
-        let left = " ruckus";
-        let sumw = sumtxt.chars().count() as u16;
-        let pad = (hw as usize).saturating_sub(left.chars().count() + sumw as usize);
-        let header = Line::from(vec![
-            Span::styled(left, Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(sumtxt, Style::default().fg(sumcol).add_modifier(Modifier::BOLD)),
+        let used = 3 + "ruckus".len() + sumtxt.chars().count();
+        let tpad = (cw as usize).saturating_sub(used);
+        let title = Line::from(vec![
+            Span::styled("☰  ", Style::default().fg(th.accent).bg(th.bg)),
+            Span::styled("ruckus", Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(" ".repeat(tpad), bgstyle),
+            Span::styled(sumtxt.clone(), Style::default().fg(sumcol).bg(th.bg).add_modifier(Modifier::BOLD)),
         ]);
-        f.render_widget(
-            Paragraph::new(header).style(Style::default().bg(th.bar_bg)),
-            Rect::new(hx, area.y, hw, 1),
-        );
+        f.render_widget(Paragraph::new(title).style(bgstyle), Rect::new(cx, area.y, cw, 1));
+        self.deck_hits.push((Rect::new(area.x, area.y, inset + 4, 1), DeckHit::Menu));
         if waiting > 0 {
-            self.deck_hits
-                .push((Rect::new(area.x + area.width - sumw, area.y, sumw, 1), DeckHit::Jump));
+            let sw = sumtxt.chars().count() as u16;
+            self.deck_hits.push((Rect::new(cx + cw.saturating_sub(sw), area.y, sw, 1), DeckHit::Jump));
         }
 
-        // Space chips (row 2, right of the button).
+        // ---- Space selector (row 2) ----
         let spaces = self.snap.spaces.clone();
-        let mut spans = vec![Span::raw(" ")];
-        let mut x = hx + 1;
+        let mut spans: Vec<Span> = Vec::new();
+        let mut x = cx;
         for s in &spaces {
             let active = s.id == self.snap.active_space;
-            let label = format!(" {} ", s.name);
-            let w = label.chars().count() as u16;
+            let w = s.name.chars().count() as u16;
             let style = if active {
-                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD)
+                Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().bg(th.select_bg).fg(th.bar_fg)
+                Style::default().fg(th.status_fg).bg(th.bg)
             };
-            spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
-            self.deck_hits.push((Rect::new(x, area.y + 1, w, 1), DeckHit::Space(s.id)));
-            x += w + 1;
+            spans.push(Span::styled(s.name.clone(), style));
+            spans.push(Span::styled("    ", bgstyle));
+            self.deck_hits.push((Rect::new(x, area.y + 2, w, 1), DeckHit::Space(s.id)));
+            x += w + 4;
         }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
-            Rect::new(hx, area.y + 1, hw, 1),
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).style(bgstyle), Rect::new(cx, area.y + 2, cw, 1));
 
-        // Two-row create buttons pinned to the bottom.
+        // ---- Bottom create buttons (2 rows, inset) ----
         let brow = area.y + area.height - 2;
-        let bw = (area.width.saturating_sub(3)) / 2;
-        let make_btn = |x: u16, label: &str, hit: DeckHit, hits: &mut Vec<(Rect, DeckHit)>| -> Vec<(Rect, Line<'static>)> {
-            let r = Rect::new(x, brow, bw, 2);
-            hits.push((r, hit));
-            let lpad = (bw as usize).saturating_sub(label.chars().count()) / 2;
-            let text = format!("{}{}", " ".repeat(lpad), label);
-            let style = Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD);
-            vec![
-                (Rect::new(x, brow, bw, 1), Line::from(Span::styled(text, style))),
-                (Rect::new(x, brow + 1, bw, 1), Line::from(Span::styled(" ".repeat(bw as usize), style))),
-            ]
-        };
-        for (r, line) in make_btn(area.x + 1, "+ tab", DeckHit::NewTab, &mut self.deck_hits) {
-            f.render_widget(Paragraph::new(line).style(Style::default().bg(th.select_bg)), r);
-        }
-        for (r, line) in make_btn(area.x + 2 + bw, "+ space", DeckHit::NewSpace, &mut self.deck_hits) {
-            f.render_widget(Paragraph::new(line).style(Style::default().bg(th.select_bg)), r);
+        let gap = 2u16;
+        let bw = cw.saturating_sub(gap) / 2;
+        let bstyle = Style::default().bg(th.surface).fg(th.accent).add_modifier(Modifier::BOLD);
+        for (bx, lbl, hit) in [(cx, "+ tab", DeckHit::NewTab), (cx + bw + gap, "+ space", DeckHit::NewSpace)] {
+            let lpad = (bw as usize).saturating_sub(lbl.chars().count()) / 2;
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("{}{}", " ".repeat(lpad), lbl), bstyle))).style(bstyle),
+                Rect::new(bx, brow, bw, 1),
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(" ".repeat(bw as usize), bstyle))).style(bstyle),
+                Rect::new(bx, brow + 1, bw, 1),
+            );
+            self.deck_hits.push((Rect::new(bx, brow, bw, 2), hit));
         }
 
-        // Cards — STABLE tab order (matches the tab strip / sidebar), so nothing
-        // jumps around as states change. Smart height: one compact line per card,
-        // plus a second preview line ONLY when it needs you (waiting/done).
+        // ---- Cards: floating inset surface blocks, smart height ----
         let Some(sp) = self.active_space() else { return };
         let sp_id = sp.id;
         let tabs = sp.tabs.clone();
-        let list_top = area.y + 2;
+        let list_top = area.y + 4;
         let hint_row = brow.saturating_sub(1);
-        let list_bottom = hint_row.saturating_sub(1); // leave a row for the scroll hint
-        // Clamp scroll loosely: min card is 1 line + 1 gutter.
+        let list_bottom = hint_row.saturating_sub(1);
         let region = (list_bottom + 1).saturating_sub(list_top);
         let capacity_loose = (region / 2).max(1) as usize;
         self.deck_scroll = self.deck_scroll.min(tabs.len().saturating_sub(capacity_loose));
         let start = self.deck_scroll;
-        let w = area.width.saturating_sub(2);
 
         let mut y = list_top;
         let mut shown = 0usize;
@@ -3532,63 +3509,42 @@ impl App {
                 Activity::Idle => ("idle", th.idle),
             };
             let pane = self.snap.pane(t.active_pane);
-            let cwd = pane.map(pane_loc).unwrap_or_default();
+            let loc = pane.map(pane_loc).unwrap_or_default();
             let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
-            let mut leaves = Vec::new();
-            t.layout.leaves(&mut leaves);
-            let extra = if leaves.len() > 1 { format!(" ·{}", leaves.len()) } else { String::new() };
-            let name = format!("{}{extra}", t.name);
-
-            // Line 1 (select_bg): ▎ glyph name  cwd(dim, fills middle)  STATE Ns(right).
-            let lead_w = 1 + 1 + g.chars().count() + 1; // ▎ + space + glyph + space
-            let name_w = name.chars().count();
             let el = self.elapsed_label(t.active_pane);
-            let label_s = if el.is_empty() {
-                format!("{label} ")
-            } else {
-                format!("{label} {el} ")
-            };
-            let label_w = label_s.chars().count();
-            let room = (w as usize).saturating_sub(lead_w + name_w + label_w + 4);
-            let cwd_disp = if cwd.is_empty() || room < 3 {
-                String::new()
-            } else {
-                format!("  {}", cwd.chars().take(room).collect::<String>())
-            };
-            let used = lead_w + name_w + cwd_disp.chars().count() + label_w;
-            let pad = (w as usize).saturating_sub(used);
-            let sb = Style::default().bg(th.select_bg);
-            let title = Line::from(vec![
+            let statelbl = if el.is_empty() { label.to_string() } else { format!("{label} {el}") };
+
+            let sb = Style::default().bg(th.surface);
+            let name = t.name.clone();
+            let lead_w = 4usize; // ▎ + " g "
+            let name_w = name.chars().count();
+            let right = format!("{statelbl} ");
+            let right_w = right.chars().count();
+            let room = (cw as usize).saturating_sub(lead_w + name_w + right_w + 4);
+            let loc_disp = if loc.is_empty() || room < 3 { String::new() } else { format!("  {}", loc.chars().take(room).collect::<String>()) };
+            let pad = (cw as usize).saturating_sub(lead_w + name_w + loc_disp.chars().count() + right_w);
+            let line1 = Line::from(vec![
                 Span::styled("▎", sb.fg(color)),
                 Span::styled(format!(" {g} "), sb.fg(color)),
                 Span::styled(name, sb.fg(th.bar_active_fg).add_modifier(Modifier::BOLD)),
-                Span::styled(cwd_disp, sb.fg(th.status_fg)),
+                Span::styled(loc_disp, sb.fg(th.status_fg)),
                 Span::styled(" ".repeat(pad), sb),
-                Span::styled(label_s, sb.fg(lcol).add_modifier(Modifier::BOLD)),
+                Span::styled(right, sb.fg(lcol).add_modifier(Modifier::BOLD)),
             ]);
-            f.render_widget(
-                Paragraph::new(title).style(sb),
-                Rect::new(area.x + 1, y, w, 1),
-            );
-            // Line 2 (surface): the preview — only for cards that need you.
+            f.render_widget(Paragraph::new(line1).style(sb), Rect::new(cx, y, cw, 1));
             if has_preview {
-                let body: String =
-                    format!("   › {preview}").chars().take(w as usize).collect();
+                let body: String = format!("      {preview}").chars().take(cw as usize).collect();
                 f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(body, Style::default().fg(th.bar_fg))))
-                        .style(Style::default().bg(th.surface)),
-                    Rect::new(area.x + 1, y + 1, w, 1),
+                    Paragraph::new(Line::from(Span::styled(body, Style::default().fg(th.bar_fg)))).style(sb),
+                    Rect::new(cx, y + 1, cw, 1),
                 );
             }
-            self.deck_hits.push((
-                Rect::new(area.x + 1, y, w, rows),
-                DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane },
-            ));
-            y += rows + 1; // + gutter
+            self.deck_hits.push((Rect::new(cx, y, cw, rows), DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane }));
+            y += rows + 1;
             shown += 1;
         }
 
-        // Scroll hint (tappable): ▲ above / ▼ N more below.
+        // ---- Scroll hint ----
         let below = tabs.len().saturating_sub(start + shown);
         let mut hint: Vec<Span> = Vec::new();
         if start > 0 {
@@ -3596,20 +3552,13 @@ impl App {
             hint.push(Span::styled("  ▲ more", Style::default().fg(th.accent)));
         }
         if below > 0 {
-            self.deck_hits.push((
-                Rect::new(area.x + area.width / 2, hint_row, area.width / 2, 1),
-                DeckHit::ScrollDown,
-            ));
-            let pad = (area.width as usize)
-                .saturating_sub(hint.iter().map(|s| s.content.chars().count()).sum::<usize>() + format!("▼ {below} more  ").chars().count());
+            self.deck_hits.push((Rect::new(area.x + area.width / 2, hint_row, area.width / 2, 1), DeckHit::ScrollDown));
+            let pad = (area.width as usize).saturating_sub(hint.iter().map(|s| s.content.chars().count()).sum::<usize>() + format!("▼ {below} more  ").chars().count());
             hint.push(Span::raw(" ".repeat(pad)));
             hint.push(Span::styled(format!("▼ {below} more  "), Style::default().fg(th.accent)));
         }
         if !hint.is_empty() {
-            f.render_widget(
-                Paragraph::new(Line::from(hint)).style(Style::default().bg(th.bg)),
-                Rect::new(area.x, hint_row, area.width, 1),
-            );
+            f.render_widget(Paragraph::new(Line::from(hint)).style(bgstyle), Rect::new(area.x, hint_row, area.width, 1));
         }
     }
 
