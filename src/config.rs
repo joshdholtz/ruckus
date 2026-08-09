@@ -486,6 +486,8 @@ pub enum Placement {
     SplitRight,
     SplitDown,
     Tab,
+    /// A floating popup (display-popup style) that closes when the command exits.
+    Popup,
 }
 
 /// A user-defined key → run-a-command shortcut (config `[[bind]]`). The first
@@ -763,6 +765,7 @@ impl Config {
                 let placement = match b.place.as_deref().map(|s| s.to_lowercase()).as_deref() {
                     Some("down") | Some("split-down") | Some("v") => Placement::SplitDown,
                     Some("tab") | Some("window") => Placement::Tab,
+                    Some("popup") | Some("float") => Placement::Popup,
                     _ => Placement::SplitRight,
                 };
                 Some(CommandBind { binding, cmd, placement })
@@ -1019,11 +1022,12 @@ palette = "alt-p"         # command palette: fuzzy-search every action
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
 
 # Command shortcuts: bind a key to open a pane running a command.
-# where = "right" (split →, default) | "down" (split ↓) | "tab" (new tab)
+# where = "right" (split →, default) | "down" (split ↓) | "tab" | "popup"
+# ("popup" = a floating window that closes when the command exits; ⌃q force-closes)
 # [[bind]]
 # key = "alt-g"
 # run = "lazygit"
-# where = "right"
+# where = "popup"
 #
 # [[bind]]
 # key = "alt-e"
@@ -1203,14 +1207,20 @@ run = "htop"
 where = "tab"
 
 [[bind]]
+key = "alt-l"
+run = "lazygit"
+where = "popup"
+
+[[bind]]
 key = "bogus-key"
 run = "nope"
 "#,
         );
-        assert_eq!(cfg.commands.len(), 2); // the bogus binding is dropped
+        assert_eq!(cfg.commands.len(), 3); // the bogus binding is dropped
         assert_eq!(cfg.commands[0].cmd, vec!["lazygit", "--help"]);
         assert_eq!(cfg.commands[0].placement, Placement::SplitRight);
         assert_eq!(cfg.commands[1].placement, Placement::Tab);
+        assert_eq!(cfg.commands[2].placement, Placement::Popup);
         let ev = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
         assert!(cfg.commands[0].binding.matches(&ev));
     }

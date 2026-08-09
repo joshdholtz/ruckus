@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
 use crate::config::{
@@ -153,6 +153,69 @@ struct PaneView {
     scroll: usize,
     rows: u16,
     cols: u16,
+}
+
+/// A client-local floating command (display-popup style): its own PTY, rendered
+/// as a centered overlay that captures all keys until the command exits.
+struct Popup {
+    parser: vt100::Parser,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    title: String,
+    rows: u16,
+    cols: u16,
+}
+
+/// Spawn a command in a fresh PTY, streaming its output to `tx`. Ephemeral —
+/// unlike daemon panes, a popup dies with the client.
+fn spawn_popup(
+    cmd: Vec<String>,
+    cwd: String,
+    rows: u16,
+    cols: u16,
+    tx: UnboundedSender<Vec<u8>>,
+) -> anyhow::Result<Popup> {
+    use anyhow::anyhow;
+    use std::io::Read;
+    let cmdline = if cmd.is_empty() { vec![crate::protocol::default_shell()] } else { cmd };
+    let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let mut builder = portable_pty::CommandBuilder::new(&cmdline[0]);
+    builder.args(&cmdline[1..]);
+    builder.env("TERM", "xterm-256color");
+    builder.cwd(&cwd);
+    let child = pair.slave.spawn_command(builder).map_err(|e| anyhow!("spawn: {e}"))?;
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(Vec::new()); // EOF sentinel → close the popup
+    });
+    Ok(Popup {
+        parser: vt100::Parser::new(rows, cols, 0),
+        master: pair.master,
+        writer,
+        child,
+        title: cmdline.join(" "),
+        rows,
+        cols,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -423,6 +486,10 @@ struct App {
     sidebar_w: Option<u16>,
     /// True while dragging the sidebar's edge to resize it.
     sidebar_resizing: bool,
+    /// A floating command popup (display-popup style), if one is open.
+    popup: Option<Popup>,
+    /// Channel a popup's reader thread pushes output to.
+    popup_tx: UnboundedSender<Vec<u8>>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     /// Triage chips: (action, row, col range).
     action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
@@ -1140,6 +1207,10 @@ impl App {
     /// Run a user command shortcut: open its command in a split or new tab,
     /// seeded with the focused pane's cwd.
     async fn run_command_bind(&mut self, cb: CommandBind) {
+        if cb.placement == Placement::Popup {
+            self.open_popup(cb.cmd);
+            return;
+        }
         let cwd = Some(self.seed_cwd(self.focused));
         let req = match cb.placement {
             Placement::SplitRight => {
@@ -1152,11 +1223,42 @@ impl App {
                 let Some(space) = self.active_space().map(|s| s.id) else { return };
                 Request::NewTab { space, name: None, cmd: cb.cmd, cwd }
             }
+            Placement::Popup => return, // handled above
         };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
+        }
+    }
+
+    /// Centered ~5/6-screen rect for a floating popup.
+    fn popup_rect(&self) -> Rect {
+        let (w0, h0) = self.size;
+        let w = ((w0 as u32 * 5 / 6) as u16).clamp(20, w0);
+        let h = ((h0 as u32 * 5 / 6) as u16).clamp(6, h0);
+        Rect::new(w0.saturating_sub(w) / 2, h0.saturating_sub(h) / 2, w, h)
+    }
+
+    /// Open a command in a floating popup (one at a time).
+    fn open_popup(&mut self, cmd: Vec<String>) {
+        if self.popup.is_some() {
+            return;
+        }
+        let r = self.popup_rect();
+        let cols = r.width.saturating_sub(2).max(1);
+        let rows = r.height.saturating_sub(2).max(1);
+        let cwd = self.seed_cwd(self.focused);
+        match spawn_popup(cmd, cwd, rows, cols, self.popup_tx.clone()) {
+            Ok(p) => self.popup = Some(p),
+            Err(e) => self.notify(format!("popup failed: {e}")),
+        }
+    }
+
+    fn close_popup(&mut self) {
+        if let Some(mut p) = self.popup.take() {
+            let _ = p.child.kill();
+            let _ = p.child.wait();
         }
     }
 
@@ -1773,6 +1875,22 @@ impl App {
         }
         let ev = normalize_key(&ev, self.cfg.ui.mac_option_fallback);
 
+        // A floating popup owns all input while open; ctrl-q force-closes it.
+        if self.popup.is_some() {
+            if ev.code == KeyCode::Char('q') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+                self.close_popup();
+                return;
+            }
+            if let Some(bytes) = encode_key(&ev) {
+                if let Some(p) = self.popup.as_mut() {
+                    use std::io::Write;
+                    let _ = p.writer.write_all(&bytes);
+                    let _ = p.writer.flush();
+                }
+            }
+            return;
+        }
+
         // Deck view: keyboard selection cursor (vim + arrows) plus action bindings.
         if self.deck_active() && self.palette.is_none() && self.prompt.is_none() {
             let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
@@ -2089,6 +2207,10 @@ impl App {
     async fn on_mouse(&mut self, ev: MouseEvent) {
         let (col, row) = (ev.column, ev.row);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
+        // A popup owns the screen — ignore mouse on the panes behind it.
+        if self.popup.is_some() {
+            return;
+        }
         // Palette overlay owns the mouse while open: wheel moves the cursor, a
         // click on a row selects and activates it (jump / run / enter a space).
         if self.palette.is_some() {
@@ -2759,6 +2881,15 @@ impl App {
                 self.copied_at = None;
                 self.select = None;
             }
+        }
+        // Reap a popup whose command has exited.
+        let popup_dead = self
+            .popup
+            .as_mut()
+            .map(|p| matches!(p.child.try_wait(), Ok(Some(_))))
+            .unwrap_or(false);
+        if popup_dead {
+            self.close_popup();
         }
     }
 
@@ -4506,6 +4637,58 @@ impl App {
         );
     }
 
+    /// Draw the floating command popup on top of everything.
+    fn draw_popup(&mut self, f: &mut Frame) {
+        if self.popup.is_none() {
+            return;
+        }
+        let th = self.cfg.theme.clone();
+        let r = self.popup_rect();
+        f.render_widget(Clear, r);
+        let cols = r.width.saturating_sub(2).max(1);
+        let rows = r.height.saturating_sub(2).max(1);
+        // Keep the PTY sized to the overlay.
+        let title = {
+            let p = self.popup.as_mut().unwrap();
+            if p.cols != cols || p.rows != rows {
+                let _ = p.master.resize(portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+                p.parser.set_size(rows, cols);
+                p.rows = rows;
+                p.cols = cols;
+            }
+            p.title.clone()
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.surface))
+            .title(Line::from(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                " ⌃q close ",
+                Style::default().fg(th.status_fg),
+            )));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let p = self.popup.as_ref().unwrap();
+        let screen = p.parser.screen();
+        let lines = screen_to_lines(screen, true, false);
+        f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.surface)), inner);
+        if !screen.hide_cursor() {
+            let (crow, ccol) = screen.cursor_position();
+            let cx = inner.x + ccol.min(inner.width.saturating_sub(1));
+            let cy = inner.y + crow.min(inner.height.saturating_sub(1));
+            f.set_cursor_position((cx, cy));
+        }
+    }
+
     fn draw_toast(&self, f: &mut Frame) {
         let Some((msg, at)) = &self.toast else { return };
         let th = &self.cfg.theme;
@@ -4556,6 +4739,7 @@ impl App {
             self.draw_palette(f);
             self.draw_prompt(f);
             self.draw_toast(f);
+            self.draw_popup(f);
             return;
         }
 
@@ -4622,6 +4806,7 @@ impl App {
         self.draw_prompt(f);
         self.draw_prefix_indicator(f);
         self.draw_toast(f);
+        self.draw_popup(f);
     }
 }
 
@@ -4644,6 +4829,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     let deck_default = cfg.ui.deck;
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
+    let (popup_tx, mut popup_rx) = unbounded_channel::<Vec<u8>>();
     let mut app = App {
         cfg,
         client,
@@ -4691,6 +4877,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         swap_from: None,
         sidebar_w: None,
         sidebar_resizing: false,
+        popup: None,
+        popup_tx,
         footer_hits: Vec::new(),
         action_hits: Vec::new(),
         pane_rects: Vec::new(),
@@ -4781,8 +4969,24 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                     }
                 }
             },
+            bytes = popup_rx.recv() => match bytes {
+                Some(b) if b.is_empty() => app.close_popup(),   // reader EOF
+                Some(b) => {
+                    if let Some(p) = app.popup.as_mut() {
+                        p.parser.process(&b);
+                    }
+                }
+                None => {}
+            },
             _ = ticker.tick() => app.on_tick(),
             _ = status_ticker.tick() => app.refresh_status_cmds().await,
+        }
+        while let Ok(b) = popup_rx.try_recv() {
+            if b.is_empty() {
+                app.close_popup();
+            } else if let Some(p) = app.popup.as_mut() {
+                p.parser.process(&b);
+            }
         }
         while let Ok(e) = in_rx.try_recv() {
             app.on_term_event(e).await;
