@@ -55,26 +55,28 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
     (Action::Quit, "quit (daemon keeps running)"),
 ];
 
-/// Subsequence fuzzy score, or None if `q` isn't a subsequence of `cand`.
-/// Rewards early and contiguous matches so the best candidate ranks first.
-fn fuzzy_score(cand: &str, q: &str) -> Option<i32> {
+/// Subsequence fuzzy match: a score (rewards early + contiguous matches) plus
+/// the char indices in `cand` that matched, for highlighting. `None` if `q`
+/// isn't a subsequence of `cand`.
+fn fuzzy_indices(cand: &str, q: &str) -> Option<(i32, Vec<usize>)> {
     if q.is_empty() {
-        return Some(0);
+        return Some((0, Vec::new()));
     }
-    let cb = cand.as_bytes();
-    let qb = q.as_bytes();
+    let cand: Vec<char> = cand.chars().collect();
     let mut ci = 0usize;
     let mut score = 0i32;
     let mut prev: Option<usize> = None;
-    for &qc in qb {
+    let mut hits = Vec::new();
+    for qc in q.chars() {
         let mut matched = false;
-        while ci < cb.len() {
-            if cb[ci].eq_ignore_ascii_case(&qc) {
+        while ci < cand.len() {
+            if cand[ci].eq_ignore_ascii_case(&qc) {
                 score += if prev == Some(ci.wrapping_sub(1)) { 3 } else { 1 };
                 if ci == 0 {
                     score += 2;
                 }
                 prev = Some(ci);
+                hits.push(ci);
                 ci += 1;
                 matched = true;
                 break;
@@ -85,7 +87,52 @@ fn fuzzy_score(cand: &str, q: &str) -> Option<i32> {
             return None;
         }
     }
-    Some(score)
+    Some((score, hits))
+}
+
+/// Split `label` into styled spans, accenting the matched (`hl`) chars.
+fn hl_spans(
+    label: &str,
+    hl: &[usize],
+    base: Style,
+    normal_fg: Color,
+    match_fg: Color,
+    bold: bool,
+) -> Vec<Span<'static>> {
+    let hlset: HashSet<usize> = hl.iter().copied().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_match = false;
+    let flush = |spans: &mut Vec<Span<'static>>, text: &mut String, is_match: bool| {
+        if text.is_empty() {
+            return;
+        }
+        let mut st = base.fg(if is_match { match_fg } else { normal_fg });
+        if bold || is_match {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(std::mem::take(text), st));
+    };
+    for (i, ch) in label.chars().enumerate() {
+        let m = hlset.contains(&i);
+        if !cur.is_empty() && m != cur_match {
+            flush(&mut spans, &mut cur, cur_match);
+        }
+        cur.push(ch);
+        cur_match = m;
+    }
+    flush(&mut spans, &mut cur, cur_match);
+    spans
+}
+
+/// A pane's display name: its title, else its command, else a fallback.
+fn pane_name(p: Option<&PaneInfo>) -> String {
+    match p {
+        Some(p) if !p.title.is_empty() => p.title.clone(),
+        Some(p) if !p.cmd.is_empty() => p.cmd.join(" "),
+        Some(p) => format!("pane {}", p.id),
+        None => "pane".to_string(),
+    }
 }
 
 /// Linear blend between two colors (RGB only; non-RGB returns `b`).
@@ -114,19 +161,65 @@ enum Target {
     Pane(u64),
 }
 
-/// A row in the command palette: either an action to run, or a space/tab to
-/// jump straight into.
+/// The command palette is a choose-tree navigator: an indented Space → Tab →
+/// Pane tree you fuzzy-filter and jump into. Typing `>` switches to a flat
+/// command list. Navigation is arrows / Ctrl-n·p (typed keys feed the filter).
 #[derive(Clone)]
-enum PaletteItem {
-    Action(Action, &'static str),
-    Jump {
-        space: u64,
-        tab: u64,
-        pane: u64,
-        label: String,
-        act: Activity,
-        is_space: bool,
-    },
+struct Palette {
+    query: String,
+    /// Selected index into the current visible rows.
+    sel: usize,
+    /// Scroll offset (top visible row).
+    scroll: usize,
+    /// Space/tab ids whose children are folded away. Defaults collapse every
+    /// space but the active one, and every tab (panes hidden until expanded).
+    collapsed: HashSet<u64>,
+}
+
+impl Palette {
+    fn new(snap: &Snapshot) -> Palette {
+        let mut collapsed = HashSet::new();
+        for s in &snap.spaces {
+            if s.id != snap.active_space {
+                collapsed.insert(s.id);
+            }
+            for t in &s.tabs {
+                collapsed.insert(t.id);
+            }
+        }
+        Palette { query: String::new(), sel: 0, scroll: 0, collapsed }
+    }
+    /// `>`-prefixed query means the flat command list, not the tree.
+    fn is_commands(&self) -> bool {
+        self.query.starts_with('>')
+    }
+    /// The active filter text (without the `>` mode prefix), lowercased.
+    fn filter(&self) -> String {
+        self.query.strip_prefix('>').unwrap_or(&self.query).trim().to_lowercase()
+    }
+}
+
+/// What a visible palette row targets.
+#[derive(Clone, Copy)]
+enum PKind {
+    Space(u64),
+    Jump { space: u64, tab: u64, pane: u64 },
+    Cmd(Action),
+}
+
+/// A rendered palette row, rebuilt from the snapshot + query each frame.
+struct PRow {
+    kind: PKind,
+    depth: u8,
+    glyph: (String, Color),
+    label: String,
+    meta: String,
+    /// Char indices in `label` that matched the query (for highlighting).
+    hl: Vec<usize>,
+    expandable: bool,
+    expanded: bool,
+    /// Shown only as context for a matching descendant/ancestor — render muted.
+    dim: bool,
 }
 
 
@@ -291,8 +384,10 @@ struct App {
     prompt: Option<Prompt>,
     /// Active scrollback search query (focused pane); drives n/N and highlight.
     search: Option<String>,
-    /// Command palette: fuzzy query + selected row index.
-    palette: Option<(String, usize)>,
+    /// Command palette / choose-tree navigator.
+    palette: Option<Palette>,
+    /// Clickable palette rows: (rect, visible-row index).
+    palette_hits: Vec<(Rect, usize)>,
     /// Touch-first deck view (big cards) — the mobile home screen. Gated by narrow().
     deck: bool,
     deck_scroll: usize,
@@ -1203,7 +1298,7 @@ impl App {
                 self.sync().await;
             }
             Action::Search => self.open_prompt(PromptKind::Search),
-            Action::Palette => self.palette = Some((String::new(), 0)),
+            Action::Palette => self.open_palette(),
             Action::Deck => {
                 self.deck = !self.deck;
                 if self.deck {
@@ -1214,77 +1309,227 @@ impl App {
         }
     }
 
-    /// Everything the palette can match: every space, every tab (as jump
-    /// targets), then the actions. Each paired with the lowercase string to
-    /// fuzzy-match against. Insertion order also sets tie-break priority —
-    /// jumps rank above actions when scores are equal (e.g. an empty query).
-    fn palette_candidates(&self) -> Vec<(String, PaletteItem)> {
-        let mut v: Vec<(String, PaletteItem)> = Vec::new();
-        for s in &self.snap.spaces {
-            let (tab, pane) = s
-                .tabs
-                .iter()
-                .find(|t| t.id == s.active_tab)
-                .or_else(|| s.tabs.first())
-                .map(|t| (t.id, t.active_pane))
-                .unwrap_or((s.active_tab, 0));
-            v.push((
-                format!("space {}", s.name).to_lowercase(),
-                PaletteItem::Jump {
-                    space: s.id,
-                    tab,
-                    pane,
-                    label: s.name.clone(),
-                    act: space_activity(&self.snap, s),
-                    is_space: true,
-                },
-            ));
-            for t in &s.tabs {
-                v.push((
-                    format!("{} {}", s.name, t.name).to_lowercase(),
-                    PaletteItem::Jump {
-                        space: s.id,
-                        tab: t.id,
-                        pane: t.active_pane,
-                        label: format!("{} › {}", s.name, t.name),
-                        act: tab_activity(&self.snap, t),
-                        is_space: false,
+    fn open_palette(&mut self) {
+        self.palette = Some(Palette::new(&self.snap));
+    }
+
+    /// Build the visible palette rows for the current query + fold state.
+    fn palette_rows(&self) -> Vec<PRow> {
+        let Some(pal) = &self.palette else { return Vec::new() };
+        if pal.is_commands() {
+            return self.palette_command_rows(&pal.filter());
+        }
+        self.palette_tree_rows(&pal.filter(), &pal.collapsed)
+    }
+
+    /// Flat command list (the `>` mode), fuzzy-ranked with match highlights.
+    fn palette_command_rows(&self, q: &str) -> Vec<PRow> {
+        let mut scored: Vec<(i32, usize, PRow)> = Vec::new();
+        for (i, (a, d)) in PALETTE_ITEMS.iter().enumerate() {
+            if let Some((score, hl)) = fuzzy_indices(d, q) {
+                scored.push((
+                    score,
+                    i,
+                    PRow {
+                        kind: PKind::Cmd(*a),
+                        depth: 0,
+                        glyph: (String::new(), self.cfg.theme.accent),
+                        label: d.to_string(),
+                        meta: self.cfg.hint(*a),
+                        hl,
+                        expandable: false,
+                        expanded: false,
+                        dim: false,
                     },
                 ));
             }
         }
-        for (a, d) in PALETTE_ITEMS {
-            v.push((d.to_lowercase(), PaletteItem::Action(*a, d)));
-        }
-        v
+        scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        scored.into_iter().map(|(_, _, r)| r).collect()
     }
 
-    /// Palette rows matching the current query, best match first.
-    fn palette_filtered(&self) -> Vec<PaletteItem> {
-        let q = self.palette.as_ref().map(|(q, _)| q.to_lowercase()).unwrap_or_default();
-        let mut scored: Vec<(i32, usize, PaletteItem)> = self
-            .palette_candidates()
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, (search, item))| fuzzy_score(&search, &q).map(|s| (s, i, item)))
-            .collect();
-        // Higher score first; original order breaks ties (jumps before actions).
-        scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
-        scored.into_iter().map(|(_, _, it)| it).collect()
+    /// The Space → Tab → Pane tree, filtered by `q` and folded per `collapsed`.
+    /// Panes appear only under split tabs. While filtering we force-expand along
+    /// matches and dim rows shown purely as context.
+    fn palette_tree_rows(&self, q: &str, collapsed: &HashSet<u64>) -> Vec<PRow> {
+        let filtering = !q.is_empty();
+        let mut rows = Vec::new();
+        for s in &self.snap.spaces {
+            let space_hl = fuzzy_indices(&s.name, q);
+            let space_match = space_hl.is_some();
+            // Resolve each tab's match + its (split-only) pane matches up front so
+            // we can decide the space's visibility before emitting its row.
+            struct TabRow {
+                idx: usize,
+                hl: Option<Vec<usize>>,
+                panes: Vec<(u64, String, Option<Vec<usize>>)>, // (pane id, name, match)
+            }
+            let mut tabs: Vec<TabRow> = Vec::new();
+            for (ti, t) in s.tabs.iter().enumerate() {
+                let hl = fuzzy_indices(&t.name, q).map(|(_, h)| h);
+                let mut leaves = Vec::new();
+                t.layout.leaves(&mut leaves);
+                let split = leaves.len() > 1;
+                let panes = if split {
+                    leaves
+                        .iter()
+                        .map(|pid| {
+                            let name = pane_name(self.snap.pane(*pid));
+                            let m = fuzzy_indices(&name, q).map(|(_, h)| h);
+                            (*pid, name, m)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                tabs.push(TabRow { idx: ti, hl, panes });
+            }
+            let any_tab_match = tabs.iter().any(|t| t.hl.is_some());
+            let any_pane_match = tabs.iter().any(|t| t.panes.iter().any(|(_, _, m)| m.is_some()));
+            let space_in = !filtering || space_match || any_tab_match || any_pane_match;
+            if !space_in {
+                continue;
+            }
+            let n = s.tabs.len();
+            let waiting = s
+                .tabs
+                .iter()
+                .filter(|t| tab_activity(&self.snap, t) == Activity::Waiting)
+                .count();
+            let meta = if waiting > 0 {
+                format!("{n} tabs · ◉{waiting}")
+            } else {
+                format!("{n} tab{}", if n == 1 { "" } else { "s" })
+            };
+            let space_expanded =
+                if filtering { true } else { !collapsed.contains(&s.id) };
+            rows.push(PRow {
+                kind: PKind::Space(s.id),
+                depth: 0,
+                glyph: self.static_glyph(space_activity(&self.snap, s)),
+                label: s.name.clone(),
+                meta,
+                hl: space_hl.as_ref().map(|(_, h)| h.clone()).unwrap_or_default(),
+                expandable: n > 0,
+                expanded: space_expanded,
+                dim: filtering && space_hl.as_ref().map(|(_, h)| h.is_empty()).unwrap_or(true),
+            });
+            if !space_expanded {
+                continue;
+            }
+            for tr in &tabs {
+                let t = &s.tabs[tr.idx];
+                let tab_match = tr.hl.is_some();
+                let pane_match = tr.panes.iter().any(|(_, _, m)| m.is_some());
+                let tab_in = !filtering || space_match || tab_match || pane_match;
+                if !tab_in {
+                    continue;
+                }
+                let tact = tab_activity(&self.snap, t);
+                let loc = self.snap.pane(t.active_pane).map(pane_loc).unwrap_or_default();
+                let el = self.elapsed_label(t.active_pane);
+                let meta = [el, loc].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("  ");
+                let split = !tr.panes.is_empty();
+                let tab_expanded = if filtering { pane_match } else { !collapsed.contains(&t.id) };
+                rows.push(PRow {
+                    kind: PKind::Jump { space: s.id, tab: t.id, pane: t.active_pane },
+                    depth: 1,
+                    glyph: self.static_glyph(tact),
+                    label: t.name.clone(),
+                    meta,
+                    hl: tr.hl.clone().unwrap_or_default(),
+                    expandable: split,
+                    expanded: tab_expanded,
+                    dim: filtering && !tab_match,
+                });
+                if !split || !tab_expanded {
+                    continue;
+                }
+                for (pid, name, m) in &tr.panes {
+                    let pane_in = !filtering || space_match || tab_match || m.is_some();
+                    if !pane_in {
+                        continue;
+                    }
+                    let p = self.snap.pane(*pid);
+                    rows.push(PRow {
+                        kind: PKind::Jump { space: s.id, tab: t.id, pane: *pid },
+                        depth: 2,
+                        glyph: self.glyph(p),
+                        label: name.clone(),
+                        meta: p.map(pane_loc).unwrap_or_default(),
+                        hl: m.clone().unwrap_or_default(),
+                        expandable: false,
+                        expanded: false,
+                        dim: filtering && m.is_none(),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Collapse (`collapse=true`) or expand the selected tree row; when there's
+    /// nothing to fold, move to the parent / first child instead.
+    fn palette_fold(&mut self, collapse: bool) {
+        let rows = self.palette_rows();
+        let Some(pal) = self.palette.as_mut() else { return };
+        let Some(row) = rows.get(pal.sel) else { return };
+        let id = match row.kind {
+            PKind::Space(id) => Some(id),
+            PKind::Jump { tab, .. } if row.expandable => Some(tab),
+            _ => None,
+        };
+        if collapse {
+            if row.expandable && row.expanded {
+                if let Some(id) = id {
+                    pal.collapsed.insert(id);
+                }
+            } else if row.depth > 0 {
+                for i in (0..pal.sel).rev() {
+                    if rows[i].depth < row.depth {
+                        pal.sel = i;
+                        break;
+                    }
+                }
+            }
+        } else if row.expandable && !row.expanded {
+            if let Some(id) = id {
+                pal.collapsed.remove(&id);
+            }
+        } else if row.expandable && row.expanded && pal.sel + 1 < rows.len() {
+            pal.sel += 1;
+        }
     }
 
     async fn palette_run(&mut self) {
-        let items = self.palette_filtered();
-        let sel = self.palette.as_ref().map(|(_, s)| *s).unwrap_or(0);
+        let rows = self.palette_rows();
+        let sel = self.palette.as_ref().map(|p| p.sel).unwrap_or(0);
+        let kind = rows.get(sel).map(|r| r.kind);
         self.palette = None;
-        match items.into_iter().nth(sel) {
-            Some(PaletteItem::Action(action, _)) => self.do_action(action).await,
-            Some(PaletteItem::Jump { space, tab, pane, .. }) => {
-                self.set_active(space, tab, pane).await;
-                self.deck = false; // if we jumped from the deck, enter the pane
-                self.sync().await;
+        let jump = match kind {
+            Some(PKind::Cmd(a)) => {
+                self.do_action(a).await;
+                return;
             }
-            None => {}
+            Some(PKind::Space(id)) => self
+                .snap
+                .spaces
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| {
+                    s.tabs
+                        .iter()
+                        .find(|t| t.id == s.active_tab)
+                        .or_else(|| s.tabs.first())
+                        .map(|t| (s.id, t.id, t.active_pane))
+                }),
+            Some(PKind::Jump { space, tab, pane }) => Some((space, tab, pane)),
+            None => None,
+        };
+        if let Some((space, tab, pane)) = jump {
+            self.set_active(space, tab, pane).await;
+            self.deck = false; // if we jumped from the deck, enter the pane
+            self.sync().await;
         }
     }
 
@@ -1435,32 +1680,40 @@ impl App {
             return;
         }
 
-        // Command palette: a fuzzy action launcher that swallows keys while open.
+        // Command palette / choose-tree. It's a live filter, so typed keys feed
+        // the query — navigation is on the arrows (and Ctrl-n/p), fold on ←/→.
         if self.palette.is_some() {
-            let len = self.palette_filtered().len();
+            let len = self.palette_rows().len();
+            let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            let up = |p: &mut Palette| p.sel = p.sel.saturating_sub(1);
+            let down = |p: &mut Palette| p.sel = (p.sel + 1).min(len.saturating_sub(1));
             match ev.code {
                 KeyCode::Esc => self.palette = None,
                 KeyCode::Enter => self.palette_run().await,
                 KeyCode::Up | KeyCode::BackTab => {
-                    if let Some((_, sel)) = self.palette.as_mut() {
-                        *sel = sel.saturating_sub(1);
-                    }
+                    self.palette.as_mut().map(up);
                 }
                 KeyCode::Down | KeyCode::Tab => {
-                    if let Some((_, sel)) = self.palette.as_mut() {
-                        *sel = (*sel + 1).min(len.saturating_sub(1));
-                    }
+                    self.palette.as_mut().map(down);
                 }
+                KeyCode::Char('p') if ctrl => {
+                    self.palette.as_mut().map(up);
+                }
+                KeyCode::Char('n') if ctrl => {
+                    self.palette.as_mut().map(down);
+                }
+                KeyCode::Left => self.palette_fold(true),
+                KeyCode::Right => self.palette_fold(false),
                 KeyCode::Backspace => {
-                    if let Some((q, sel)) = self.palette.as_mut() {
-                        q.pop();
-                        *sel = 0;
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.pop();
+                        p.sel = 0;
                     }
                 }
-                KeyCode::Char(c) if !ev.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((q, sel)) = self.palette.as_mut() {
-                        q.push(c);
-                        *sel = 0;
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.push(c);
+                        p.sel = 0;
                     }
                 }
                 _ => {}
@@ -1708,6 +1961,40 @@ impl App {
     async fn on_mouse(&mut self, ev: MouseEvent) {
         let (col, row) = (ev.column, ev.row);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
+        // Palette overlay owns the mouse while open: wheel moves the cursor, a
+        // click on a row selects and activates it (jump / run / enter a space).
+        if self.palette.is_some() {
+            match ev.kind {
+                MouseEventKind::Moved => self.hover = Some((col, row)),
+                MouseEventKind::ScrollDown => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.sel = p.sel.saturating_add(3);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.sel = p.sel.saturating_sub(3);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let hit = self
+                        .palette_hits
+                        .iter()
+                        .find(|(r, _)| {
+                            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+                        })
+                        .map(|(_, i)| *i);
+                    if let Some(idx) = hit {
+                        if let Some(p) = self.palette.as_mut() {
+                            p.sel = idx;
+                        }
+                        self.palette_run().await;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         // Deck view has its own tap/scroll model.
         if self.deck_active() {
             match ev.kind {
@@ -1754,7 +2041,7 @@ impl App {
                         Some(DeckHit::ScrollDown) => {
                             self.deck_scroll = self.deck_scroll.saturating_add(3)
                         }
-                        Some(DeckHit::Menu) => self.palette = Some((String::new(), 0)),
+                        Some(DeckHit::Menu) => self.open_palette(),
                         None => {}
                     }
                 }
@@ -3270,81 +3557,149 @@ impl App {
         }
     }
 
-    fn draw_palette(&self, f: &mut Frame) {
-        let Some((query, sel)) = &self.palette else { return };
-        let th = &self.cfg.theme;
-        let items = self.palette_filtered();
-        let w: u16 = 54.min(self.size.0.saturating_sub(4));
-        let rows = items.len().min(10) as u16;
-        let h = rows + 4; // border + input + blank
+    fn draw_palette(&mut self, f: &mut Frame) {
+        if self.palette.is_none() {
+            self.palette_hits.clear();
+            return;
+        }
+        let th = self.cfg.theme.clone();
+        let rows = self.palette_rows();
+        let (query, commands) = {
+            let p = self.palette.as_ref().unwrap();
+            (p.query.clone(), p.is_commands())
+        };
+
+        // Large centered overlay.
+        let w = self.size.0.saturating_sub(4).min(100);
+        let h = ((self.size.1 as u32 * 4 / 5) as u16).max(8).min(self.size.1.saturating_sub(2));
         let x = self.size.0.saturating_sub(w) / 2;
-        let y = (self.size.1.saturating_sub(h) / 3).max(1);
-        let r = Rect::new(x, y, w, h.min(self.size.1));
+        let y = self.size.1.saturating_sub(h) / 2;
+        let r = Rect::new(x, y, w, h);
         f.render_widget(Clear, r);
+        let title = if commands { " run command " } else { " go to " };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(th.accent))
             .style(Style::default().bg(th.sidebar_bg))
             .title(Line::from(Span::styled(
-                " go to / run ",
+                title,
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             )));
         let inner = block.inner(r);
         f.render_widget(block, r);
+        if inner.height < 3 || inner.width < 8 {
+            self.palette_hits.clear();
+            return;
+        }
 
-        let mut lines: Vec<Line> = Vec::new();
-        let cursor = if (self.tick / 4) % 2 == 0 { "▏" } else { " " };
-        lines.push(Line::from(vec![
-            Span::styled(" › ", Style::default().fg(th.accent)),
-            Span::styled(query.clone(), Style::default().fg(th.bar_active_fg)),
-            Span::styled(cursor.to_string(), Style::default().fg(th.accent)),
-        ]));
-        lines.push(Line::raw(""));
-        let iw = inner.width as usize;
-        for (i, item) in items.iter().enumerate().take(10) {
-            let selected = i == *sel;
-            let base = if selected {
-                Style::default().bg(th.select_bg)
-            } else {
-                Style::default()
-            };
-            let marker = if selected { "❯ " } else { "  " };
-            let name_fg = if selected { th.bar_active_fg } else { th.bar_fg };
-            let mut spans = vec![Span::styled(
-                marker.to_string(),
-                base.fg(th.accent).add_modifier(Modifier::BOLD),
-            )];
-            match item {
-                PaletteItem::Action(action, desc) => {
-                    let key = self.cfg.hint(*action);
-                    let pad = iw.saturating_sub(2 + desc.chars().count() + key.chars().count() + 1);
-                    spans.push(Span::styled(desc.to_string(), base.fg(name_fg)));
-                    spans.push(Span::styled(" ".repeat(pad), base));
-                    spans.push(Span::styled(format!("{key} "), base.fg(th.status_fg)));
-                }
-                PaletteItem::Jump { label, act, is_space, .. } => {
-                    let (g, gcol) = self.state_glyph(*act);
-                    let tag = if *is_space { "space" } else { "jump" };
-                    let used = 2 + g.chars().count() + 1 + label.chars().count() + tag.chars().count() + 1;
-                    let pad = iw.saturating_sub(used);
-                    spans.push(Span::styled(format!("{g} "), base.fg(gcol)));
-                    spans.push(Span::styled(
-                        label.clone(),
-                        base.fg(name_fg).add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(" ".repeat(pad), base));
-                    spans.push(Span::styled(format!("{tag} "), base.fg(th.status_fg)));
-                }
+        // Inner layout: row 0 = query, row 1 = blank, [list…], last row = hint.
+        let list_top = inner.y + 2;
+        let hint_row = inner.y + inner.height - 1;
+        let cap = hint_row.saturating_sub(list_top) as usize;
+
+        // Keep the selection in view.
+        let len = rows.len();
+        let (sel, scroll) = {
+            let p = self.palette.as_mut().unwrap();
+            if p.sel >= len {
+                p.sel = len.saturating_sub(1);
             }
-            lines.push(Line::from(spans));
+            if p.sel < p.scroll {
+                p.scroll = p.sel;
+            } else if cap > 0 && p.sel >= p.scroll + cap {
+                p.scroll = p.sel + 1 - cap;
+            }
+            p.scroll = if len > cap { p.scroll.min(len - cap) } else { 0 };
+            (p.sel, p.scroll)
+        };
+
+        let iw = inner.width as usize;
+        let bg = Style::default().bg(th.sidebar_bg);
+
+        // Query line.
+        let cursor = if (self.tick / 4) % 2 == 0 { "▏" } else { " " };
+        let mut qspans = vec![Span::styled(" › ", bg.fg(th.accent))];
+        if commands {
+            qspans.push(Span::styled("> ", bg.fg(th.accent).add_modifier(Modifier::BOLD)));
         }
-        if items.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  no match",
-                Style::default().fg(th.status_fg),
-            )));
+        let shown_q = if commands {
+            query.strip_prefix('>').unwrap_or(&query).to_string()
+        } else {
+            query.clone()
+        };
+        qspans.push(Span::styled(shown_q, bg.fg(th.bar_active_fg)));
+        qspans.push(Span::styled(cursor.to_string(), bg.fg(th.accent)));
+        f.render_widget(Paragraph::new(Line::from(qspans)).style(bg), Rect::new(inner.x, inner.y, inner.width, 1));
+
+        // Rows.
+        let mut hits = Vec::new();
+        let mut yy = list_top;
+        for (i, row) in rows.iter().enumerate().skip(scroll).take(cap) {
+            let selected = i == sel;
+            let base = if selected { Style::default().bg(th.select_bg) } else { bg };
+            let marker = if selected { "❯" } else { " " };
+            let indent = "  ".repeat(row.depth as usize);
+            let twisty = if row.expandable {
+                if row.expanded { "▾" } else { "▸" }
+            } else {
+                " "
+            };
+            let (g, gcol) = &row.glyph;
+            let glyph_part = if g.is_empty() { String::new() } else { format!("{g} ") };
+            let name_fg = if row.dim {
+                th.status_fg
+            } else if selected {
+                th.bar_active_fg
+            } else {
+                th.bar_fg
+            };
+            let mut spans = vec![
+                Span::styled(format!("{marker} "), base.fg(th.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(indent.clone(), base),
+                Span::styled(format!("{twisty} "), base.fg(th.status_fg)),
+            ];
+            if !glyph_part.is_empty() {
+                spans.push(Span::styled(glyph_part.clone(), base.fg(*gcol)));
+            }
+            spans.extend(hl_spans(&row.label, &row.hl, base, name_fg, th.accent, !row.dim));
+            let lead =
+                2 + indent.chars().count() + 2 + glyph_part.chars().count() + row.label.chars().count();
+            let mw = row.meta.chars().count();
+            let pad = iw.saturating_sub(lead + mw + 1);
+            spans.push(Span::styled(" ".repeat(pad), base));
+            spans.push(Span::styled(format!("{} ", row.meta), base.fg(th.status_fg)));
+            f.render_widget(Paragraph::new(Line::from(spans)).style(base), Rect::new(inner.x, yy, inner.width, 1));
+            hits.push((Rect::new(inner.x, yy, inner.width, 1), i));
+            yy += 1;
         }
-        f.render_widget(Paragraph::new(lines), inner);
+        self.palette_hits = hits;
+
+        if rows.is_empty() {
+            let msg = if commands { "  no command" } else { "  no match" };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(msg, bg.fg(th.status_fg)))).style(bg),
+                Rect::new(inner.x, list_top, inner.width, 1),
+            );
+        }
+
+        // Footer: key hints + scroll arrows.
+        let nav = if commands {
+            "↵ run   ↑↓ move   ⌫ back to tree   esc"
+        } else {
+            "↵ jump   ←/→ fold   ↑↓ move   > commands   esc"
+        };
+        let arrows = format!(
+            "{}{}",
+            if scroll > 0 { "▲" } else { " " },
+            if scroll + cap < len { "▼" } else { " " }
+        );
+        let hpad = iw.saturating_sub(nav.chars().count() + 1 + arrows.chars().count() + 1);
+        let hint = Line::from(vec![
+            Span::styled(format!(" {nav}"), bg.fg(th.status_fg)),
+            Span::styled(" ".repeat(hpad), bg),
+            Span::styled(format!("{arrows} "), bg.fg(th.accent)),
+        ]);
+        f.render_widget(Paragraph::new(hint).style(bg), Rect::new(inner.x, hint_row, inner.width, 1));
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
@@ -4058,6 +4413,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         prompt: None,
         search: None,
         palette: None,
+        palette_hits: Vec::new(),
         deck: deck_default,
         deck_scroll: 0,
         deck_sel: 0,
@@ -4271,13 +4627,16 @@ mod palette_tests {
 
     #[test]
     fn fuzzy_matches_subsequence_and_ranks() {
-        assert!(fuzzy_score("split pane right", "split").is_some());
-        assert!(fuzzy_score("split pane right", "spr").is_some()); // subsequence
-        assert!(fuzzy_score("split pane right", "xyz").is_none());
+        let score = |c, q| fuzzy_indices(c, q).map(|(s, _)| s);
+        assert!(score("split pane right", "split").is_some());
+        assert!(score("split pane right", "spr").is_some()); // subsequence
+        assert!(score("split pane right", "xyz").is_none());
         // contiguous prefix scores higher than a mid-string match
-        let a = fuzzy_score("split", "sp").unwrap(); // prefix + contiguous
-        let b = fuzzy_score("crispy plum", "sp").unwrap(); // contiguous, mid-string
+        let a = score("split", "sp").unwrap(); // prefix + contiguous
+        let b = score("crispy plum", "sp").unwrap(); // contiguous, mid-string
         assert!(a > b, "prefix {a} should beat mid-string {b}");
-        assert_eq!(fuzzy_score("anything", ""), Some(0));
+        assert_eq!(score("anything", ""), Some(0));
+        // the matched char indices come back for highlighting
+        assert_eq!(fuzzy_indices("split", "sp").unwrap().1, vec![0, 1]);
     }
 }
