@@ -282,6 +282,9 @@ struct App {
     /// Touch-first deck view (big cards) — the mobile home screen. Gated by narrow().
     deck: bool,
     deck_scroll: usize,
+    /// Keyboard selection cursor over the deck's focusable items: 0..n = cards,
+    /// then the +tab and +space buttons. Touch taps sync it too.
+    deck_sel: usize,
     /// Tap regions in the deck: (rect, what it does).
     deck_hits: Vec<(Rect, DeckHit)>,
     drag: Option<Drag>,
@@ -494,6 +497,54 @@ impl App {
     /// when the deck is the home to return to (☰ goes back).
     fn mobile_focus(&self) -> bool {
         self.cfg.ui.deck && self.narrow() && !self.deck
+    }
+
+    /// Point the deck cursor at the active tab's card (when returning to the deck).
+    fn sync_deck_sel(&mut self) {
+        if let Some(sp) = self.active_space() {
+            if let Some(i) = sp.tabs.iter().position(|t| t.id == sp.active_tab) {
+                self.deck_sel = i;
+            }
+        }
+    }
+
+    /// Move the active space by `dir` (deck h/l) and reset the card cursor.
+    async fn deck_switch_space(&mut self, dir: i32) {
+        if self.snap.spaces.is_empty() {
+            return;
+        }
+        let n = self.snap.spaces.len();
+        let idx = self
+            .snap
+            .spaces
+            .iter()
+            .position(|s| s.id == self.snap.active_space)
+            .unwrap_or(0);
+        let ni = ((idx as i32 + dir).rem_euclid(n as i32)) as usize;
+        let s = self.snap.spaces[ni].clone();
+        if let Some(t) = s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()) {
+            self.deck_sel = 0;
+            self.deck_scroll = 0;
+            self.set_active(s.id, t.id, t.active_pane).await;
+        }
+    }
+
+    /// Activate the deck item at `idx`: a card enters its pane; the trailing two
+    /// indices are the +tab / +space buttons.
+    async fn deck_activate(&mut self, idx: usize) {
+        let Some(sp) = self.active_space() else { return };
+        let ncards = sp.tabs.len();
+        if idx < ncards {
+            let t = &sp.tabs[idx];
+            let (s, tab, pane) = (sp.id, t.id, t.active_pane);
+            self.set_active(s, tab, pane).await;
+            self.deck = false;
+            self.sync().await;
+        } else if idx == ncards {
+            self.open_prompt(PromptKind::NewTab);
+        } else {
+            self.open_prompt(PromptKind::NewSpace);
+        }
     }
 
     fn sidebar_shown(&self) -> bool {
@@ -1115,6 +1166,9 @@ impl App {
             Action::Palette => self.palette = Some((String::new(), 0)),
             Action::Deck => {
                 self.deck = !self.deck;
+                if self.deck {
+                    self.sync_deck_sel();
+                }
                 self.sync().await;
             }
         }
@@ -1268,17 +1322,31 @@ impl App {
             return;
         }
 
-        // Deck view is mouse-first: honor action bindings (alt-d out, palette,
-        // quit, jump-to-waiting…) but swallow raw keys — there's no pane to type into.
+        // Deck view: keyboard selection cursor (vim + arrows) plus action bindings.
         if self.deck_active() && self.palette.is_none() && self.prompt.is_none() {
-            if let Some(a) = self.cfg.action_for(&ev) {
-                self.do_action(a).await;
-            } else if ev.code == KeyCode::Enter {
-                // Enter opens the first attention item fullscreen.
-                if let Some(p) = self.attention().first().map(|p| p.id) {
-                    self.goto_pane(p).await;
-                    self.deck = false;
-                    self.sync().await;
+            let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
+            let nitems = ncards + 2; // + tab, + space
+            let bare = ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT;
+            match ev.code {
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab if bare => {
+                    self.deck_sel = (self.deck_sel + 1).min(nitems.saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab if bare => {
+                    self.deck_sel = self.deck_sel.saturating_sub(1);
+                }
+                KeyCode::Left | KeyCode::Char('h') if bare => {
+                    self.deck_switch_space(-1).await;
+                }
+                KeyCode::Right | KeyCode::Char('l') if bare => {
+                    self.deck_switch_space(1).await;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('o') if bare => {
+                    self.deck_activate(self.deck_sel).await;
+                }
+                _ => {
+                    if let Some(a) = self.cfg.action_for(&ev) {
+                        self.do_action(a).await;
+                    }
                 }
             }
             return;
@@ -1841,6 +1909,7 @@ impl App {
                         if row == h || row == h + 1 {
                             if col < 6 {
                                 self.deck = true;
+                                self.sync_deck_sel();
                                 self.sync().await;
                             } else if row == h + 1 {
                                 if let Some(v) = self.views.get_mut(&self.focused) {
@@ -1857,6 +1926,7 @@ impl App {
                         // On mobile the ☰ is the home button — back to the deck.
                         if self.cfg.ui.deck && self.narrow() {
                             self.deck = true;
+                            self.sync_deck_sel();
                             self.sync().await;
                         } else {
                             self.do_action(Action::ToggleSidebar).await;
@@ -3462,12 +3532,26 @@ impl App {
         }
         f.render_widget(Paragraph::new(Line::from(spans)).style(bgstyle), Rect::new(cx, area.y + 2, cw, 1));
 
-        // ---- Bottom create buttons (2 rows, inset) ----
+        // Selection cursor: 0..ncards = cards, then +tab, +space. Clamp it.
+        let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
+        self.deck_sel = self.deck_sel.min(ncards + 1);
+        let sel = self.deck_sel;
+
+        // ---- Bottom create buttons (2 rows, inset). Focused = filled accent. ----
         let brow = area.y + area.height - 2;
         let gap = 2u16;
         let bw = cw.saturating_sub(gap) / 2;
-        let bstyle = Style::default().bg(th.surface).fg(th.accent).add_modifier(Modifier::BOLD);
-        for (bx, lbl, hit) in [(cx, "+ tab", DeckHit::NewTab), (cx + bw + gap, "+ space", DeckHit::NewSpace)] {
+        for (i, (bx, lbl, hit)) in
+            [(cx, "+ tab", DeckHit::NewTab), (cx + bw + gap, "+ space", DeckHit::NewSpace)]
+                .into_iter()
+                .enumerate()
+        {
+            let focused = sel == ncards + i;
+            let bstyle = if focused {
+                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(th.surface).fg(th.accent).add_modifier(Modifier::BOLD)
+            };
             let lpad = (bw as usize).saturating_sub(lbl.chars().count()) / 2;
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(format!("{}{}", " ".repeat(lpad), lbl), bstyle))).style(bstyle),
@@ -3489,12 +3573,21 @@ impl App {
         let list_bottom = hint_row.saturating_sub(1);
         let region = (list_bottom + 1).saturating_sub(list_top);
         let capacity_loose = (region / 2).max(1) as usize;
+        // Keep the selected card in view (auto-scroll).
+        if sel < ncards {
+            if sel < self.deck_scroll {
+                self.deck_scroll = sel;
+            } else if sel >= self.deck_scroll + capacity_loose {
+                self.deck_scroll = sel + 1 - capacity_loose;
+            }
+        }
         self.deck_scroll = self.deck_scroll.min(tabs.len().saturating_sub(capacity_loose));
         let start = self.deck_scroll;
 
         let mut y = list_top;
         let mut shown = 0usize;
-        for t in tabs.iter().skip(start) {
+        for (ai, t) in tabs.iter().enumerate().skip(start) {
+            let selected = ai == sel;
             let act = tab_activity(&self.snap, t);
             let has_preview = matches!(act, Activity::Waiting | Activity::Done);
             let rows = if has_preview { 2 } else { 1 };
@@ -3514,9 +3607,11 @@ impl App {
             let el = self.elapsed_label(t.active_pane);
             let statelbl = if el.is_empty() { label.to_string() } else { format!("{label} {el}") };
 
-            let sb = Style::default().bg(th.surface);
+            // Selected card: raised bg + accent ❯ marker (the app's "selected" cue).
+            let sb = Style::default().bg(if selected { th.select_bg } else { th.surface });
+            let (marker, mcol) = if selected { ("❯", th.accent) } else { ("▎", color) };
             let name = t.name.clone();
-            let lead_w = 4usize; // ▎ + " g "
+            let lead_w = 4usize; // marker + " g "
             let name_w = name.chars().count();
             let right = format!("{statelbl} ");
             let right_w = right.chars().count();
@@ -3524,7 +3619,7 @@ impl App {
             let loc_disp = if loc.is_empty() || room < 3 { String::new() } else { format!("  {}", loc.chars().take(room).collect::<String>()) };
             let pad = (cw as usize).saturating_sub(lead_w + name_w + loc_disp.chars().count() + right_w);
             let line1 = Line::from(vec![
-                Span::styled("▎", sb.fg(color)),
+                Span::styled(marker, sb.fg(mcol).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" {g} "), sb.fg(color)),
                 Span::styled(name, sb.fg(th.bar_active_fg).add_modifier(Modifier::BOLD)),
                 Span::styled(loc_disp, sb.fg(th.status_fg)),
@@ -3963,6 +4058,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         palette: None,
         deck: deck_default,
         deck_scroll: 0,
+        deck_sel: 0,
         deck_hits: Vec::new(),
         drag: None,
         select: None,
