@@ -3347,26 +3347,30 @@ impl App {
         }
 
         // Cards — STABLE tab order (matches the tab strip / sidebar), so nothing
-        // jumps around as states change. Flat background-layer style to match the
-        // pane view: a filled title band + surface content + a gutter between.
+        // jumps around as states change. Smart height: one compact line per card,
+        // plus a second preview line ONLY when it needs you (waiting/done).
         let Some(sp) = self.active_space() else { return };
         let sp_id = sp.id;
         let tabs = sp.tabs.clone();
-        let card_stride = 3u16; // 2 drawn rows + 1 gutter
         let list_top = area.y + 2;
         let hint_row = brow.saturating_sub(1);
         let list_bottom = hint_row.saturating_sub(1); // leave a row for the scroll hint
-        let capacity = ((list_bottom + 1).saturating_sub(list_top) / card_stride).max(1) as usize;
-        let max_scroll = tabs.len().saturating_sub(capacity);
-        self.deck_scroll = self.deck_scroll.min(max_scroll);
+        // Clamp scroll loosely: min card is 1 line + 1 gutter.
+        let region = (list_bottom + 1).saturating_sub(list_top);
+        let capacity_loose = (region / 2).max(1) as usize;
+        self.deck_scroll = self.deck_scroll.min(tabs.len().saturating_sub(capacity_loose));
         let start = self.deck_scroll;
+        let w = area.width.saturating_sub(2);
 
         let mut y = list_top;
+        let mut shown = 0usize;
         for t in tabs.iter().skip(start) {
-            if y + 1 > list_bottom {
+            let act = tab_activity(&self.snap, t);
+            let has_preview = matches!(act, Activity::Waiting | Activity::Done);
+            let rows = if has_preview { 2 } else { 1 };
+            if y + rows - 1 > list_bottom {
                 break;
             }
-            let act = tab_activity(&self.snap, t);
             let (g, color) = self.state_glyph(act);
             let (label, lcol) = match act {
                 Activity::Waiting => ("WAITING", th.waiting),
@@ -3379,47 +3383,54 @@ impl App {
             let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
             let mut leaves = Vec::new();
             t.layout.leaves(&mut leaves);
-            let extra = if leaves.len() > 1 { format!("  ·{}", leaves.len()) } else { String::new() };
-
-            let w = area.width.saturating_sub(2);
-            let title_rect = Rect::new(area.x + 1, y, w, 1);
-            let body_rect = Rect::new(area.x + 1, y + 1, w, 1);
-            // Title band (select_bg) with a state-colored left bar + glyph + name, state label right.
+            let extra = if leaves.len() > 1 { format!(" ·{}", leaves.len()) } else { String::new() };
             let name = format!("{}{extra}", t.name);
-            let head_used = 2 + g.chars().count() + 1 + name.chars().count();
-            let head_pad =
-                (w as usize).saturating_sub(head_used + label.chars().count() + 1);
+
+            // Line 1 (select_bg): ▎ glyph name  cwd(dim, fills middle)  STATE(right).
+            let lead_w = 1 + 1 + g.chars().count() + 1; // ▎ + space + glyph + space
+            let name_w = name.chars().count();
+            let label_s = format!("{label} ");
+            let label_w = label_s.chars().count();
+            let room = (w as usize).saturating_sub(lead_w + name_w + label_w + 4);
+            let cwd_disp = if cwd.is_empty() || room < 3 {
+                String::new()
+            } else {
+                format!("  {}", cwd.chars().take(room).collect::<String>())
+            };
+            let used = lead_w + name_w + cwd_disp.chars().count() + label_w;
+            let pad = (w as usize).saturating_sub(used);
+            let sb = Style::default().bg(th.select_bg);
             let title = Line::from(vec![
-                Span::styled("▎", Style::default().fg(color).bg(th.select_bg)),
-                Span::styled(format!(" {g} "), Style::default().fg(color).bg(th.select_bg)),
-                Span::styled(
-                    name,
-                    Style::default().fg(th.bar_active_fg).bg(th.select_bg).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ".repeat(head_pad), Style::default().bg(th.select_bg)),
-                Span::styled(
-                    format!("{label} "),
-                    Style::default().fg(lcol).bg(th.select_bg).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("▎", sb.fg(color)),
+                Span::styled(format!(" {g} "), sb.fg(color)),
+                Span::styled(name, sb.fg(th.bar_active_fg).add_modifier(Modifier::BOLD)),
+                Span::styled(cwd_disp, sb.fg(th.status_fg)),
+                Span::styled(" ".repeat(pad), sb),
+                Span::styled(label_s, sb.fg(lcol).add_modifier(Modifier::BOLD)),
             ]);
-            f.render_widget(Paragraph::new(title).style(Style::default().bg(th.select_bg)), title_rect);
-            // Body (surface): cwd › preview.
-            let iw = w as usize;
-            let body_txt: String = format!("  {cwd}  › {preview}").chars().take(iw).collect();
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(body_txt, Style::default().fg(th.status_fg))))
-                    .style(Style::default().bg(th.surface)),
-                body_rect,
+                Paragraph::new(title).style(sb),
+                Rect::new(area.x + 1, y, w, 1),
             );
+            // Line 2 (surface): the preview — only for cards that need you.
+            if has_preview {
+                let body: String =
+                    format!("   › {preview}").chars().take(w as usize).collect();
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(body, Style::default().fg(th.bar_fg))))
+                        .style(Style::default().bg(th.surface)),
+                    Rect::new(area.x + 1, y + 1, w, 1),
+                );
+            }
             self.deck_hits.push((
-                Rect::new(area.x + 1, y, w, 2),
+                Rect::new(area.x + 1, y, w, rows),
                 DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane },
             ));
-            y += card_stride;
+            y += rows + 1; // + gutter
+            shown += 1;
         }
 
         // Scroll hint (tappable): ▲ above / ▼ N more below.
-        let shown = tabs.len().saturating_sub(start).min(capacity);
         let below = tabs.len().saturating_sub(start + shown);
         let mut hint: Vec<Span> = Vec::new();
         if start > 0 {
