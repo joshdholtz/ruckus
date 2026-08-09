@@ -301,6 +301,10 @@ pub struct PaneInfo {
     /// labels ("waiting 45s", "done 2m ago").
     #[serde(default)]
     pub activity_since: u64,
+    /// Current git branch of the pane's cwd (empty if not a repo). Filled in at
+    /// snapshot time for the compact "folder·branch" location display.
+    #[serde(default)]
+    pub git_branch: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

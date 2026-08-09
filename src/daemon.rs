@@ -558,9 +558,28 @@ impl State {
                 .map(|p| {
                     let mut info = p.info.clone();
                     info.preview = pane_preview(&p.screen);
+                    info.git_branch = git_branch(&p.info.cwd);
                     info
                 })
                 .collect(),
+        }
+    }
+}
+
+/// Git branch of `cwd` (or a short detached SHA), by walking up to the repo and
+/// reading `.git/HEAD` — no subprocess. Empty when not inside a repo.
+fn git_branch(cwd: &str) -> String {
+    let mut dir = std::path::PathBuf::from(cwd);
+    loop {
+        if let Ok(head) = std::fs::read_to_string(dir.join(".git/HEAD")) {
+            let head = head.trim();
+            return match head.strip_prefix("ref: refs/heads/") {
+                Some(b) => b.to_string(),
+                None => head.chars().take(7).collect(), // detached HEAD
+            };
+        }
+        if !dir.pop() {
+            return String::new();
         }
     }
 }
@@ -1314,6 +1333,7 @@ fn spawn_pane_with_id(
         agent: None,
         preview: String::new(),
         activity_since: unix_now(),
+        git_branch: String::new(),
     };
     install_pane(state, st, info, pty, reader, scrollback.unwrap_or_default(), 24, 80);
     Ok(())

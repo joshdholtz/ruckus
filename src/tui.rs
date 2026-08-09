@@ -353,6 +353,17 @@ fn home_relative(path: &str) -> String {
     path.to_string()
 }
 
+/// Compact location for a pane: last folder + git branch, e.g. "ruckus·main".
+fn pane_loc(p: &PaneInfo) -> String {
+    let rel = home_relative(&p.cwd);
+    let folder = rel.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&rel);
+    if p.git_branch.is_empty() {
+        folder.to_string()
+    } else {
+        format!("{folder}·{}", p.git_branch)
+    }
+}
+
 /// Put text on the clipboard two ways for wide coverage: OSC 52 (works over SSH
 /// and in iTerm2 / WezTerm / kitty / …) and a local `pbcopy` fallback.
 fn copy_to_clipboard(text: &str) {
@@ -2202,7 +2213,7 @@ impl App {
         );
 
         // Info row.
-        let cwd = info.map(|p| home_relative(&p.cwd)).unwrap_or_default();
+        let cwd = info.map(pane_loc).unwrap_or_default();
         let mut leaves = Vec::new();
         if let Some(t) = self.active_tab() {
             t.layout.leaves(&mut leaves);
@@ -3486,7 +3497,7 @@ impl App {
                 Activity::Idle => ("idle", th.idle),
             };
             let pane = self.snap.pane(t.active_pane);
-            let cwd = pane.map(|p| home_relative(&p.cwd)).unwrap_or_default();
+            let cwd = pane.map(pane_loc).unwrap_or_default();
             let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
             let mut leaves = Vec::new();
             t.layout.leaves(&mut leaves);
