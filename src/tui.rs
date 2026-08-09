@@ -579,7 +579,7 @@ impl App {
         let mut action = None;
         if ui.header == BarPos::Top {
             header = Some(top);
-            top += if minimal { 2 } else { 1 }; // mobile focus gets a 2-row header
+            top += 1;
         }
         if ui.footer == BarPos::Top && !minimal {
             footer = Some(top);
@@ -1914,23 +1914,17 @@ impl App {
                         return;
                     }
                 }
-                // Mobile focus: the big 2-row back button (left) spans both header
-                // rows; the info row's right side jumps the pane back to live.
+                // Mobile focus: tapping the info header's right side (the ↓ live
+                // control) jumps the pane back to live. Back lives in the cmd bar.
                 if self.mobile_focus() {
-                    if let Some(h) = self.frame.header {
-                        if row == h || row == h + 1 {
-                            if col < 10 {
-                                self.deck = true;
-                                self.sync_deck_sel();
-                                self.sync().await;
-                            } else if row == h + 1 {
-                                if let Some(v) = self.views.get_mut(&self.focused) {
-                                    v.scroll = 0;
-                                    v.parser.set_scrollback(0);
-                                }
+                    if Some(row) == self.frame.header {
+                        if col > self.size.0.saturating_sub(12) {
+                            if let Some(v) = self.views.get_mut(&self.focused) {
+                                v.scroll = 0;
+                                v.parser.set_scrollback(0);
                             }
-                            return;
                         }
+                        return;
                     }
                 }
                 if Some(row) == self.frame.header {
@@ -2268,13 +2262,12 @@ impl App {
         }
     }
 
-    /// Clean two-row header for the mobile focus view — calm like the deck, no
-    /// heavy button. Row 1: subtle "‹ back" + pane name + state. Row 2: loc ·
-    /// elapsed (+ jump-to-live). The whole left of both rows is the back tap zone.
+    /// One clean info row for the mobile focus view (no back button — that lives
+    /// in the bottom command bar now): name · loc … state elapsed / ↓ live.
     fn draw_mobile_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
         let w = area.width;
-
+        let bg = Style::default().bg(th.bg);
         let info = self.snap.pane(self.focused);
         let act = info.map(|p| p.activity).unwrap_or(Activity::Idle);
         let (g, scol) = self.state_glyph(act);
@@ -2284,58 +2277,29 @@ impl App {
             Activity::Done => "done",
             Activity::Idle => "idle",
         };
-
-        // Row 1 (screen bg): ‹ back   name … ● state
         let name = self.active_tab().map(|t| t.name).unwrap_or_default();
-        let lead = format!(" ‹ back   ");
-        let right = format!("{g} {sword} ");
-        let pad = (w as usize)
-            .saturating_sub(lead.chars().count() + name.chars().count() + right.chars().count());
-        let bg = Style::default().bg(th.bg);
-        let nav = Line::from(vec![
-            Span::styled(" ‹ back  ", Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {name}"), Style::default().fg(th.bar_active_fg).bg(th.bg).add_modifier(Modifier::BOLD)),
-            Span::styled(" ".repeat(pad), bg),
-            Span::styled(right, Style::default().fg(scol).bg(th.bg).add_modifier(Modifier::BOLD)),
-        ]);
-        f.render_widget(Paragraph::new(nav).style(bg), Rect::new(area.x, area.y, w, 1));
-
-        // Row 2 (screen bg, dim): loc · pane · elapsed … ↓ live
         let loc = info.map(pane_loc).unwrap_or_default();
-        let mut leaves = Vec::new();
-        if let Some(t) = self.active_tab() {
-            t.layout.leaves(&mut leaves);
-        }
-        let pane_part = if leaves.len() > 1 {
-            let i = leaves.iter().position(|p| *p == self.focused).map(|i| i + 1).unwrap_or(1);
-            format!("  ·  pane {i}/{}", leaves.len())
-        } else {
-            String::new()
-        };
         let el = self.elapsed_label(self.focused);
-        let el_part = if el.is_empty() {
-            String::new()
-        } else {
-            match act {
-                Activity::Waiting => format!("  ·  waiting {el}"),
-                Activity::Working => format!("  ·  running {el}"),
-                Activity::Done => format!("  ·  done {el} ago"),
-                Activity::Idle => format!("  ·  idle {el}"),
-            }
-        };
         let scroll = self.views.get(&self.focused).map(|v| v.scroll).unwrap_or(0);
-        let live = if scroll > 0 { format!("↑{scroll}  ↓ live ") } else { String::new() };
-        let livew = live.chars().count();
-        let leftmax = (w as usize).saturating_sub(livew + 1);
-        let left: String =
-            format!("   {loc}{pane_part}{el_part}").chars().take(leftmax).collect();
-        let pad2 = (w as usize).saturating_sub(left.chars().count() + livew);
-        let info_line = Line::from(vec![
-            Span::styled(left, Style::default().fg(th.status_fg).bg(th.bg)),
-            Span::styled(" ".repeat(pad2), bg),
-            Span::styled(live, Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
+
+        let right = if scroll > 0 {
+            format!("↑{scroll}  ↓ live ")
+        } else if el.is_empty() {
+            format!("{g} {sword} ")
+        } else {
+            format!("{g} {sword} {el} ")
+        };
+        let rcol = if scroll > 0 { th.accent } else { scol };
+        let loc_disp = if loc.is_empty() { String::new() } else { format!("   {loc}") };
+        let used = 1 + name.chars().count() + loc_disp.chars().count() + right.chars().count();
+        let pad = (w as usize).saturating_sub(used);
+        let line = Line::from(vec![
+            Span::styled(format!(" {name}"), Style::default().fg(th.bar_active_fg).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(loc_disp, Style::default().fg(th.status_fg).bg(th.bg)),
+            Span::styled(" ".repeat(pad), bg),
+            Span::styled(right, Style::default().fg(rcol).bg(th.bg).add_modifier(Modifier::BOLD)),
         ]);
-        f.render_widget(Paragraph::new(info_line).style(bg), Rect::new(area.x, area.y + 1, w, 1));
+        f.render_widget(Paragraph::new(line).style(bg), Rect::new(area.x, area.y, w, 1));
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -3327,32 +3291,31 @@ impl App {
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
-        // Mobile focus: one clean, consistent command bar (not the context-
-        // switching y/n/needs-you strip). Same commands every time = predictable.
+        // Mobile focus: a prefix-helper style command bar — "key label" pairs,
+        // consistent every time, tappable. Keys mirror the tmux prefix (⌃b then …).
         if self.mobile_focus() {
             let th = self.cfg.theme.clone();
-            let cmds: [(&str, ChipAction); 5] = [
-                ("‹ back", ChipAction::Back),
-                ("next", ChipAction::Next),
-                ("zoom", ChipAction::Zoom),
-                ("find", ChipAction::Search),
-                ("close", ChipAction::Close),
+            let cmds: [(&str, &str, ChipAction); 5] = [
+                ("d", "back", ChipAction::Back),
+                ("n", "next", ChipAction::Next),
+                ("z", "zoom", ChipAction::Zoom),
+                ("/", "find", ChipAction::Search),
+                ("x", "close", ChipAction::Close),
             ];
-            let mut spans: Vec<Span> = Vec::new();
+            let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(th.bar_bg))];
             let mut hits = Vec::new();
             let mut x = area.x + 1;
-            for (label, act) in cmds {
-                let w = label.chars().count() as u16;
-                let range = x..x + w;
+            for (key, label, act) in cmds {
+                let text = format!("{key} {label}");
+                let width = text.chars().count() as u16;
+                let range = x..x + width;
                 let hovered = self.hover_at(&range, area.y);
-                let style = Style::default()
-                    .fg(if hovered { th.accent } else { th.bar_fg })
-                    .bg(th.bar_bg)
-                    .add_modifier(if hovered { Modifier::BOLD } else { Modifier::empty() });
-                spans.push(Span::styled(label.to_string(), style));
-                spans.push(Span::styled("     ", Style::default().bg(th.bar_bg)));
+                let kbg = if hovered { th.select_bg } else { th.bar_bg };
+                spans.push(Span::styled(key.to_string(), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!(" {label}"), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
+                spans.push(Span::styled("   ", Style::default().bg(th.bar_bg)));
                 hits.push((act, area.y, range));
-                x += w + 5;
+                x += width + 3;
             }
             self.action_hits = hits;
             f.render_widget(
@@ -3974,7 +3937,7 @@ impl App {
 
         if let Some(r) = self.frame.header {
             if self.mobile_focus() {
-                self.draw_mobile_header(f, Rect::new(0, r, area.width, 2));
+                self.draw_mobile_header(f, Rect::new(0, r, area.width, 1));
             } else {
                 self.draw_header(f, Rect::new(0, r, area.width, 1));
             }
