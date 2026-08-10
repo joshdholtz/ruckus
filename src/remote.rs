@@ -4,8 +4,8 @@
 //! bits of every id at the ingest/egress boundaries. `pack(0, id) == id`, so
 //! local (origin 0) traffic is unchanged.
 //!
-//! Phase R0: pure + fully tested. Wired into the client in R1+.
-#![allow(dead_code)] // wired in R1; kept pure + tested first
+//! The id layer is pure + fully unit-tested; the client routes every request
+//! and prefixes every event through it (`tui.rs`).
 
 use crate::protocol::{Node, Request, ServerMsg, Snapshot};
 
@@ -141,6 +141,17 @@ pub fn route_request(req: &mut Request) -> Origin {
         Request::ReportAgent { pane, .. } => strip1(pane),
         Request::Snapshot | Request::NewSpace { .. } | Request::Reload | Request::Upgrade => LOCAL,
     }
+}
+
+/// Merge one daemon's snapshot into the combined client view: replace exactly
+/// that origin's spaces + panes, leaving every other origin's untouched.
+/// `incoming` must already be prefixed with `origin`. Does not touch
+/// `dest.active_space` — the client's focus is client-owned.
+pub fn merge_snapshot(dest: &mut Snapshot, origin: Origin, incoming: &Snapshot) {
+    dest.spaces.retain(|s| origin_of(s.id) != origin);
+    dest.panes.retain(|p| origin_of(p.id) != origin);
+    dest.spaces.extend(incoming.spaces.iter().cloned());
+    dest.panes.extend(incoming.panes.iter().cloned());
 }
 
 #[cfg(test)]
@@ -289,6 +300,59 @@ mod tests {
         // no-id requests → local
         let mut r = Request::Snapshot;
         assert_eq!(route_request(&mut r), LOCAL);
+    }
+
+    #[test]
+    fn merge_keeps_other_origins() {
+        // Start with a local (origin 0) snapshot merged in.
+        let mut dest = Snapshot {
+            active_space: 0,
+            spaces: Vec::new(),
+            panes: Vec::new(),
+        };
+        let mut local = fixture();
+        prefix_snapshot(&mut local, 0);
+        merge_snapshot(&mut dest, 0, &local);
+        // Add a remote (origin 2).
+        let mut remote = fixture();
+        prefix_snapshot(&mut remote, 2);
+        merge_snapshot(&mut dest, 2, &remote);
+        assert_eq!(dest.spaces.len(), 2); // local + remote
+        assert_eq!(dest.panes.len(), 4);
+        assert!(dest.spaces.iter().any(|s| origin_of(s.id) == 0));
+        assert!(dest.spaces.iter().any(|s| origin_of(s.id) == 2));
+
+        // Re-merging origin 2 replaces only origin 2, leaves origin 0.
+        let mut remote2 = Snapshot {
+            active_space: 9,
+            spaces: vec![SpaceInfo {
+                id: 9,
+                name: "new".into(),
+                active_tab: 9,
+                tabs: vec![],
+            }],
+            panes: vec![],
+        };
+        prefix_snapshot(&mut remote2, 2);
+        merge_snapshot(&mut dest, 2, &remote2);
+        assert_eq!(
+            dest.spaces.iter().filter(|s| origin_of(s.id) == 0).count(),
+            1
+        );
+        assert_eq!(
+            dest.spaces.iter().filter(|s| origin_of(s.id) == 2).count(),
+            1
+        );
+        assert_eq!(
+            local_of(
+                dest.spaces
+                    .iter()
+                    .find(|s| origin_of(s.id) == 2)
+                    .unwrap()
+                    .id
+            ),
+            9
+        );
     }
 
     #[test]

@@ -28,7 +28,16 @@ use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
 };
 use crate::protocol::*;
+use crate::remote::{self, Origin};
 use crate::render::{encode_key, encode_mouse_wheel, screen_to_lines};
+
+/// One connected daemon (local or a remote over SSH).
+struct Conn {
+    client: Client,
+    /// Host label — empty for the local daemon. Shown in the sidebar (R4).
+    #[allow(dead_code)]
+    host: String,
+}
 
 /// Below this width the footer switches to compact tap-first chips.
 const FOOTER_COMPACT: u16 = 70;
@@ -599,7 +608,8 @@ struct FrameLayout {
 
 struct App {
     cfg: Config,
-    client: Client,
+    /// Connected daemons by origin (0 = local). Requests route by the id's origin.
+    conns: std::collections::BTreeMap<Origin, Conn>,
     snap: Snapshot,
     views: HashMap<u64, PaneView>,
     focused: u64,
@@ -1176,17 +1186,13 @@ impl App {
             .collect();
         for p in stale {
             self.views.remove(&p);
-            let _ = self.client.request(Request::Detach { pane: p }).await;
+            let _ = self.route(Request::Detach { pane: p }).await;
         }
 
         for (pane, rect) in rects {
             let (rows, cols) = self.pane_size(rect);
             if !self.views.contains_key(&pane) {
-                match self
-                    .client
-                    .request(Request::Attach { pane, rows, cols })
-                    .await
-                {
+                match self.route(Request::Attach { pane, rows, cols }).await {
                     Ok(ServerMsg::Attached { scrollback, .. }) => {
                         let mut parser = vt100::Parser::new(rows, cols, 10_000);
                         if let Ok(bytes) = B64.decode(scrollback.as_bytes()) {
@@ -1210,10 +1216,7 @@ impl App {
                     v.rows = rows;
                     v.cols = cols;
                     v.parser.set_size(rows, cols);
-                    let _ = self
-                        .client
-                        .request(Request::Resize { pane, rows, cols })
-                        .await;
+                    let _ = self.route(Request::Resize { pane, rows, cols }).await;
                 }
             }
         }
@@ -1228,6 +1231,20 @@ impl App {
                 self.focused = p;
             }
         }
+    }
+
+    /// Send a request to the daemon that owns its ids (routing by origin), and
+    /// re-prefix the reply's ids back to global form. The client's single point
+    /// of contact with all daemons.
+    async fn route(&self, mut req: Request) -> anyhow::Result<ServerMsg> {
+        let origin = remote::route_request(&mut req);
+        let conn = self
+            .conns
+            .get(&origin)
+            .ok_or_else(|| anyhow::anyhow!("daemon {origin} not connected"))?;
+        let mut resp = conn.client.request(req).await?;
+        remote::prefix_servermsg(&mut resp, origin);
+        Ok(resp)
     }
 
     async fn set_active(&mut self, space: u64, tab: u64, pane: u64) {
@@ -1247,10 +1264,7 @@ impl App {
         }
         self.focused = pane;
         self.mark_seen();
-        let _ = self
-            .client
-            .request(Request::SetActive { space, tab, pane })
-            .await;
+        let _ = self.route(Request::SetActive { space, tab, pane }).await;
         self.sync().await;
     }
 
@@ -1518,7 +1532,7 @@ impl App {
             }
             Placement::Popup => return, // handled above
         };
-        match self.client.request(req).await {
+        match self.route(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
@@ -1563,7 +1577,7 @@ impl App {
             cmd: Vec::new(),
             cwd,
         };
-        match self.client.request(req).await {
+        match self.route(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
@@ -1581,7 +1595,7 @@ impl App {
             cmd: Vec::new(),
             cwd,
         };
-        match self.client.request(req).await {
+        match self.route(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
@@ -1593,7 +1607,7 @@ impl App {
             name,
             cwd: Some(self.seed_cwd(self.focused)),
         };
-        match self.client.request(req).await {
+        match self.route(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
             _ => {}
@@ -1696,18 +1710,14 @@ impl App {
             PromptKind::NewSpace => self.new_space_action(opt).await,
             PromptKind::RenameSpace(space) => {
                 if let Some(name) = opt {
-                    if let Err(e) = self
-                        .client
-                        .request(Request::RenameSpace { space, name })
-                        .await
-                    {
+                    if let Err(e) = self.route(Request::RenameSpace { space, name }).await {
                         self.toast(e.to_string());
                     }
                 }
             }
             PromptKind::RenameTab(tab) => {
                 if let Some(name) = opt {
-                    if let Err(e) = self.client.request(Request::RenameTab { tab, name }).await {
+                    if let Err(e) = self.route(Request::RenameTab { tab, name }).await {
                         self.toast(e.to_string());
                     }
                 }
@@ -1741,7 +1751,7 @@ impl App {
             pane: self.focused,
             data: B64.encode(bytes),
         };
-        if let Err(e) = self.client.request(req).await {
+        if let Err(e) = self.route(req).await {
             self.toast(e.to_string());
         }
     }
@@ -1769,7 +1779,7 @@ impl App {
     }
 
     async fn close_pane_action(&mut self, pane: u64) {
-        if let Err(e) = self.client.request(Request::ClosePane { pane }).await {
+        if let Err(e) = self.route(Request::ClosePane { pane }).await {
             self.toast(e.to_string());
         }
     }
@@ -2067,7 +2077,7 @@ impl App {
     }
 
     async fn restart_action(&mut self, pane: u64) {
-        match self.client.request(Request::Restart { pane }).await {
+        match self.route(Request::Restart { pane }).await {
             Ok(_) => {
                 self.seen.remove(&pane);
                 self.views.remove(&pane); // fresh attach picks up seeded scrollback
@@ -2112,14 +2122,14 @@ impl App {
             }
             MenuAction::CloseTab => {
                 if let Some(t) = tab {
-                    if let Err(e) = self.client.request(Request::CloseTab { tab: t }).await {
+                    if let Err(e) = self.route(Request::CloseTab { tab: t }).await {
                         self.toast(e.to_string());
                     }
                 }
             }
             MenuAction::CloseSpace => {
                 if let Some(s) = space {
-                    if let Err(e) = self.client.request(Request::CloseSpace { space: s }).await {
+                    if let Err(e) = self.route(Request::CloseSpace { space: s }).await {
                         self.toast(e.to_string());
                     }
                 }
@@ -2138,7 +2148,7 @@ impl App {
                         } else {
                             i + 1
                         };
-                        if let Err(e) = self.client.request(Request::MoveTab { tab: t, to }).await {
+                        if let Err(e) = self.route(Request::MoveTab { tab: t, to }).await {
                             self.toast(e.to_string());
                         }
                     }
@@ -2152,11 +2162,7 @@ impl App {
                         } else {
                             i + 1
                         };
-                        if let Err(e) = self
-                            .client
-                            .request(Request::MoveSpace { space: sp, to })
-                            .await
-                        {
+                        if let Err(e) = self.route(Request::MoveSpace { space: sp, to }).await {
                             self.toast(e.to_string());
                         }
                     }
@@ -2351,7 +2357,7 @@ impl App {
                 }
                 KeyCode::Char('&') => {
                     if let Some(tab) = self.active_space().map(|s| s.active_tab) {
-                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                        if let Err(e) = self.route(Request::CloseTab { tab }).await {
                             self.toast(e.to_string());
                         }
                     }
@@ -2427,7 +2433,7 @@ impl App {
                 pane: self.focused,
                 data: B64.encode(&bytes),
             };
-            if let Err(e) = self.client.request(req).await {
+            if let Err(e) = self.route(req).await {
                 self.toast(e.to_string());
             }
         }
@@ -2534,8 +2540,7 @@ impl App {
             .map(|t| t.layout.clone());
         if let Some(layout) = layout {
             if let Err(e) = self
-                .client
-                .request(Request::SetLayout {
+                .route(Request::SetLayout {
                     tab: drag.tab,
                     layout,
                 })
@@ -2670,7 +2675,7 @@ impl App {
                                     .and_then(|s| s.tabs.iter().position(|t| t.id == target))
                                 {
                                     self.drag_target = Some(target);
-                                    let _ = self.client.request(Request::MoveTab { tab, to }).await;
+                                    let _ = self.route(Request::MoveTab { tab, to }).await;
                                 }
                             }
                         }
@@ -2687,7 +2692,7 @@ impl App {
                         if target != space && self.drag_target != Some(target) {
                             if let Some(to) = self.snap.spaces.iter().position(|s| s.id == target) {
                                 self.drag_target = Some(target);
-                                let _ = self.client.request(Request::MoveSpace { space, to }).await;
+                                let _ = self.route(Request::MoveSpace { space, to }).await;
                             }
                         }
                     }
@@ -2716,10 +2721,7 @@ impl App {
                                 let mut layout = t.layout.clone();
                                 layout.swap_leaves(from, to);
                                 let tab = t.id;
-                                if let Err(e) = self
-                                    .client
-                                    .request(Request::SetLayout { tab, layout })
-                                    .await
+                                if let Err(e) = self.route(Request::SetLayout { tab, layout }).await
                                 {
                                     self.toast(e.to_string());
                                 }
@@ -2747,7 +2749,7 @@ impl App {
                         .find(|(_, r)| r.contains(&col))
                         .and_then(|(id, _)| *id)
                     {
-                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                        if let Err(e) = self.route(Request::CloseTab { tab }).await {
                             self.toast(e.to_string());
                         }
                     }
@@ -2956,7 +2958,7 @@ impl App {
                             match btn {
                                 SidebarBtn::CloseSpace(id) => {
                                     if let Err(e) =
-                                        self.client.request(Request::CloseSpace { space: id }).await
+                                        self.route(Request::CloseSpace { space: id }).await
                                     {
                                         self.toast(e.to_string());
                                     }
@@ -2986,7 +2988,7 @@ impl App {
                         .find(|(_, r)| r.contains(&col))
                         .map(|(id, _)| *id)
                     {
-                        if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
+                        if let Err(e) = self.route(Request::CloseTab { tab }).await {
                             self.toast(e.to_string());
                         }
                         return;
@@ -3108,7 +3110,7 @@ impl App {
                     pane,
                     data: B64.encode(&bytes),
                 };
-                if let Err(e) = self.client.request(req).await {
+                if let Err(e) = self.route(req).await {
                     self.toast(e.to_string());
                 }
             }
@@ -3116,7 +3118,9 @@ impl App {
         }
     }
 
-    async fn on_server(&mut self, msg: ServerMsg) {
+    async fn on_server(&mut self, origin: Origin, mut msg: ServerMsg) {
+        // Tag every id in the message with its daemon before we touch shared state.
+        remote::prefix_servermsg(&mut msg, origin);
         match msg {
             ServerMsg::State { snapshot } => {
                 self.drag = None;
@@ -3128,7 +3132,16 @@ impl App {
                     .active_space()
                     .map(|s| self.deck_sel >= s.tabs.len())
                     .unwrap_or(false);
-                self.snap = snapshot;
+                // Merge this daemon's tree in (replacing only its own spaces/panes).
+                // Focus is client-owned: adopt this daemon's active space only if
+                // we're currently focused on it (or have no focus yet).
+                let incoming_active = snapshot.active_space;
+                remote::merge_snapshot(&mut self.snap, origin, &snapshot);
+                if self.snap.active_space == 0
+                    || remote::origin_of(self.snap.active_space) == origin
+                {
+                    self.snap.active_space = incoming_active;
+                }
                 if self.deck && !was_on_button {
                     let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
                     self.deck_sel = self.deck_sel.min(ncards.saturating_sub(1));
@@ -3247,7 +3260,7 @@ impl App {
             pane,
             data: B64.encode(&data),
         };
-        if let Err(e) = self.client.request(req).await {
+        if let Err(e) = self.route(req).await {
             self.toast(e.to_string());
         }
     }
@@ -5552,7 +5565,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     if !cfg.plugins.is_empty() && !crate::config::ensure_declared(&cfg.plugins).is_empty() {
         cfg = Config::load();
     }
-    let (client, mut events) = connect().await?;
+    let (client, events) = connect().await?;
     let snap = client.snapshot().await?;
 
     let focused = snap
@@ -5574,9 +5587,21 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
     let (popup_tx, mut popup_rx) = unbounded_channel::<Vec<u8>>();
+    // All daemons' events fan into one channel tagged by origin; a `None` payload
+    // means that daemon dropped (triggering a reconnect for that origin).
+    let (mev_tx, mut mev_rx) = unbounded_channel::<(Origin, Option<ServerMsg>)>();
+    spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
+    let mut conns = std::collections::BTreeMap::new();
+    conns.insert(
+        remote::LOCAL,
+        Conn {
+            client,
+            host: String::new(),
+        },
+    );
     let mut app = App {
         cfg,
-        client,
+        conns,
         snap,
         views: HashMap::new(),
         focused,
@@ -5702,22 +5727,25 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 Some(e) => app.on_term_event(e).await,
                 None => app.running = false,
             },
-            msg = events.recv() => match msg {
-                Some(m) => app.on_server(m).await,
-                None => {
-                    // Daemon connection dropped (restart/upgrade) — reconnect and
+            got = mev_rx.recv() => match got {
+                Some((origin, Some(m))) => app.on_server(origin, m).await,
+                Some((remote::LOCAL, None)) => {
+                    // Local daemon dropped (restart/upgrade) — reconnect and
                     // reattach instead of exiting. Panes persist across daemon
                     // restarts under the same ids, so the view comes right back.
                     app.toast("reconnecting…");
                     terminal.draw(|f| app.draw(f))?;
-                    match reconnect(&mut app, &mut in_rx).await {
-                        Some(new_events) => {
-                            events = new_events;
-                            app.toast("🐏 reconnected");
-                        }
-                        None => app.running = false,
+                    if !reconnect(&mut app, &mut in_rx, &mev_tx).await {
+                        app.running = false;
                     }
                 }
+                Some((origin, None)) => {
+                    // A remote daemon dropped — drop its spaces; R4 will reconnect.
+                    app.conns.remove(&origin);
+                    app.snap.spaces.retain(|s| remote::origin_of(s.id) != origin);
+                    app.snap.panes.retain(|p| remote::origin_of(p.id) != origin);
+                }
+                None => app.running = false,
             },
             bytes = popup_rx.recv() => match bytes {
                 Some(b) if b.is_empty() => app.close_popup(),   // reader EOF
@@ -5741,8 +5769,10 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         while let Ok(e) = in_rx.try_recv() {
             app.on_term_event(e).await;
         }
-        while let Ok(m) = events.try_recv() {
-            app.on_server(m).await;
+        while let Ok(got) = mev_rx.try_recv() {
+            if let (origin, Some(m)) = got {
+                app.on_server(origin, m).await;
+            }
         }
     }
 
@@ -5757,37 +5787,64 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Re-establish the daemon connection after it drops. Restarts the daemon if it
-/// died, reconnects with backoff, re-fetches state, and re-attaches panes.
-/// Returns the fresh event stream, or None if the user quits or it gives up.
+/// Forward one daemon's event stream into the merged channel, tagged by origin.
+/// Sends `(origin, None)` when the stream ends so the loop can reconnect it.
+fn spawn_forwarder(
+    origin: Origin,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+    tx: tokio::sync::mpsc::UnboundedSender<(Origin, Option<ServerMsg>)>,
+) {
+    tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if tx.send((origin, Some(m))).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send((origin, None));
+    });
+}
+
+/// Re-establish the LOCAL daemon connection after it drops. Restarts the daemon
+/// if it died, reconnects with backoff, re-fetches state, re-attaches panes, and
+/// respawns its forwarder. Returns false only if the user quits / it gives up.
 async fn reconnect(
     app: &mut App,
     in_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-) -> Option<tokio::sync::mpsc::UnboundedReceiver<ServerMsg>> {
+    mev_tx: &tokio::sync::mpsc::UnboundedSender<(Origin, Option<ServerMsg>)>,
+) -> bool {
     for _ in 0..240 {
         // Let the user bail out while we retry.
         while let Ok(ev) = in_rx.try_recv() {
             if let Event::Key(k) = ev {
                 let k = normalize_key(&k, app.cfg.ui.mac_option_fallback);
                 if app.cfg.action_for(&k) == Some(Action::Quit) {
-                    return None;
+                    return false;
                 }
             }
         }
         if ensure_daemon().await.is_ok() {
             if let Ok((client, events)) = connect().await {
-                if let Ok(snap) = client.snapshot().await {
-                    app.client = client;
-                    app.snap = snap;
+                if let Ok(mut snap) = client.snapshot().await {
+                    remote::prefix_snapshot(&mut snap, remote::LOCAL);
+                    remote::merge_snapshot(&mut app.snap, remote::LOCAL, &snap);
+                    app.conns.insert(
+                        remote::LOCAL,
+                        Conn {
+                            client,
+                            host: String::new(),
+                        },
+                    );
+                    spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
                     app.views.clear(); // force re-attach of every visible pane
                     app.sync().await;
-                    return Some(events);
+                    app.toast("🐏 reconnected");
+                    return true;
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    None
+    false
 }
 
 #[cfg(test)]
