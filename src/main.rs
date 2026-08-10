@@ -398,6 +398,33 @@ async fn restart(target: String) -> Result<()> {
     Ok(())
 }
 
+/// Parse a plugin reference into (clone url, owner/repo cache key, subpath).
+/// Accepts `owner/repo`, `owner/repo/sub/dir`, or a full git URL (no subpath).
+fn parse_plugin_ref(repo: &str) -> Result<(String, String, String)> {
+    if repo.starts_with("http") || repo.contains("://") || repo.starts_with("git@") {
+        let tail: Vec<&str> = repo.trim_end_matches(".git").rsplit('/').take(2).collect();
+        let key = tail.into_iter().rev().collect::<Vec<_>>().join("/");
+        return Ok((repo.to_string(), key, String::new()));
+    }
+    let parts: Vec<&str> = repo.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        anyhow::bail!("expected owner/repo or owner/repo/subpath");
+    }
+    let owner_repo = format!("{}/{}", parts[0], parts[1]);
+    Ok((format!("https://github.com/{owner_repo}"), owner_repo, parts[2..].join("/")))
+}
+
+/// Walk up from `start` (following symlinks) to the enclosing git repo, if any.
+fn git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut p = start.canonicalize().ok()?;
+    loop {
+        if p.join(".git").exists() {
+            return Some(p);
+        }
+        p = p.parent()?.to_path_buf();
+    }
+}
+
 async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
     use config::{list_plugins, plugins_dir};
     let dir = plugins_dir();
@@ -440,54 +467,72 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             println!("run `ruckus reload` to pick it up");
         }
         PluginCmd::Install { repo } => {
-            let name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+            // Accept `owner/repo`, `owner/repo/sub/dir` (monorepo subfolder), or a
+            // full git URL (optionally with a subfolder after the repo name).
+            let (url, owner_repo, subpath) = parse_plugin_ref(&repo)?;
+            // Clone the repo once into a shared cache; multiple plugins from the
+            // same monorepo reuse it (and `update` pulls it once).
+            let cache = dir.join(".cache").join(owner_repo.replace('/', "__"));
+            if cache.join(".git").exists() {
+                std::process::Command::new("git").arg("-C").arg(&cache).args(["pull", "--ff-only"]).status()?;
+            } else {
+                std::fs::create_dir_all(cache.parent().unwrap()).ok();
+                let ok = std::process::Command::new("git")
+                    .args(["clone", "--depth", "1", &url])
+                    .arg(&cache)
+                    .status()?
+                    .success();
+                if !ok {
+                    anyhow::bail!("git clone failed");
+                }
+            }
+            let src = if subpath.is_empty() { cache.clone() } else { cache.join(&subpath) };
+            if !src.join("ruckus-plugin.toml").exists() {
+                anyhow::bail!("{}: no ruckus-plugin.toml there", src.display());
+            }
+            let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
             let dst = dir.join(&name);
             if dst.exists() {
                 anyhow::bail!("{name} already installed (ruckus plugin remove {name})");
             }
-            let url = if repo.starts_with("http") || repo.contains("://") {
-                repo.clone()
-            } else {
-                format!("https://github.com/{repo}")
-            };
-            let status = std::process::Command::new("git")
-                .args(["clone", "--depth", "1", &url])
-                .arg(&dst)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!("git clone failed");
-            }
-            if !dst.join("ruckus-plugin.toml").exists() {
-                std::fs::remove_dir_all(&dst).ok();
-                anyhow::bail!("{name}: no ruckus-plugin.toml — not a ruckus plugin");
-            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&src, &dst)?;
             println!("installed {name}");
             println!("run `ruckus reload` to pick it up");
         }
         PluginCmd::Update { name } => {
-            let targets: Vec<std::path::PathBuf> = match name {
-                Some(n) if dir.join(&n).exists() => vec![dir.join(&n)],
+            use std::collections::HashSet;
+            let targets: Vec<(String, std::path::PathBuf)> = match name {
+                Some(n) if dir.join(&n).exists() => vec![(n.clone(), dir.join(&n))],
                 Some(n) => match list_plugins().into_iter().find(|p| p.name == n) {
-                    Some(p) => vec![p.path],
+                    Some(p) => vec![(p.id, p.path)],
                     None => anyhow::bail!("no plugin {n}"),
                 },
-                None => list_plugins().into_iter().map(|p| p.path).collect(),
+                None => list_plugins().into_iter().map(|p| (p.id, p.path)).collect(),
             };
-            for d in targets {
-                let handle = d.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
-                // Dev symlinks have no git repo of their own — edit the source.
-                if d.symlink_metadata()?.file_type().is_symlink() {
-                    println!("· {handle} (dev link — edit its source dir)");
-                    continue;
+            let base = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            // Resolve each plugin to its backing git repo; pull ones we own (the
+            // clone cache / standalone installs), skip dev links to your own repos.
+            let mut roots: HashSet<std::path::PathBuf> = HashSet::new();
+            for (handle, path) in targets {
+                match git_root(&path) {
+                    Some(root) if root.starts_with(&base) => {
+                        roots.insert(root);
+                    }
+                    Some(_) => println!("· {handle} (dev link — edit its source)"),
+                    None => println!("· {handle} (not a git repo)"),
                 }
+            }
+            for root in roots {
                 let ok = std::process::Command::new("git")
                     .arg("-C")
-                    .arg(&d)
+                    .arg(&root)
                     .args(["pull", "--ff-only"])
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
-                println!("{} {handle}", if ok { "✓" } else { "✗" });
+                let n = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                println!("{} {n}", if ok { "✓" } else { "✗" });
             }
             println!("run `ruckus reload` to apply");
         }

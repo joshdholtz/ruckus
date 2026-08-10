@@ -756,6 +756,10 @@ pub fn list_plugins() -> Vec<PluginInfo> {
         if !path.is_dir() {
             continue;
         }
+        // Skip hidden dirs (e.g. the .cache of cloned monorepos).
+        if entry.file_name().to_str().is_some_and(|n| n.starts_with('.')) {
+            continue;
+        }
         let Some(m) = read_manifest(&path) else { continue };
         let meta = m.plugin.unwrap_or_default();
         let id = path.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
