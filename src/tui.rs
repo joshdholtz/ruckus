@@ -4369,6 +4369,36 @@ impl App {
                     Paragraph::new(lines).style(Style::default().bg(th.surface)),
                     content,
                 );
+                // A blank pane that just launched is probably a slow tool loading
+                // (e.g. gh-dash fetching) — show a spinner so it doesn't read as
+                // frozen. Only for the first ~20s; after that a blank pane is just
+                // blank.
+                let starting = !exited
+                    && content.height >= 1
+                    && screen.contents().trim().is_empty()
+                    && info
+                        .map(|i| crate::protocol::unix_now().saturating_sub(i.created) < 20)
+                        .unwrap_or(false);
+                if starting {
+                    let cmd = info
+                        .and_then(|i| i.cmd.first().cloned())
+                        .unwrap_or_default();
+                    let msg = if cmd.is_empty() {
+                        format!("{} starting…", self.spin())
+                    } else {
+                        format!("{} starting {cmd}…", self.spin())
+                    };
+                    let mw = (msg.chars().count() as u16).min(content.width);
+                    let mx = content.x + content.width.saturating_sub(mw) / 2;
+                    let my = content.y + content.height / 2;
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            msg,
+                            Style::default().fg(th.status_fg).bg(th.surface),
+                        ))),
+                        Rect::new(mx, my, mw, 1),
+                    );
+                }
             }
             // Dead-pane frame: status banner + restart/close hints over the content.
             if let Some(PaneInfo {
