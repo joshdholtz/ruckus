@@ -4,10 +4,11 @@
 remote box's spaces show in your sidebar and are **fully read/write** — view
 panes, send input, split, create, close — exactly like local ones.
 
-Status: **working (R0–R5 landed); migrating the hub from client → daemon (H1–H5).**
-Remote spaces mirror into the sidebar and are fully read/write. Connecting is in
-the background (a slow/dead SSH never stalls the UI) and dropped remotes
-**auto-reconnect**.
+Status: **working — hybrid (daemon-side hub) landed (H1–H5).** The daemon owns
+the remote connections; remote spaces mirror into every attached client's sidebar
+and are fully read/write. The mirror **survives TUI quit**, is **shared by all
+clients**, uses your **ssh-agent**, and **auto-reconnects** from the daemon.
+Remote rows are `host:`-tagged and take an optional `theme.remote` colour.
 
 ## Hybrid redesign (H-phases): the daemon owns the connection
 
@@ -61,7 +62,9 @@ args = []               # extra ssh opts, e.g. ["-p", "2222"]
 
 Either way, the host's spaces appear in your sidebar tagged `workbox: …` and are
 view/type/split like local ones. SSH handles auth (mosh is orthogonal — your
-link, not the mirror's).
+link, not the mirror's). The **daemon** holds the connection using the SSH env
+(`SSH_AUTH_SOCK`) the client hands it, so the mirror stays up after you quit the
+TUI and every attached client sees it. Colour remote rows with `theme.remote`.
 
 **Disconnect:** the `disconnect remote` action drops the remote whose space
 you're currently on — kills its SSH, forgets it (no auto-reconnect), removes its

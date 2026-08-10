@@ -3835,13 +3835,16 @@ impl App {
                         } else {
                             Style::default()
                         };
+                        // Tag remote spaces with their host (e.g. "workbox: api").
+                        let host = self.host_of(s.id);
                         let text_fg = if s_active {
                             th.accent
+                        } else if !host.is_empty() {
+                            // Remote row: use the configured remote accent if set.
+                            th.remote.unwrap_or(th.bar_active_fg)
                         } else {
                             th.bar_active_fg
                         };
-                        // Tag remote spaces with their host (e.g. "workbox: api").
-                        let host = self.host_of(s.id);
                         let disp = if host.is_empty() {
                             s.name.clone()
                         } else {

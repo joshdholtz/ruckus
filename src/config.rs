@@ -243,6 +243,10 @@ pub struct Theme {
     pub idle: Color,
     pub done_ok: Color,
     pub done_err: Color,
+    /// Optional accent for mirrored *remote* space rows in the sidebar. `None`
+    /// (the default) leaves them looking like local rows (still `host:`-tagged);
+    /// set `theme.remote = "#rrggbb"` to colour them distinctly.
+    pub remote: Option<Color>,
 }
 
 const fn rgb(v: u32) -> Color {
@@ -300,6 +304,7 @@ pub fn theme_preset(name: &str) -> Option<Theme> {
         idle: rgb(idle),
         done_ok: rgb(done_ok),
         done_err: rgb(done_err),
+        remote: None,
     };
     Some(
         match name.to_lowercase().replace(['-', '_', ' '], "").as_str() {
@@ -1176,6 +1181,10 @@ impl Config {
         set(&mut theme.idle, "idle");
         set(&mut theme.done_ok, "done_ok");
         set(&mut theme.done_err, "done_err");
+        // Optional (Option<Color>): only set when present in config.
+        if let Some(c) = t.get("remote").and_then(|s| parse_hex(s)) {
+            theme.remote = Some(c);
+        }
 
         let d = UiConfig::default();
         let sidebar_raw = raw.ui.sidebar.as_deref().map(|s| s.to_lowercase());
@@ -1509,6 +1518,7 @@ waiting = "#eed49f"
 idle = "#5b6078"
 done_ok = "#a6da95"
 done_err = "#ed8796"
+# remote = "#f5bde6" # optional: tint mirrored remote space rows in the sidebar
 "##;
 
 #[cfg(test)]
