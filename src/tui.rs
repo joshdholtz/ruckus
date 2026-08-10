@@ -4301,13 +4301,15 @@ impl App {
             let bar_y = inner.y + fixed_top as u16;
             let bar_h = inner.height.saturating_sub(fixed_top as u16);
             let bar_area = Rect::new(inner.x, bar_y, inner.width.saturating_sub(1), bar_h);
+            // Muted so it never competes with the selected row / content: thumb =
+            // dim idle grey, track = darker border.
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
                 .track_symbol(Some("│"))
-                .track_style(Style::default().fg(th.idle))
+                .track_style(Style::default().fg(th.border))
                 .thumb_symbol("▐")
-                .thumb_style(Style::default().fg(th.accent));
+                .thumb_style(Style::default().fg(th.idle));
             f.render_stateful_widget(bar, bar_area, &mut state);
         }
     }
