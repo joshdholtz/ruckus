@@ -150,10 +150,12 @@ pub fn route_request(req: &mut Request) -> Origin {
     }
 }
 
-/// Merge one daemon's snapshot into the combined client view: replace exactly
-/// that origin's spaces + panes, leaving every other origin's untouched.
-/// `incoming` must already be prefixed with `origin`. Does not touch
-/// `dest.active_space` — the client's focus is client-owned.
+/// Merge one daemon's snapshot into a combined view: replace exactly that
+/// origin's spaces + panes, leaving every other origin's untouched. `incoming`
+/// must already be prefixed with `origin`. Does not touch `dest.active_space`.
+/// The daemon now merges inline (per-origin snapshot caches), so this is kept as
+/// the reference implementation of the semantics its unit test pins down.
+#[allow(dead_code)]
 pub fn merge_snapshot(dest: &mut Snapshot, origin: Origin, incoming: &Snapshot) {
     dest.spaces.retain(|s| origin_of(s.id) != origin);
     dest.panes.retain(|p| origin_of(p.id) != origin);

@@ -28,19 +28,8 @@ use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
 };
 use crate::protocol::*;
-use crate::remote::{self, Origin};
+use crate::remote;
 use crate::render::{encode_key, encode_mouse_wheel, screen_to_lines};
-
-/// One connected daemon (local or a remote over SSH).
-struct Conn {
-    client: Client,
-    /// Host label — empty for the local daemon. Shown in the sidebar.
-    host: String,
-    /// The `ssh … __proxy` child for a remote; kept alive so the pipe stays open
-    /// (kill_on_drop reaps it when the conn is removed). None for local.
-    #[allow(dead_code)]
-    child: Option<tokio::process::Child>,
-}
 
 /// Below this width the footer switches to compact tap-first chips.
 const FOOTER_COMPACT: u16 = 70;
@@ -621,8 +610,10 @@ struct FrameLayout {
 
 struct App {
     cfg: Config,
-    /// Connected daemons by origin (0 = local). Requests route by the id's origin.
-    conns: std::collections::BTreeMap<Origin, Conn>,
+    /// The one connection to the LOCAL daemon. Remote mirrors live in the daemon
+    /// now (the hybrid hub): it merges their spaces into the snapshot and routes
+    /// requests by the id's origin, so the client sends origin-encoded ids as-is.
+    client: Client,
     snap: Snapshot,
     views: HashMap<u64, PaneView>,
     focused: u64,
@@ -691,15 +682,6 @@ struct App {
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
     popup_tx: UnboundedSender<Vec<u8>>,
-    /// Merged daemon-event channel — background connectors forward through it.
-    mev_tx: UnboundedSender<(Origin, Option<ServerMsg>)>,
-    /// Known remotes (origin → host/args), whether or not currently connected.
-    /// Populated from config + runtime `connect remote`; drives auto-reconnect.
-    remotes: std::collections::BTreeMap<Origin, crate::config::RemoteSpec>,
-    /// Where a background connector reports a remote connect outcome.
-    conn_tx: UnboundedSender<ConnMsg>,
-    /// Remotes with an in-flight connect attempt (dedups retries).
-    connecting: HashSet<Origin>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     /// Triage chips: (action, row, col range).
     action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
@@ -1258,68 +1240,50 @@ impl App {
     /// Send a request to the daemon that owns its ids (routing by origin), and
     /// re-prefix the reply's ids back to global form. The client's single point
     /// of contact with all daemons.
-    /// Kick off a background connect for every known remote that isn't connected
-    /// (and isn't already being attempted). Non-blocking — a dead host can't stall
-    /// the UI. Called on startup, on reload, and on a slow retry ticker.
-    fn retry_remotes(&mut self) {
-        let todo: Vec<(Origin, crate::config::RemoteSpec)> = self
-            .remotes
-            .iter()
-            .filter(|(o, _)| !self.conns.contains_key(o) && !self.connecting.contains(o))
-            .map(|(o, s)| (*o, s.clone()))
-            .collect();
-        for (o, s) in todo {
-            self.connecting.insert(o);
-            spawn_connect(o, s, self.conn_tx.clone());
-        }
-    }
-
-    /// Register a remote (config or runtime `connect remote`) under a stable
-    /// origin (deduped by host) and start connecting it.
-    fn add_remote(&mut self, spec: crate::config::RemoteSpec) {
-        if self.remotes.values().any(|r| r.host == spec.host) {
-            self.retry_remotes(); // known already — just (re)connect it
-            return;
-        }
-        let origin = self.remotes.keys().last().copied().unwrap_or(0) + 1;
-        self.remotes.insert(origin, spec);
-        self.retry_remotes();
-    }
-
-    /// A background connector established a remote — merge it into the view.
-    fn on_conn_up(&mut self, mut up: ConnUp) {
-        self.connecting.remove(&up.origin);
-        remote::prefix_snapshot(&mut up.snapshot, up.origin);
-        remote::merge_snapshot(&mut self.snap, up.origin, &up.snapshot);
-        spawn_forwarder(up.origin, up.events, self.mev_tx.clone());
-        self.conns.insert(
-            up.origin,
-            Conn {
-                client: up.client,
-                host: up.host.clone(),
-                child: Some(up.child),
-            },
-        );
-        self.notify(format!("mirrored {}", up.host));
-    }
-
-    /// The host label for an id's daemon ("" = local).
+    /// The host label for an id's daemon ("" = local). Remote hosts come from the
+    /// merged snapshot the daemon sends (it owns the connections now).
     fn host_of(&self, id: u64) -> &str {
-        self.conns
-            .get(&remote::origin_of(id))
-            .map(|c| c.host.as_str())
+        let origin = remote::origin_of(id);
+        if origin == remote::LOCAL {
+            return "";
+        }
+        self.snap
+            .remote_hosts
+            .get(&origin)
+            .map(|s| s.as_str())
             .unwrap_or("")
     }
 
-    async fn route(&self, mut req: Request) -> anyhow::Result<ServerMsg> {
-        let origin = remote::route_request(&mut req);
-        let conn = self
-            .conns
-            .get(&origin)
-            .ok_or_else(|| anyhow::anyhow!("daemon {origin} not connected"))?;
-        let mut resp = conn.client.request(req).await?;
-        remote::prefix_servermsg(&mut resp, origin);
-        Ok(resp)
+    /// Send a request to the local daemon. Ids are origin-encoded; the daemon
+    /// routes remote ones to the owning daemon and re-prefixes the reply, so the
+    /// client neither strips nor re-tags anything.
+    async fn route(&self, req: Request) -> anyhow::Result<ServerMsg> {
+        self.client.request(req).await
+    }
+
+    /// The client's live SSH env, handed to the daemon so its detached `ssh` can
+    /// authenticate as the user (agent auth / hardware-key touch are agent-side).
+    fn ssh_env() -> std::collections::BTreeMap<String, String> {
+        let mut env = std::collections::BTreeMap::new();
+        for k in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
+            if let Ok(v) = std::env::var(k) {
+                env.insert(k.to_string(), v);
+            }
+        }
+        env
+    }
+
+    /// Ask the daemon to connect a remote (runtime or config), passing live SSH env.
+    async fn connect_remote(&mut self, host: String, args: Vec<String>) {
+        self.notify(format!("connecting {host}…"));
+        let req = Request::ConnectRemote {
+            host,
+            args,
+            env: Self::ssh_env(),
+        };
+        if let Err(e) = self.route(req).await {
+            self.notify(format!("connect failed: {e}"));
+        }
     }
 
     async fn set_active(&mut self, space: u64, tab: u64, pane: u64) {
@@ -1815,11 +1779,7 @@ impl App {
             }
             PromptKind::ConnectRemote => {
                 if !name.is_empty() {
-                    self.notify(format!("connecting {name}…"));
-                    self.add_remote(crate::config::RemoteSpec {
-                        host: name,
-                        args: Vec::new(),
-                    });
+                    self.connect_remote(name, Vec::new()).await;
                 }
             }
         }
@@ -1986,56 +1946,18 @@ impl App {
             }
             Action::ConnectRemote => self.open_prompt(PromptKind::ConnectRemote),
             Action::DisconnectRemote => {
-                self.disconnect_remote(remote::origin_of(self.snap.active_space))
-                    .await;
+                let origin = remote::origin_of(self.snap.active_space);
+                if origin == remote::LOCAL {
+                    self.toast("that's the local daemon");
+                } else {
+                    let host = self.host_of(self.snap.active_space).to_string();
+                    self.notify(format!("disconnecting {host}…"));
+                    // The daemon kills the ssh + drops the mirror, then broadcasts
+                    // a new snapshot; on_server refocuses us locally automatically.
+                    let _ = self.route(Request::DisconnectRemote { origin }).await;
+                }
             }
         }
-    }
-
-    /// Drop a remote for good: kill its SSH, forget it (no auto-reconnect), remove
-    /// its spaces/panes, and refocus locally if we were on it.
-    async fn disconnect_remote(&mut self, origin: Origin) {
-        if origin == remote::LOCAL {
-            self.toast("that's the local daemon");
-            return;
-        }
-        let host = self
-            .conns
-            .get(&origin)
-            .map(|c| c.host.clone())
-            .unwrap_or_default();
-        self.remotes.remove(&origin); // forget → the retry ticker won't bring it back
-        self.conns.remove(&origin); // drop Conn → kill_on_drop reaps the ssh child
-        self.connecting.remove(&origin);
-        self.snap
-            .spaces
-            .retain(|s| remote::origin_of(s.id) != origin);
-        self.snap
-            .panes
-            .retain(|p| remote::origin_of(p.id) != origin);
-        self.views.retain(|id, _| remote::origin_of(*id) != origin);
-        // If we were viewing this remote, jump back to a local space.
-        if remote::origin_of(self.snap.active_space) == origin
-            || remote::origin_of(self.focused) == origin
-        {
-            let local = self
-                .snap
-                .spaces
-                .iter()
-                .find(|s| remote::origin_of(s.id) == remote::LOCAL)
-                .and_then(|s| {
-                    s.tabs
-                        .iter()
-                        .find(|t| t.id == s.active_tab)
-                        .or_else(|| s.tabs.first())
-                        .map(|t| (s.id, t.id, t.active_pane))
-                });
-            if let Some((s, t, p)) = local {
-                self.set_active(s, t, p).await;
-            }
-        }
-        self.notify(format!("disconnected {host}"));
-        self.sync().await;
     }
 
     fn open_palette(&mut self) {
@@ -3254,9 +3176,7 @@ impl App {
         }
     }
 
-    async fn on_server(&mut self, origin: Origin, mut msg: ServerMsg) {
-        // Tag every id in the message with its daemon before we touch shared state.
-        remote::prefix_servermsg(&mut msg, origin);
+    async fn on_server(&mut self, msg: ServerMsg) {
         match msg {
             ServerMsg::State { snapshot } => {
                 self.drag = None;
@@ -3268,15 +3188,14 @@ impl App {
                     .active_space()
                     .map(|s| self.deck_sel >= s.tabs.len())
                     .unwrap_or(false);
-                // Merge this daemon's tree in (replacing only its own spaces/panes).
-                // Focus is client-owned: adopt this daemon's active space only if
-                // we're currently focused on it (or have no focus yet).
-                let incoming_active = snapshot.active_space;
-                remote::merge_snapshot(&mut self.snap, origin, &snapshot);
-                if self.snap.active_space == 0
-                    || remote::origin_of(self.snap.active_space) == origin
-                {
-                    self.snap.active_space = incoming_active;
+                // The daemon sends the full merged snapshot (local + all remotes).
+                // Focus is client-owned: keep our active space if it still exists
+                // (it may be a remote one the daemon doesn't track focus for),
+                // otherwise adopt the daemon's.
+                let keep = self.snap.active_space;
+                self.snap = snapshot;
+                if self.snap.spaces.iter().any(|s| s.id == keep) {
+                    self.snap.active_space = keep;
                 }
                 if self.deck && !was_on_button {
                     let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
@@ -3345,12 +3264,12 @@ impl App {
                 let _ = crossterm::execute!(out, DisableMouseCapture);
             }
         }
-        // Pick up newly config-declared remotes, then (re)connect anything missing.
+        // Pick up newly config-declared remotes — ask the daemon to connect them
+        // (already-connected hosts are a no-op on the daemon side).
         let specs: Vec<crate::config::RemoteSpec> = self.cfg.remotes.clone();
         for spec in specs {
-            self.add_remote(spec);
+            self.connect_remote(spec.host, spec.args).await;
         }
-        self.retry_remotes();
         self.sync().await;
         self.toast("config reloaded");
     }
@@ -5738,35 +5657,16 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     let spinner_ms = cfg.ui.spinner_ms;
     let mouse = cfg.ui.mouse;
     let (popup_tx, mut popup_rx) = unbounded_channel::<Vec<u8>>();
-    // All daemons' events fan into one channel tagged by origin; a `None` payload
-    // means that daemon dropped (triggering a reconnect for that origin).
-    let (mev_tx, mut mev_rx) = unbounded_channel::<(Origin, Option<ServerMsg>)>();
-    let (conn_tx, mut conn_rx) = unbounded_channel::<ConnMsg>();
-    spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
-    let mut conns = std::collections::BTreeMap::new();
-    conns.insert(
-        remote::LOCAL,
-        Conn {
-            client,
-            host: String::new(),
-            child: None,
-        },
-    );
-    // Config-declared remotes are known from the start (origins 1..); runtime
-    // `connect remote` adds more. Connecting happens in the background.
-    let remotes: std::collections::BTreeMap<Origin, crate::config::RemoteSpec> = cfg
-        .remotes
-        .iter()
-        .enumerate()
-        .map(|(i, r)| ((i as Origin) + 1, r.clone()))
-        .collect();
+    // The local daemon's event stream; a `None` payload means it dropped
+    // (restart/upgrade) and we reconnect. Remotes are the daemon's concern now.
+    let (mev_tx, mut mev_rx) = unbounded_channel::<Option<ServerMsg>>();
+    spawn_forwarder(events, mev_tx.clone());
+    // Config-declared remotes are connected by asking the daemon (with live SSH
+    // env) once we're up — see below.
+    let config_remotes = cfg.remotes.clone();
     let mut app = App {
         cfg,
-        conns,
-        mev_tx: mev_tx.clone(),
-        remotes,
-        conn_tx,
-        connecting: HashSet::new(),
+        client,
         snap,
         views: HashMap::new(),
         focused,
@@ -5860,7 +5760,11 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         hook(info);
     }));
 
-    app.retry_remotes(); // start connecting configured remotes in the background
+    // Ask the daemon to (re)connect any config-declared remotes, handing it our
+    // live SSH env. Idempotent — already-connected ones are a no-op on the daemon.
+    for r in &config_remotes {
+        app.connect_remote(r.host.clone(), r.args.clone()).await;
+    }
     app.sync().await;
 
     let (in_tx, mut in_rx) = unbounded_channel::<Event>();
@@ -5885,7 +5789,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_millis(spinner_ms));
     let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
-    let mut remote_ticker = tokio::time::interval(Duration::from_secs(5)); // auto-reconnect
     app.refresh_status_cmds().await; // populate #(command) segments up front
     while app.running {
         terminal.draw(|f| app.draw(f))?;
@@ -5895,8 +5798,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 None => app.running = false,
             },
             got = mev_rx.recv() => match got {
-                Some((origin, Some(m))) => app.on_server(origin, m).await,
-                Some((remote::LOCAL, None)) => {
+                Some(Some(m)) => app.on_server(m).await,
+                Some(None) => {
                     // Local daemon dropped (restart/upgrade) — reconnect and
                     // reattach instead of exiting. Panes persist across daemon
                     // restarts under the same ids, so the view comes right back.
@@ -5905,16 +5808,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                     if !reconnect(&mut app, &mut in_rx, &mev_tx).await {
                         app.running = false;
                     }
-                }
-                Some((origin, None)) => {
-                    // A remote dropped — drop its spaces but keep it known, so the
-                    // retry ticker reconnects it in the background.
-                    if let Some(c) = app.conns.remove(&origin) {
-                        app.toast(format!("{} disconnected", c.host));
-                    }
-                    app.connecting.remove(&origin);
-                    app.snap.spaces.retain(|s| remote::origin_of(s.id) != origin);
-                    app.snap.panes.retain(|p| remote::origin_of(p.id) != origin);
                 }
                 None => app.running = false,
             },
@@ -5927,20 +5820,6 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 }
                 None => {}
             },
-            up = conn_rx.recv() => match up {
-                Some(ConnMsg::Up(up)) => {
-                    let host = up.host.clone();
-                    app.on_conn_up(*up);
-                    app.sync().await;
-                    app.notify(format!("mirrored {host}"));
-                }
-                Some(ConnMsg::Failed { origin, host, error }) => {
-                    app.connecting.remove(&origin);
-                    app.notify(format!("connect {host} failed — {error} (see ~/.ruckus/client.log)"));
-                }
-                None => {}
-            },
-            _ = remote_ticker.tick() => app.retry_remotes(),
             _ = ticker.tick() => app.on_tick(),
             _ = status_ticker.tick() => app.refresh_status_cmds().await,
         }
@@ -5954,10 +5833,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         while let Ok(e) = in_rx.try_recv() {
             app.on_term_event(e).await;
         }
-        while let Ok(got) = mev_rx.try_recv() {
-            if let (origin, Some(m)) = got {
-                app.on_server(origin, m).await;
-            }
+        while let Ok(Some(m)) = mev_rx.try_recv() {
+            app.on_server(m).await;
         }
     }
 
@@ -5972,82 +5849,19 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// A remote (re)connected — reported by a background connector to the loop.
-struct ConnUp {
-    origin: Origin,
-    host: String,
-    client: Client,
-    events: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
-    child: tokio::process::Child,
-    snapshot: Snapshot,
-}
-
-/// Outcome of a background connect attempt. `Up` boxed because it's large.
-enum ConnMsg {
-    Up(Box<ConnUp>),
-    Failed {
-        origin: Origin,
-        host: String,
-        error: String,
-    },
-}
-
-/// Connect a remote in the background (so a hung/slow SSH never stalls the UI)
-/// and report the outcome back through `tx`. A short ConnectTimeout bounds a
-/// dead host; every failure is logged (client.log) AND surfaced as a toast so
-/// `connect remote` can never silently do nothing.
-fn spawn_connect(origin: Origin, spec: crate::config::RemoteSpec, tx: UnboundedSender<ConnMsg>) {
-    tokio::spawn(async move {
-        let mut args = vec!["-o".to_string(), "ConnectTimeout=6".to_string()];
-        args.extend(spec.args.clone());
-        tracing::info!(origin, "connect remote: starting {}", spec.host);
-        let fail = |tx: &UnboundedSender<ConnMsg>, error: String| {
-            tracing::warn!(origin, "connect remote {} failed: {error}", spec.host);
-            let _ = tx.send(ConnMsg::Failed {
-                origin,
-                host: spec.host.clone(),
-                error,
-            });
-        };
-        match crate::client::connect_remote(&spec.host, &args).await {
-            Ok((client, events, child)) => match client.snapshot().await {
-                Ok(snapshot) => {
-                    tracing::info!(
-                        origin,
-                        spaces = snapshot.spaces.len(),
-                        "connect remote: {} mirrored",
-                        spec.host
-                    );
-                    let _ = tx.send(ConnMsg::Up(Box::new(ConnUp {
-                        origin,
-                        host: spec.host,
-                        client,
-                        events,
-                        child,
-                        snapshot,
-                    })));
-                }
-                Err(e) => fail(&tx, format!("snapshot: {e:#}")),
-            },
-            Err(e) => fail(&tx, format!("ssh: {e:#}")),
-        }
-    });
-}
-
-/// Forward one daemon's event stream into the merged channel, tagged by origin.
-/// Sends `(origin, None)` when the stream ends so the loop can reconnect it.
+/// Forward the local daemon's event stream into the loop channel. Sends `None`
+/// when the stream ends so the loop knows the daemon dropped and can reconnect.
 fn spawn_forwarder(
-    origin: Origin,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
-    tx: tokio::sync::mpsc::UnboundedSender<(Origin, Option<ServerMsg>)>,
+    tx: tokio::sync::mpsc::UnboundedSender<Option<ServerMsg>>,
 ) {
     tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
-            if tx.send((origin, Some(m))).is_err() {
+            if tx.send(Some(m)).is_err() {
                 return;
             }
         }
-        let _ = tx.send((origin, None));
+        let _ = tx.send(None);
     });
 }
 
@@ -6057,7 +5871,7 @@ fn spawn_forwarder(
 async fn reconnect(
     app: &mut App,
     in_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    mev_tx: &tokio::sync::mpsc::UnboundedSender<(Origin, Option<ServerMsg>)>,
+    mev_tx: &tokio::sync::mpsc::UnboundedSender<Option<ServerMsg>>,
 ) -> bool {
     for _ in 0..240 {
         // Let the user bail out while we retry.
@@ -6071,18 +5885,10 @@ async fn reconnect(
         }
         if ensure_daemon().await.is_ok() {
             if let Ok((client, events)) = connect().await {
-                if let Ok(mut snap) = client.snapshot().await {
-                    remote::prefix_snapshot(&mut snap, remote::LOCAL);
-                    remote::merge_snapshot(&mut app.snap, remote::LOCAL, &snap);
-                    app.conns.insert(
-                        remote::LOCAL,
-                        Conn {
-                            client,
-                            host: String::new(),
-                            child: None,
-                        },
-                    );
-                    spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
+                if let Ok(snap) = client.snapshot().await {
+                    app.snap = snap;
+                    app.client = client;
+                    spawn_forwarder(events, mev_tx.clone());
                     app.views.clear(); // force re-attach of every visible pane
                     app.sync().await;
                     app.toast("🐏 reconnected");

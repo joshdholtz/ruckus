@@ -104,20 +104,12 @@ pub fn init_client_log() {
     }
 }
 
-/// Connect to a remote daemon over SSH: `ssh [args] <host> ruckus __proxy`
-/// relays the remote's unix socket over stdio. Returns the child so the caller
-/// can kill it on disconnect. Reuses SSH auth — no ports, no new protocol.
-pub async fn connect_remote(
-    host: &str,
-    args: &[String],
-) -> Result<(Client, UnboundedReceiver<ServerMsg>, tokio::process::Child)> {
-    connect_remote_env(host, args, &std::collections::BTreeMap::new()).await
-}
-
-/// Like `connect_remote`, but applies `env` to the ssh process. The hybrid model
-/// runs this in the *daemon*: the client hands over its live SSH env (chiefly
-/// `SSH_AUTH_SOCK`) so the detached daemon authenticates as the user — agent
-/// auth and hardware-key touch are agent-side, so they keep working.
+/// Connect to a remote daemon over SSH: `ssh [args] <host> ruckus __proxy` relays
+/// the remote's unix socket over stdio, applying `env` to the ssh process. The
+/// hybrid model runs this in the *daemon*: the client hands over its live SSH env
+/// (chiefly `SSH_AUTH_SOCK`) so the detached daemon authenticates as the user —
+/// agent auth and hardware-key touch are agent-side, so they keep working.
+/// Returns the child so the caller can kill it on disconnect.
 pub async fn connect_remote_env(
     host: &str,
     args: &[String],
