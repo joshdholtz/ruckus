@@ -771,7 +771,8 @@ impl State {
         for (origin, rc) in &self.remotes {
             snap.spaces.extend(rc.snapshot.spaces.iter().cloned());
             snap.panes.extend(rc.snapshot.panes.iter().cloned());
-            snap.remote_hosts.insert(*origin, rc.host.clone());
+            snap.remote_hosts
+                .insert(origin.to_string(), rc.host.clone());
         }
         snap
     }

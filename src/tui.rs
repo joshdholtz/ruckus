@@ -1260,7 +1260,7 @@ impl App {
         }
         self.snap
             .remote_hosts
-            .get(&origin)
+            .get(&origin.to_string())
             .map(|s| s.as_str())
             .unwrap_or("")
     }

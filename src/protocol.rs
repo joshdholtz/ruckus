@@ -383,7 +383,11 @@ pub struct Snapshot {
     /// origin → host label for mirrored remotes (origin 0 = local, never listed).
     /// Lets the client tag + colour remote rows without its own connection state.
     #[serde(default)]
-    pub remote_hosts: std::collections::BTreeMap<u16, String>,
+    /// origin → host label. Key is a String (not u16): JSON object keys are
+    /// always strings, and a u16 key fails to round-trip through the client's
+    /// deserializer ("invalid type: string, expected u16"), which silently
+    /// dropped every State frame once a remote was mirrored.
+    pub remote_hosts: std::collections::BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -464,6 +468,37 @@ pub fn basename(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a State frame carrying a non-empty `remote_hosts` (i.e. once a
+    /// remote is mirrored) MUST round-trip through the exact path the client's
+    /// reader uses — `serde_json::from_str::<ServerFrame>`. A `u16` map key
+    /// serialized to JSON as the string `"1"` failed to deserialize ("invalid
+    /// type: string, expected u16"), so the client silently dropped every State
+    /// frame and all snapshot-based requests timed out. Earlier tests missed this
+    /// because they read raw JSON, never the typed deserializer.
+    #[test]
+    fn state_frame_with_remote_hosts_round_trips_through_client_deserializer() {
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .remote_hosts
+            .insert("1".to_string(), "workbox".to_string());
+        let wire = serde_json::to_string(&ServerFrame {
+            seq: Some(1),
+            msg: ServerMsg::State { snapshot },
+        })
+        .unwrap();
+        // This is literally what connect_io's reader does per line — it must parse.
+        let back: ServerFrame = serde_json::from_str(&wire).expect("client must parse State frame");
+        match back.msg {
+            ServerMsg::State { snapshot } => {
+                assert_eq!(
+                    snapshot.remote_hosts.get("1").map(String::as_str),
+                    Some("workbox")
+                );
+            }
+            _ => panic!("expected State"),
+        }
+    }
 
     fn leaf(p: u64) -> Node {
         Node::Leaf { pane: p }

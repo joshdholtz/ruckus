@@ -294,20 +294,17 @@ async fn disconnect_remote_cmd(target: Option<String>, force: bool) -> Result<()
         return Ok(());
     }
     // Resolve which origins to drop: all, an exact origin number, or a host match.
+    // Keys are strings (origin numbers as text).
     let origins: Vec<u16> = match target.as_deref() {
-        None => hosts.keys().copied().collect(),
+        None => hosts.keys().filter_map(|k| k.parse().ok()).collect(),
         Some(t) => {
-            if let Ok(n) = t.parse::<u16>() {
-                if hosts.contains_key(&n) {
-                    vec![n]
-                } else {
-                    vec![]
-                }
+            if hosts.contains_key(t) {
+                t.parse().into_iter().collect()
             } else {
                 hosts
                     .iter()
                     .filter(|(_, h)| h.contains(t))
-                    .map(|(o, _)| *o)
+                    .filter_map(|(o, _)| o.parse().ok())
                     .collect()
             }
         }
@@ -317,7 +314,7 @@ async fn disconnect_remote_cmd(target: Option<String>, force: bool) -> Result<()
         return Ok(());
     }
     for o in origins {
-        let host = hosts.get(&o).cloned().unwrap_or_default();
+        let host = hosts.get(&o.to_string()).cloned().unwrap_or_default();
         client
             .request(Request::DisconnectRemote { origin: o })
             .await?;
