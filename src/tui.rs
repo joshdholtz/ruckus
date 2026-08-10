@@ -3847,10 +3847,15 @@ impl App {
                         } else {
                             th.bar_active_fg
                         };
+                        // Configurable remote label (default "☁ {host}: {name}").
                         let disp = if host.is_empty() {
                             s.name.clone()
                         } else {
-                            format!("{host}: {}", s.name)
+                            self.cfg
+                                .ui
+                                .remote_label
+                                .replace("{host}", host)
+                                .replace("{name}", &s.name)
                         };
                         let vars = vec![
                             ("name", disp.clone()),

@@ -124,7 +124,7 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 | `[theme]` | All 15 colors — 4 background layers, accent, text tiers, state colors |
 | `[ui]` | Sidebar side/width/section order; gutter + pane padding; title bars; header/footer position; tab strip; narrow-collapse threshold; deck on/off; spinner speed; toast position; mouse |
 | `[glyphs]` | State icons, focus marker, spinner frames |
-| Row templates | `space_row` / `tab_row` / `queue_row` with `{icon} {title} {name} {id} {cmd} {cwd}` tokens |
+| Row templates | `space_row` / `tab_row` / `queue_row` with `{icon} {title} {name} {id} {cmd} {cwd}` tokens; `remote_label` (`{host}`/`{name}`, default `☁ {host}: {name}`) styles mirrored remote spaces, plus `theme.remote` for their colour |
 
 Or pick a built-in theme: `ruckus theme` lists them (macchiato, latte, gruvbox, nord, tokyonight, dracula, rosepine), `ruckus theme nord` switches live. The only thing ruckus can't control is the font — that belongs to your terminal app.
 

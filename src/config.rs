@@ -483,6 +483,11 @@ pub struct UiConfig {
     pub space_row: String,
     pub tab_row: String,
     pub queue_row: String,
+    /// How a mirrored *remote* space's name is decorated in the sidebar. Tokens:
+    /// `{host}` (the ssh host you connected) and `{name}` (the space name). The
+    /// default glyph + prefix make remote spaces obvious; set to `"{name}"` to
+    /// hide the distinction, or customise freely.
+    pub remote_label: String,
 }
 
 impl Default for UiConfig {
@@ -546,6 +551,7 @@ impl Default for UiConfig {
             space_row: "{icon} {name}".to_string(),
             tab_row: "{icon} {title}".to_string(),
             queue_row: "{icon} {title}".to_string(),
+            remote_label: "☁ {host}: {name}".to_string(),
         }
     }
 }
@@ -741,6 +747,7 @@ struct RawUi {
     mac_option_fallback: Option<bool>,
     link_click: Option<String>,
     space_row: Option<String>,
+    remote_label: Option<String>,
     tab_row: Option<String>,
     queue_row: Option<String>,
 }
@@ -1296,6 +1303,7 @@ impl Config {
                 _ => LinkClick::Plain,
             },
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
+            remote_label: raw.ui.remote_label.unwrap_or(d.remote_label),
             tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
             queue_row: raw.ui.queue_row.unwrap_or(d.queue_row),
         };
@@ -1488,6 +1496,8 @@ mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt
 space_row = "{icon} {name}"
 tab_row = "{icon} {title}"
 queue_row = "{icon} {title}"
+# How mirrored remote spaces are labelled. Tokens: {host} {name}
+remote_label = "☁ {host}: {name}"
 
 [notify]
 system = true               # macOS notification when a pane needs you and nobody's watching

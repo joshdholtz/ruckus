@@ -1,6 +1,6 @@
 [package]
 name = "ruckus"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "a persistent runtime for your coding agents"
 license = "Apache-2.0"
