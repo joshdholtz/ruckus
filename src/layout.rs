@@ -29,10 +29,15 @@ pub fn split_chunks(dir: Dir, n: usize, weights: &[u16], area: Rect, gutter: u16
 pub fn node_rects(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(u64, Rect)>) {
     match node {
         Node::Leaf { pane } => out.push((*pane, area)),
-        Node::Split { dir, children, weights } => {
-            for (c, r) in children
-                .iter()
-                .zip(split_chunks(*dir, children.len(), weights, area, gutter))
+        Node::Split {
+            dir,
+            children,
+            weights,
+        } => {
+            for (c, r) in
+                children
+                    .iter()
+                    .zip(split_chunks(*dir, children.len(), weights, area, gutter))
             {
                 node_rects(c, r, gutter, out);
             }
@@ -43,7 +48,12 @@ pub fn node_rects(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(u64, Rect
 /// Collect subtle divider segments in the gutter between sibling panes.
 /// Each entry is (line rect, is_vertical).
 pub fn node_dividers(node: &Node, area: Rect, gutter: u16, out: &mut Vec<(Rect, bool)>) {
-    let Node::Split { dir, children, weights } = node else {
+    let Node::Split {
+        dir,
+        children,
+        weights,
+    } = node
+    else {
         return;
     };
     let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
@@ -76,7 +86,12 @@ pub fn find_border(
     row: u16,
     path: &mut Vec<usize>,
 ) -> Option<(Vec<usize>, usize, Dir)> {
-    let Node::Split { dir, children, weights } = node else {
+    let Node::Split {
+        dir,
+        children,
+        weights,
+    } = node
+    else {
         return None;
     };
     let chunks = split_chunks(*dir, children.len(), weights, area, gutter);
@@ -131,7 +146,12 @@ pub fn area_at_path(node: &Node, area: Rect, gutter: u16, path: &[usize]) -> Opt
     if path.is_empty() {
         return Some(area);
     }
-    let Node::Split { dir, children, weights } = node else {
+    let Node::Split {
+        dir,
+        children,
+        weights,
+    } = node
+    else {
         return None;
     };
     let chunks = split_chunks(*dir, children.len(), weights, area, gutter);

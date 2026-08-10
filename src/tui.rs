@@ -72,7 +72,11 @@ fn fuzzy_indices(cand: &str, q: &str) -> Option<(i32, Vec<usize>)> {
         let mut matched = false;
         while ci < cand.len() {
             if cand[ci].eq_ignore_ascii_case(&qc) {
-                score += if prev == Some(ci.wrapping_sub(1)) { 3 } else { 1 };
+                score += if prev == Some(ci.wrapping_sub(1)) {
+                    3
+                } else {
+                    1
+                };
                 if ci == 0 {
                     score += 2;
                 }
@@ -124,6 +128,24 @@ fn hl_spans(
     }
     flush(&mut spans, &mut cur, cur_match);
     spans
+}
+
+/// Substitute a link handler's `run` template into argv: `${url}`/`${match}`/
+/// `${0}` = the whole match, `${1}`.. = capture groups. Each whitespace token
+/// becomes exactly one argv element (the matched text is never shell-split).
+fn link_argv(run: &str, full: &str, groups: &[&str]) -> Vec<String> {
+    run.split_whitespace()
+        .map(|tok| {
+            let mut t = tok
+                .replace("${url}", full)
+                .replace("${match}", full)
+                .replace("${0}", full);
+            for (i, g) in groups.iter().enumerate() {
+                t = t.replace(&format!("${{{}}}", i + 1), g);
+            }
+            t
+        })
+        .collect()
 }
 
 /// A pane's display name: its title, else its command, else a fallback.
@@ -178,7 +200,11 @@ fn spawn_popup(
 ) -> anyhow::Result<Popup> {
     use anyhow::anyhow;
     use std::io::Read;
-    let cmdline = if cmd.is_empty() { vec![crate::protocol::default_shell()] } else { cmd };
+    let cmdline = if cmd.is_empty() {
+        vec![crate::protocol::default_shell()]
+    } else {
+        cmd
+    };
     let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
         rows,
         cols,
@@ -188,10 +214,19 @@ fn spawn_popup(
     let mut builder = portable_pty::CommandBuilder::new(&cmdline[0]);
     builder.args(&cmdline[1..]);
     builder.env("TERM", "xterm-256color");
-    builder.env("RUCKUS_SOCK", crate::protocol::socket_path().display().to_string());
-    builder.env("RUCKUS_DIR", crate::protocol::ruckus_dir().display().to_string());
+    builder.env(
+        "RUCKUS_SOCK",
+        crate::protocol::socket_path().display().to_string(),
+    );
+    builder.env(
+        "RUCKUS_DIR",
+        crate::protocol::ruckus_dir().display().to_string(),
+    );
     builder.cwd(&cwd);
-    let child = pair.slave.spawn_command(builder).map_err(|e| anyhow!("spawn: {e}"))?;
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| anyhow!("spawn: {e}"))?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
@@ -253,7 +288,12 @@ impl Palette {
                 collapsed.insert(t.id);
             }
         }
-        Palette { query: String::new(), sel: 0, scroll: 0, collapsed }
+        Palette {
+            query: String::new(),
+            sel: 0,
+            scroll: 0,
+            collapsed,
+        }
     }
     /// `>`-prefixed query means the flat command list, not the tree.
     fn is_commands(&self) -> bool {
@@ -261,7 +301,11 @@ impl Palette {
     }
     /// The active filter text (without the `>` mode prefix), lowercased.
     fn filter(&self) -> String {
-        self.query.strip_prefix('>').unwrap_or(&self.query).trim().to_lowercase()
+        self.query
+            .strip_prefix('>')
+            .unwrap_or(&self.query)
+            .trim()
+            .to_lowercase()
     }
 }
 
@@ -288,6 +332,133 @@ struct PRow {
     dim: bool,
 }
 
+/// The pure structural result of the tree navigator: which rows are visible,
+/// their depth, fold state, and match highlights — no styling/time. Extracted
+/// so the filter/fold logic is unit-testable independent of the App.
+struct PTreeRow {
+    kind: PKind,
+    depth: u8,
+    label: String,
+    hl: Vec<usize>,
+    expandable: bool,
+    expanded: bool,
+    dim: bool,
+}
+
+/// Build the Space → Tab → Pane navigator rows for `q` + `collapsed`. Panes
+/// appear only under split tabs; while filtering we force-expand along matches
+/// and dim rows shown purely as context. Pure over the snapshot.
+fn palette_tree(snap: &Snapshot, q: &str, collapsed: &HashSet<u64>) -> Vec<PTreeRow> {
+    let filtering = !q.is_empty();
+    let mut rows = Vec::new();
+    for s in &snap.spaces {
+        let space_hl = fuzzy_indices(&s.name, q);
+        let space_match = space_hl.is_some();
+        struct TabData {
+            idx: usize,
+            hl: Option<Vec<usize>>,
+            panes: Vec<(u64, String, Option<Vec<usize>>)>,
+        }
+        let mut tabs: Vec<TabData> = Vec::new();
+        for (ti, t) in s.tabs.iter().enumerate() {
+            let hl = fuzzy_indices(&t.name, q).map(|(_, h)| h);
+            let mut leaves = Vec::new();
+            t.layout.leaves(&mut leaves);
+            let panes = if leaves.len() > 1 {
+                leaves
+                    .iter()
+                    .map(|pid| {
+                        let name = pane_name(snap.pane(*pid));
+                        let m = fuzzy_indices(&name, q).map(|(_, h)| h);
+                        (*pid, name, m)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tabs.push(TabData { idx: ti, hl, panes });
+        }
+        let any_tab_match = tabs.iter().any(|t| t.hl.is_some());
+        let any_pane_match = tabs
+            .iter()
+            .any(|t| t.panes.iter().any(|(_, _, m)| m.is_some()));
+        if filtering && !space_match && !any_tab_match && !any_pane_match {
+            continue;
+        }
+        let space_expanded = if filtering {
+            true
+        } else {
+            !collapsed.contains(&s.id)
+        };
+        rows.push(PTreeRow {
+            kind: PKind::Space(s.id),
+            depth: 0,
+            label: s.name.clone(),
+            hl: space_hl
+                .as_ref()
+                .map(|(_, h)| h.clone())
+                .unwrap_or_default(),
+            expandable: !s.tabs.is_empty(),
+            expanded: space_expanded,
+            dim: filtering && space_hl.as_ref().map(|(_, h)| h.is_empty()).unwrap_or(true),
+        });
+        if !space_expanded {
+            continue;
+        }
+        for tr in &tabs {
+            let t = &s.tabs[tr.idx];
+            let tab_match = tr.hl.is_some();
+            let pane_match = tr.panes.iter().any(|(_, _, m)| m.is_some());
+            if filtering && !space_match && !tab_match && !pane_match {
+                continue;
+            }
+            let split = !tr.panes.is_empty();
+            let tab_expanded = if filtering {
+                pane_match
+            } else {
+                !collapsed.contains(&t.id)
+            };
+            rows.push(PTreeRow {
+                kind: PKind::Jump {
+                    space: s.id,
+                    tab: t.id,
+                    pane: t.active_pane,
+                },
+                depth: 1,
+                label: t.name.clone(),
+                hl: tr.hl.clone().unwrap_or_default(),
+                expandable: split,
+                expanded: tab_expanded,
+                dim: filtering && !tab_match,
+            });
+            if !split || !tab_expanded {
+                continue;
+            }
+            for (pid, name, m) in &tr.panes {
+                if filtering && !space_match && !tab_match && m.is_none() {
+                    continue;
+                }
+                rows.push(PTreeRow {
+                    kind: PKind::Jump {
+                        space: s.id,
+                        tab: t.id,
+                        pane: *pid,
+                    },
+                    depth: 2,
+                    label: name.clone(),
+                    hl: m.clone().unwrap_or_default(),
+                    expandable: false,
+                    expanded: false,
+                    dim: filtering && m.is_none(),
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// A NEEDS-YOU sidebar row: (pane id, template vars, state glyph).
+type AttnRow = (u64, Vec<(&'static str, String)>, (String, Color));
 
 /// A clickable affordance rendered in the sidebar.
 #[derive(Clone, Copy)]
@@ -582,7 +753,12 @@ fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
 fn tab_activity(snap: &Snapshot, tab: &TabInfo) -> Activity {
     let mut leaves = Vec::new();
     tab.layout.leaves(&mut leaves);
-    agg_activity(leaves.iter().filter_map(|p| snap.pane(*p)).map(|p| p.activity))
+    agg_activity(
+        leaves
+            .iter()
+            .filter_map(|p| snap.pane(*p))
+            .map(|p| p.activity),
+    )
 }
 
 fn space_activity(snap: &Snapshot, space: &SpaceInfo) -> Activity {
@@ -611,7 +787,10 @@ fn template_spans(
     let mut rest = tpl;
     while let Some(start) = rest.find('{') {
         if start > 0 {
-            spans.push(Span::styled(rest[..start].to_string(), row_style.fg(text_fg)));
+            spans.push(Span::styled(
+                rest[..start].to_string(),
+                row_style.fg(text_fg),
+            ));
         }
         match rest[start..].find('}') {
             Some(endrel) => {
@@ -621,15 +800,15 @@ fn template_spans(
                 } else if let Some((_, v)) = vars.iter().find(|(k, _)| *k == token) {
                     spans.push(Span::styled(v.clone(), row_style.fg(text_fg)));
                 } else {
-                    spans.push(Span::styled(
-                        format!("{{{token}}}"),
-                        row_style.fg(text_fg),
-                    ));
+                    spans.push(Span::styled(format!("{{{token}}}"), row_style.fg(text_fg)));
                 }
                 rest = &rest[start + endrel + 1..];
             }
             None => {
-                spans.push(Span::styled(rest[start..].to_string(), row_style.fg(text_fg)));
+                spans.push(Span::styled(
+                    rest[start..].to_string(),
+                    row_style.fg(text_fg),
+                ));
                 rest = "";
             }
         }
@@ -721,7 +900,12 @@ impl App {
             .unwrap_or(0);
         let ni = ((idx as i32 + dir).rem_euclid(n as i32)) as usize;
         let s = self.snap.spaces[ni].clone();
-        if let Some(t) = s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()) {
+        if let Some(t) = s
+            .tabs
+            .iter()
+            .find(|t| t.id == s.active_tab)
+            .or(s.tabs.first())
+        {
             self.deck_sel = 0;
             self.deck_scroll = 0;
             self.set_active(s.id, t.id, t.active_pane).await;
@@ -731,7 +915,9 @@ impl App {
     /// Activate the deck item at `idx`: a card enters its pane; the trailing two
     /// indices are the +tab / +space buttons.
     async fn deck_activate(&mut self, idx: usize) {
-        let Some(sp) = self.active_space() else { return };
+        let Some(sp) = self.active_space() else {
+            return;
+        };
         let ncards = sp.tabs.len();
         if idx < ncards {
             let t = &sp.tabs[idx];
@@ -800,12 +986,18 @@ impl App {
         }
         let body = Rect::new(0, top, w, bot.saturating_sub(top));
         let shown = self.sidebar_shown();
-        let sw = if shown { self.sidebar_width().min(w.saturating_sub(20)) } else { 0 };
+        let sw = if shown {
+            self.sidebar_width().min(w.saturating_sub(20))
+        } else {
+            0
+        };
         let (sidebar, main_x, main_w) = if shown {
             match ui.sidebar_pos {
-                SidebarPos::Left => {
-                    (Some(Rect::new(0, body.y, sw, body.height)), sw, w.saturating_sub(sw))
-                }
+                SidebarPos::Left => (
+                    Some(Rect::new(0, body.y, sw, body.height)),
+                    sw,
+                    w.saturating_sub(sw),
+                ),
                 SidebarPos::Right => (
                     Some(Rect::new(w.saturating_sub(sw), body.y, sw, body.height)),
                     0,
@@ -818,15 +1010,33 @@ impl App {
         let main = Rect::new(main_x, body.y, main_w, body.height);
         let (tabs, panes) = if ui.tab_strip && main.height > 1 && !minimal {
             // Reserve one extra row under the tab strip for a divider line.
-            let border = if ui.tab_border && main.height > 2 { 1 } else { 0 };
+            let border = if ui.tab_border && main.height > 2 {
+                1
+            } else {
+                0
+            };
             (
                 Some(main.y),
-                Rect::new(main.x, main.y + 1 + border, main.width, main.height - 1 - border),
+                Rect::new(
+                    main.x,
+                    main.y + 1 + border,
+                    main.width,
+                    main.height - 1 - border,
+                ),
             )
         } else {
             (None, main)
         };
-        FrameLayout { header, footer, action, tabs, body, sidebar, main, panes }
+        FrameLayout {
+            header,
+            footer,
+            action,
+            tabs,
+            body,
+            sidebar,
+            main,
+            panes,
+        }
     }
 
     fn compute_rects(&self) -> Vec<(u64, Rect)> {
@@ -882,7 +1092,11 @@ impl App {
 
     /// Absolute (col,row) clamped into `pane`'s content -> cell (row,col).
     fn cell_in_pane(&self, pane: u64, col: u16, row: u16) -> Option<(u16, u16)> {
-        let rect = self.pane_rects.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r)?;
+        let rect = self
+            .pane_rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)?;
         let c = self.pane_content_rect(rect);
         if c.width == 0 || c.height == 0 {
             return None;
@@ -899,7 +1113,9 @@ impl App {
             return;
         }
         let ((sr, sc), (er, ec)) = sel.ordered();
-        let Some(view) = self.views.get(&sel.pane) else { return };
+        let Some(view) = self.views.get(&sel.pane) else {
+            return;
+        };
         let screen = view.parser.screen();
         let (rows, cols) = screen.size();
         // Clamp every coordinate to the grid: a client/daemon size desync can put
@@ -961,13 +1177,25 @@ impl App {
         for (pane, rect) in rects {
             let (rows, cols) = self.pane_size(rect);
             if !self.views.contains_key(&pane) {
-                match self.client.request(Request::Attach { pane, rows, cols }).await {
+                match self
+                    .client
+                    .request(Request::Attach { pane, rows, cols })
+                    .await
+                {
                     Ok(ServerMsg::Attached { scrollback, .. }) => {
                         let mut parser = vt100::Parser::new(rows, cols, 10_000);
                         if let Ok(bytes) = B64.decode(scrollback.as_bytes()) {
                             parser.process(&bytes);
                         }
-                        self.views.insert(pane, PaneView { parser, scroll: 0, rows, cols });
+                        self.views.insert(
+                            pane,
+                            PaneView {
+                                parser,
+                                scroll: 0,
+                                rows,
+                                cols,
+                            },
+                        );
                     }
                     Err(e) => self.toast(e.to_string()),
                     _ => {}
@@ -977,7 +1205,10 @@ impl App {
                     v.rows = rows;
                     v.cols = cols;
                     v.parser.set_size(rows, cols);
-                    let _ = self.client.request(Request::Resize { pane, rows, cols }).await;
+                    let _ = self
+                        .client
+                        .request(Request::Resize { pane, rows, cols })
+                        .await;
                 }
             }
         }
@@ -1004,7 +1235,10 @@ impl App {
         }
         self.focused = pane;
         self.mark_seen();
-        let _ = self.client.request(Request::SetActive { space, tab, pane }).await;
+        let _ = self
+            .client
+            .request(Request::SetActive { space, tab, pane })
+            .await;
         self.sync().await;
     }
 
@@ -1057,8 +1291,12 @@ impl App {
     fn persist_sidebar_width(&self) {
         let Some(w) = self.sidebar_w else { return };
         let path = crate::config::ensure_config_file();
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+            return;
+        };
         if !doc.contains_key("ui") {
             doc["ui"] = toml_edit::Item::Table(toml_edit::Table::new());
         }
@@ -1104,8 +1342,9 @@ impl App {
     /// Every pane running a non-shell command (an "agent"), across all spaces,
     /// most-attention-first: (pane id, tab name, space name).
     fn agent_rows(&self) -> Vec<(u64, String, String)> {
-        const SHELLS: &[&str] =
-            &["zsh", "bash", "sh", "fish", "dash", "tcsh", "ksh", "nu", "pwsh"];
+        const SHELLS: &[&str] = &[
+            "zsh", "bash", "sh", "fish", "dash", "tcsh", "ksh", "nu", "pwsh",
+        ];
         let mut out = Vec::new();
         for s in &self.snap.spaces {
             for t in &s.tabs {
@@ -1135,7 +1374,11 @@ impl App {
             }
         }
         out.sort_by_key(|(pid, _, _)| {
-            let a = self.snap.pane(*pid).map(|p| p.activity).unwrap_or(Activity::Idle);
+            let a = self
+                .snap
+                .pane(*pid)
+                .map(|p| p.activity)
+                .unwrap_or(Activity::Idle);
             std::cmp::Reverse(a.urgency())
         });
         out
@@ -1175,7 +1418,12 @@ impl App {
     /// matched text, the resolved argv, and its placement. `${url}`/`${match}`/
     /// `${0}` are the whole match; `${1}`.. are regex capture groups — each
     /// substituted as a SINGLE argv element (never shell-interpreted).
-    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, Vec<String>, Option<Placement>)> {
+    fn link_at(
+        &self,
+        pane: u64,
+        row: u16,
+        col: u16,
+    ) -> Option<(String, Vec<String>, Option<Placement>)> {
         let screen = self.views.get(&pane)?.parser.screen();
         let contents = screen.contents();
         let line = contents.lines().nth(row as usize)?;
@@ -1186,22 +1434,10 @@ impl App {
                 let end = start + m.as_str().chars().count();
                 if (col as usize) >= start && (col as usize) < end {
                     let full = m.as_str();
-                    let argv: Vec<String> = rule
-                        .run
-                        .split_whitespace()
-                        .map(|tok| {
-                            let mut t = tok
-                                .replace("${url}", full)
-                                .replace("${match}", full)
-                                .replace("${0}", full);
-                            for i in 1..caps.len() {
-                                if let Some(g) = caps.get(i) {
-                                    t = t.replace(&format!("${{{i}}}"), g.as_str());
-                                }
-                            }
-                            t
-                        })
+                    let groups: Vec<&str> = (1..caps.len())
+                        .map(|i| caps.get(i).map_or("", |g| g.as_str()))
                         .collect();
+                    let argv = link_argv(&rule.run, full, &groups);
                     return Some((full.to_string(), argv, rule.placement));
                 }
             }
@@ -1211,7 +1447,9 @@ impl App {
 
     /// Run a link handler's resolved argv detached (e.g. `open <url>`).
     fn run_link(&mut self, argv: &[String], matched: &str) {
-        let Some((prog, args)) = argv.split_first() else { return };
+        let Some((prog, args)) = argv.split_first() else {
+            return;
+        };
         let _ = std::process::Command::new(prog)
             .args(args)
             .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
@@ -1237,11 +1475,28 @@ impl App {
         }
         let cwd = Some(self.seed_cwd(self.focused));
         let req = match placement {
-            Placement::SplitRight => Request::Split { pane: self.focused, dir: Dir::Right, cmd, cwd },
-            Placement::SplitDown => Request::Split { pane: self.focused, dir: Dir::Down, cmd, cwd },
+            Placement::SplitRight => Request::Split {
+                pane: self.focused,
+                dir: Dir::Right,
+                cmd,
+                cwd,
+            },
+            Placement::SplitDown => Request::Split {
+                pane: self.focused,
+                dir: Dir::Down,
+                cmd,
+                cwd,
+            },
             Placement::Tab => {
-                let Some(space) = self.active_space().map(|s| s.id) else { return };
-                Request::NewTab { space, name: None, cmd, cwd }
+                let Some(space) = self.active_space().map(|s| s.id) else {
+                    return;
+                };
+                Request::NewTab {
+                    space,
+                    name: None,
+                    cmd,
+                    cwd,
+                }
             }
             Placement::Popup => return, // handled above
         };
@@ -1284,7 +1539,12 @@ impl App {
 
     async fn split_action(&mut self, pane: u64, dir: Dir) {
         let cwd = Some(self.seed_cwd(pane));
-        let req = Request::Split { pane, dir, cmd: Vec::new(), cwd };
+        let req = Request::Split {
+            pane,
+            dir,
+            cmd: Vec::new(),
+            cwd,
+        };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -1293,9 +1553,16 @@ impl App {
     }
 
     async fn new_tab_action(&mut self, name: Option<String>) {
-        let Some(space) = self.active_space().map(|s| s.id) else { return };
+        let Some(space) = self.active_space().map(|s| s.id) else {
+            return;
+        };
         let cwd = Some(self.seed_cwd(self.focused));
-        let req = Request::NewTab { space, name, cmd: Vec::new(), cwd };
+        let req = Request::NewTab {
+            space,
+            name,
+            cmd: Vec::new(),
+            cwd,
+        };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -1304,7 +1571,10 @@ impl App {
     }
 
     async fn new_space_action(&mut self, name: Option<String>) {
-        let req = Request::NewSpace { name, cwd: Some(self.seed_cwd(self.focused)) };
+        let req = Request::NewSpace {
+            name,
+            cwd: Some(self.seed_cwd(self.focused)),
+        };
         match self.client.request(req).await {
             Ok(ServerMsg::Created { space, tab, pane }) => self.set_active(space, tab, pane).await,
             Err(e) => self.toast(e.to_string()),
@@ -1320,15 +1590,30 @@ impl App {
             PromptKind::Reply => ("type a reply (enter to send)", String::new()),
             PromptKind::RenameSpace(id) => (
                 "rename space",
-                self.snap.spaces.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default(),
+                self.snap
+                    .spaces
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default(),
             ),
             PromptKind::RenameTab(id) => (
                 "rename tab",
-                self.snap.spaces.iter().flat_map(|s| &s.tabs).find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_default(),
+                self.snap
+                    .spaces
+                    .iter()
+                    .flat_map(|s| &s.tabs)
+                    .find(|t| t.id == id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default(),
             ),
             PromptKind::Search => ("search scrollback", String::new()),
         };
-        self.prompt = Some(Prompt { kind, label, buffer });
+        self.prompt = Some(Prompt {
+            kind,
+            label,
+            buffer,
+        });
     }
 
     /// Scan the focused pane's scrollback for the active query and scroll to a
@@ -1340,7 +1625,9 @@ impl App {
         }
         let ql = q.to_lowercase();
         let (found, missed) = {
-            let Some(v) = self.views.get_mut(&self.focused) else { return };
+            let Some(v) = self.views.get_mut(&self.focused) else {
+                return;
+            };
             let step = (v.rows.max(1) as usize).max(1);
             let max_off = 10_000usize;
             let mut off = v.scroll;
@@ -1381,13 +1668,21 @@ impl App {
     async fn submit_prompt(&mut self) {
         let Some(p) = self.prompt.take() else { return };
         let name = p.buffer.trim().to_string();
-        let opt = if name.is_empty() { None } else { Some(name.clone()) };
+        let opt = if name.is_empty() {
+            None
+        } else {
+            Some(name.clone())
+        };
         match p.kind {
             PromptKind::NewTab => self.new_tab_action(opt).await,
             PromptKind::NewSpace => self.new_space_action(opt).await,
             PromptKind::RenameSpace(space) => {
                 if let Some(name) = opt {
-                    if let Err(e) = self.client.request(Request::RenameSpace { space, name }).await {
+                    if let Err(e) = self
+                        .client
+                        .request(Request::RenameSpace { space, name })
+                        .await
+                    {
                         self.toast(e.to_string());
                     }
                 }
@@ -1503,7 +1798,11 @@ impl App {
                 if s.tabs.is_empty() {
                     return;
                 }
-                let idx = s.tabs.iter().position(|t| t.id == s.active_tab).unwrap_or(0);
+                let idx = s
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == s.active_tab)
+                    .unwrap_or(0);
                 let next = if a == Action::NextTab {
                     &s.tabs[(idx + 1) % s.tabs.len()]
                 } else {
@@ -1560,7 +1859,9 @@ impl App {
 
     /// Build the visible palette rows for the current query + fold state.
     fn palette_rows(&self) -> Vec<PRow> {
-        let Some(pal) = &self.palette else { return Vec::new() };
+        let Some(pal) = &self.palette else {
+            return Vec::new();
+        };
         if pal.is_commands() {
             return self.palette_command_rows(&pal.filter());
         }
@@ -1593,131 +1894,84 @@ impl App {
         scored.into_iter().map(|(_, _, r)| r).collect()
     }
 
-    /// The Space → Tab → Pane tree, filtered by `q` and folded per `collapsed`.
-    /// Panes appear only under split tabs. While filtering we force-expand along
-    /// matches and dim rows shown purely as context.
+    /// The Space → Tab → Pane tree (via `palette_tree`), each row enriched with
+    /// its state glyph and metadata (tab counts / elapsed / folder·branch).
     fn palette_tree_rows(&self, q: &str, collapsed: &HashSet<u64>) -> Vec<PRow> {
-        let filtering = !q.is_empty();
-        let mut rows = Vec::new();
-        for s in &self.snap.spaces {
-            let space_hl = fuzzy_indices(&s.name, q);
-            let space_match = space_hl.is_some();
-            // Resolve each tab's match + its (split-only) pane matches up front so
-            // we can decide the space's visibility before emitting its row.
-            struct TabRow {
-                idx: usize,
-                hl: Option<Vec<usize>>,
-                panes: Vec<(u64, String, Option<Vec<usize>>)>, // (pane id, name, match)
-            }
-            let mut tabs: Vec<TabRow> = Vec::new();
-            for (ti, t) in s.tabs.iter().enumerate() {
-                let hl = fuzzy_indices(&t.name, q).map(|(_, h)| h);
-                let mut leaves = Vec::new();
-                t.layout.leaves(&mut leaves);
-                let split = leaves.len() > 1;
-                let panes = if split {
-                    leaves
-                        .iter()
-                        .map(|pid| {
-                            let name = pane_name(self.snap.pane(*pid));
-                            let m = fuzzy_indices(&name, q).map(|(_, h)| h);
-                            (*pid, name, m)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                tabs.push(TabRow { idx: ti, hl, panes });
-            }
-            let any_tab_match = tabs.iter().any(|t| t.hl.is_some());
-            let any_pane_match = tabs.iter().any(|t| t.panes.iter().any(|(_, _, m)| m.is_some()));
-            let space_in = !filtering || space_match || any_tab_match || any_pane_match;
-            if !space_in {
-                continue;
-            }
-            let n = s.tabs.len();
-            let waiting = s
-                .tabs
-                .iter()
-                .filter(|t| tab_activity(&self.snap, t) == Activity::Waiting)
-                .count();
-            let meta = if waiting > 0 {
-                format!("{n} tabs · ◉{waiting}")
-            } else {
-                format!("{n} tab{}", if n == 1 { "" } else { "s" })
-            };
-            let space_expanded =
-                if filtering { true } else { !collapsed.contains(&s.id) };
-            rows.push(PRow {
-                kind: PKind::Space(s.id),
-                depth: 0,
-                glyph: self.static_glyph(space_activity(&self.snap, s)),
-                label: s.name.clone(),
-                meta,
-                hl: space_hl.as_ref().map(|(_, h)| h.clone()).unwrap_or_default(),
-                expandable: n > 0,
-                expanded: space_expanded,
-                dim: filtering && space_hl.as_ref().map(|(_, h)| h.is_empty()).unwrap_or(true),
-            });
-            if !space_expanded {
-                continue;
-            }
-            for tr in &tabs {
-                let t = &s.tabs[tr.idx];
-                let tab_match = tr.hl.is_some();
-                let pane_match = tr.panes.iter().any(|(_, _, m)| m.is_some());
-                let tab_in = !filtering || space_match || tab_match || pane_match;
-                if !tab_in {
-                    continue;
-                }
-                let tact = tab_activity(&self.snap, t);
-                let loc = self.snap.pane(t.active_pane).map(pane_loc).unwrap_or_default();
-                let el = self.elapsed_label(t.active_pane);
-                let meta = [el, loc].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("  ");
-                let split = !tr.panes.is_empty();
-                let tab_expanded = if filtering { pane_match } else { !collapsed.contains(&t.id) };
-                rows.push(PRow {
-                    kind: PKind::Jump { space: s.id, tab: t.id, pane: t.active_pane },
-                    depth: 1,
-                    glyph: self.static_glyph(tact),
-                    label: t.name.clone(),
-                    meta,
-                    hl: tr.hl.clone().unwrap_or_default(),
-                    expandable: split,
-                    expanded: tab_expanded,
-                    dim: filtering && !tab_match,
-                });
-                if !split || !tab_expanded {
-                    continue;
-                }
-                for (pid, name, m) in &tr.panes {
-                    let pane_in = !filtering || space_match || tab_match || m.is_some();
-                    if !pane_in {
-                        continue;
+        palette_tree(&self.snap, q, collapsed)
+            .into_iter()
+            .map(|r| {
+                let (glyph, meta) = match (r.kind, r.depth) {
+                    (PKind::Space(id), _) => {
+                        let s = self.snap.spaces.iter().find(|s| s.id == id);
+                        let g = self.static_glyph(
+                            s.map(|s| space_activity(&self.snap, s))
+                                .unwrap_or(Activity::Idle),
+                        );
+                        let n = s.map(|s| s.tabs.len()).unwrap_or(0);
+                        let waiting = s
+                            .map(|s| {
+                                s.tabs
+                                    .iter()
+                                    .filter(|t| tab_activity(&self.snap, t) == Activity::Waiting)
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        let meta = if waiting > 0 {
+                            format!("{n} tabs · ◉{waiting}")
+                        } else {
+                            format!("{n} tab{}", if n == 1 { "" } else { "s" })
+                        };
+                        (g, meta)
                     }
-                    let p = self.snap.pane(*pid);
-                    rows.push(PRow {
-                        kind: PKind::Jump { space: s.id, tab: t.id, pane: *pid },
-                        depth: 2,
-                        glyph: self.glyph(p),
-                        label: name.clone(),
-                        meta: p.map(pane_loc).unwrap_or_default(),
-                        hl: m.clone().unwrap_or_default(),
-                        expandable: false,
-                        expanded: false,
-                        dim: filtering && m.is_none(),
-                    });
+                    (PKind::Jump { tab, pane, .. }, 1) => {
+                        let tabinfo = self
+                            .snap
+                            .spaces
+                            .iter()
+                            .flat_map(|s| &s.tabs)
+                            .find(|t| t.id == tab);
+                        let g = self.static_glyph(
+                            tabinfo
+                                .map(|t| tab_activity(&self.snap, t))
+                                .unwrap_or(Activity::Idle),
+                        );
+                        let loc = self.snap.pane(pane).map(pane_loc).unwrap_or_default();
+                        let el = self.elapsed_label(pane);
+                        let meta = [el, loc]
+                            .into_iter()
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        (g, meta)
+                    }
+                    (PKind::Jump { pane, .. }, _) => {
+                        let p = self.snap.pane(pane);
+                        (self.glyph(p), p.map(pane_loc).unwrap_or_default())
+                    }
+                    (PKind::Cmd(_), _) => ((String::new(), self.cfg.theme.accent), String::new()),
+                };
+                PRow {
+                    kind: r.kind,
+                    depth: r.depth,
+                    glyph,
+                    label: r.label,
+                    meta,
+                    hl: r.hl,
+                    expandable: r.expandable,
+                    expanded: r.expanded,
+                    dim: r.dim,
                 }
-            }
-        }
-        rows
+            })
+            .collect()
     }
 
     /// Collapse (`collapse=true`) or expand the selected tree row; when there's
     /// nothing to fold, move to the parent / first child instead.
     fn palette_fold(&mut self, collapse: bool) {
         let rows = self.palette_rows();
-        let Some(pal) = self.palette.as_mut() else { return };
+        let Some(pal) = self.palette.as_mut() else {
+            return;
+        };
         let Some(row) = rows.get(pal.sel) else { return };
         let id = match row.kind {
             PKind::Space(id) => Some(id),
@@ -1756,18 +2010,13 @@ impl App {
                 self.do_action(a).await;
                 return;
             }
-            Some(PKind::Space(id)) => self
-                .snap
-                .spaces
-                .iter()
-                .find(|s| s.id == id)
-                .and_then(|s| {
-                    s.tabs
-                        .iter()
-                        .find(|t| t.id == s.active_tab)
-                        .or_else(|| s.tabs.first())
-                        .map(|t| (s.id, t.id, t.active_pane))
-                }),
+            Some(PKind::Space(id)) => self.snap.spaces.iter().find(|s| s.id == id).and_then(|s| {
+                s.tabs
+                    .iter()
+                    .find(|t| t.id == s.active_tab)
+                    .or_else(|| s.tabs.first())
+                    .map(|t| (s.id, t.id, t.active_pane))
+            }),
             Some(PKind::Jump { space, tab, pane }) => Some((space, tab, pane)),
             None => None,
         };
@@ -1864,8 +2113,10 @@ impl App {
                         } else {
                             i + 1
                         };
-                        if let Err(e) =
-                            self.client.request(Request::MoveSpace { space: sp, to }).await
+                        if let Err(e) = self
+                            .client
+                            .request(Request::MoveSpace { space: sp, to })
+                            .await
                         {
                             self.toast(e.to_string());
                         }
@@ -2092,7 +2343,13 @@ impl App {
             }
         }
         // User command shortcuts win over built-in actions on the same key.
-        if let Some(cb) = self.cfg.commands.iter().find(|c| c.binding.matches(&ev)).cloned() {
+        if let Some(cb) = self
+            .cfg
+            .commands
+            .iter()
+            .find(|c| c.binding.matches(&ev))
+            .cloned()
+        {
             self.run_command_bind(cb).await;
             return;
         }
@@ -2127,7 +2384,10 @@ impl App {
                     v.parser.set_scrollback(0);
                 }
             }
-            let req = Request::Input { pane: self.focused, data: B64.encode(&bytes) };
+            let req = Request::Input {
+                pane: self.focused,
+                data: B64.encode(&bytes),
+            };
             if let Err(e) = self.client.request(req).await {
                 self.toast(e.to_string());
             }
@@ -2142,7 +2402,13 @@ impl App {
     }
 
     fn menu_rect(&self, m: &Menu) -> Rect {
-        let w = (m.items.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(10) + 4) as u16;
+        let w = (m
+            .items
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(10)
+            + 4) as u16;
         let h = m.items.len() as u16 + 2;
         let x = m.x.min(self.size.0.saturating_sub(w + 1));
         let y = m.y.min(self.size.1.saturating_sub(h + 1));
@@ -2152,7 +2418,14 @@ impl App {
     fn border_hit(&self, col: u16, row: u16) -> Option<(Vec<usize>, usize, Dir)> {
         let t = self.active_tab()?;
         let mut path = Vec::new();
-        find_border(&t.layout, self.frame.panes, self.cfg.ui.gutter, col, row, &mut path)
+        find_border(
+            &t.layout,
+            self.frame.panes,
+            self.cfg.ui.gutter,
+            col,
+            row,
+            &mut path,
+        )
     }
 
     fn apply_drag(&mut self, col: u16, row: u16) {
@@ -2168,12 +2441,17 @@ impl App {
         else {
             return;
         };
-        let Some(tab) = space.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let Some(tab) = space.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
         let Some(split_area) = area_at_path(&tab.layout, panes_area, gutter, &path) else {
             return;
         };
-        let Some(Node::Split { dir: d, children, weights }) =
-            node_at_path_mut(&mut tab.layout, &path)
+        let Some(Node::Split {
+            dir: d,
+            children,
+            weights,
+        }) = node_at_path_mut(&mut tab.layout, &path)
         else {
             return;
         };
@@ -2216,7 +2494,13 @@ impl App {
             .find(|t| t.id == drag.tab)
             .map(|t| t.layout.clone());
         if let Some(layout) = layout {
-            if let Err(e) = self.client.request(Request::SetLayout { tab: drag.tab, layout }).await
+            if let Err(e) = self
+                .client
+                .request(Request::SetLayout {
+                    tab: drag.tab,
+                    layout,
+                })
+                .await
             {
                 self.toast(e.to_string());
             }
@@ -2282,7 +2566,10 @@ impl App {
                     match hit {
                         Some(DeckHit::Space(id)) => {
                             let t = self.snap.spaces.iter().find(|s| s.id == id).and_then(|s| {
-                                s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first())
+                                s.tabs
+                                    .iter()
+                                    .find(|t| t.id == s.active_tab)
+                                    .or(s.tabs.first())
                                     .map(|t| (s.id, t.id, t.active_pane))
                             });
                             if let Some((s, t, p)) = t {
@@ -2351,22 +2638,17 @@ impl App {
                     }
                 } else if let Some(space) = self.space_drag {
                     // Reorder spaces: move into the space row under the cursor.
-                    let over = self
-                        .sidebar_rows
-                        .iter()
-                        .find(|(r, _)| *r == row)
-                        .and_then(|(_, t)| match t {
+                    let over = self.sidebar_rows.iter().find(|(r, _)| *r == row).and_then(
+                        |(_, t)| match t {
                             Target::Space(id) => Some(*id),
                             _ => None,
-                        });
+                        },
+                    );
                     if let Some(target) = over {
                         if target != space && self.drag_target != Some(target) {
-                            if let Some(to) =
-                                self.snap.spaces.iter().position(|s| s.id == target)
-                            {
+                            if let Some(to) = self.snap.spaces.iter().position(|s| s.id == target) {
                                 self.drag_target = Some(target);
-                                let _ =
-                                    self.client.request(Request::MoveSpace { space, to }).await;
+                                let _ = self.client.request(Request::MoveSpace { space, to }).await;
                             }
                         }
                     }
@@ -2395,8 +2677,10 @@ impl App {
                                 let mut layout = t.layout.clone();
                                 layout.swap_leaves(from, to);
                                 let tab = t.id;
-                                if let Err(e) =
-                                    self.client.request(Request::SetLayout { tab, layout }).await
+                                if let Err(e) = self
+                                    .client
+                                    .request(Request::SetLayout { tab, layout })
+                                    .await
                                 {
                                     self.toast(e.to_string());
                                 }
@@ -2432,15 +2716,22 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 // Right-click a sidebar row → space/tab menu.
-                let sidebar_hit = self.frame.sidebar.map(|sb| {
-                    col >= sb.x && col < sb.x + sb.width && row >= sb.y
-                }).unwrap_or(false)
+                let sidebar_hit = self
+                    .frame
+                    .sidebar
+                    .map(|sb| col >= sb.x && col < sb.x + sb.width && row >= sb.y)
+                    .unwrap_or(false)
                     || (self.drawer && {
                         let dr = self.drawer_rect();
                         col >= dr.x && col < dr.x + dr.width && row >= dr.y
                     });
                 if sidebar_hit {
-                    if let Some(target) = self.sidebar_rows.iter().find(|(r, _)| *r == row).map(|(_, t)| *t) {
+                    if let Some(target) = self
+                        .sidebar_rows
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .map(|(_, t)| *t)
+                    {
                         let (mt, items) = match target {
                             Target::Space(id) => (
                                 MenuTarget::Space(id),
@@ -2467,7 +2758,12 @@ impl App {
                             Target::Pane(p) => (MenuTarget::Pane(p), vec![]),
                         };
                         if !items.is_empty() {
-                            self.menu = Some(Menu { x: col, y: row, target: mt, items });
+                            self.menu = Some(Menu {
+                                x: col,
+                                y: row,
+                                target: mt,
+                                items,
+                            });
                         }
                     }
                     return;
@@ -2551,23 +2847,26 @@ impl App {
                 if row >= pr.y && row < pr.y + pr.height && col >= pr.x && col < pr.x + pr.width {
                     if let Some((path, index, dir)) = self.border_hit(col, row) {
                         if let Some(t) = self.active_tab() {
-                            self.drag = Some(Drag { tab: t.id, path, index, dir });
+                            self.drag = Some(Drag {
+                                tab: t.id,
+                                path,
+                                index,
+                                dir,
+                            });
                         }
                         return;
                     }
                 }
                 // Mobile focus: tapping the info header's right side (the ↓ live
                 // control) jumps the pane back to live. Back lives in the cmd bar.
-                if self.mobile_focus() {
-                    if Some(row) == self.frame.header {
-                        if col > self.size.0.saturating_sub(12) {
-                            if let Some(v) = self.views.get_mut(&self.focused) {
-                                v.scroll = 0;
-                                v.parser.set_scrollback(0);
-                            }
+                if self.mobile_focus() && Some(row) == self.frame.header {
+                    if col > self.size.0.saturating_sub(12) {
+                        if let Some(v) = self.views.get_mut(&self.focused) {
+                            v.scroll = 0;
+                            v.parser.set_scrollback(0);
                         }
-                        return;
                     }
+                    return;
                 }
                 if Some(row) == self.frame.header {
                     if col < 10 {
@@ -2642,8 +2941,11 @@ impl App {
                 }
                 if Some(row) == self.frame.tabs && col >= self.frame.main.x {
                     // Close button (×) takes precedence over switching.
-                    if let Some(tab) =
-                        self.tab_close_hits.iter().find(|(_, r)| r.contains(&col)).map(|(id, _)| *id)
+                    if let Some(tab) = self
+                        .tab_close_hits
+                        .iter()
+                        .find(|(_, r)| r.contains(&col))
+                        .map(|(id, _)| *id)
                     {
                         if let Err(e) = self.client.request(Request::CloseTab { tab }).await {
                             self.toast(e.to_string());
@@ -2702,7 +3004,11 @@ impl App {
                     // Begin a text selection anchored at the clicked cell.
                     if self.cfg.ui.mouse_select {
                         if let Some((pid, cell)) = self.cell_at(col, row) {
-                            self.select = Some(Sel { pane: pid, anchor: cell, head: cell });
+                            self.select = Some(Sel {
+                                pane: pid,
+                                anchor: cell,
+                                head: cell,
+                            });
                             self.selecting = true;
                         }
                     }
@@ -2759,7 +3065,10 @@ impl App {
         };
         match bytes {
             Some(bytes) => {
-                let req = Request::Input { pane, data: B64.encode(&bytes) };
+                let req = Request::Input {
+                    pane,
+                    data: B64.encode(&bytes),
+                };
                 if let Err(e) = self.client.request(req).await {
                     self.toast(e.to_string());
                 }
@@ -2889,7 +3198,10 @@ impl App {
         if bracketed {
             data.extend_from_slice(b"\x1b[201~");
         }
-        let req = Request::Input { pane, data: B64.encode(&data) };
+        let req = Request::Input {
+            pane,
+            data: B64.encode(&data),
+        };
         if let Err(e) = self.client.request(req).await {
             self.toast(e.to_string());
         }
@@ -2935,7 +3247,7 @@ impl App {
             WorkingStyle::Dot => (g.working.clone(), th.working),
             WorkingStyle::Pulse => {
                 // gentle two-step color pulse on a steady dot
-                let bright = (self.tick / 3) % 2 == 0;
+                let bright = (self.tick / 3).is_multiple_of(2);
                 (g.working.clone(), if bright { th.working } else { th.idle })
             }
         }
@@ -2973,7 +3285,9 @@ impl App {
     /// Blend a row's background toward its state color for ~900ms after the
     /// pane's activity changed — a brief flash that says "this just changed".
     fn flash_bg(&self, pane: u64, base: Color) -> Color {
-        let Some(t0) = self.flash.get(&pane) else { return base };
+        let Some(t0) = self.flash.get(&pane) else {
+            return base;
+        };
         let e = t0.elapsed().as_millis();
         if e >= FLASH_MS {
             return base;
@@ -3061,31 +3375,59 @@ impl App {
             format!("{g} {sword} {el} ")
         };
         let rcol = if scroll > 0 { th.accent } else { scol };
-        let loc_disp = if loc.is_empty() { String::new() } else { format!("   {loc}") };
+        let loc_disp = if loc.is_empty() {
+            String::new()
+        } else {
+            format!("   {loc}")
+        };
         let used = 1 + name.chars().count() + loc_disp.chars().count() + right.chars().count();
         let pad = (w as usize).saturating_sub(used);
         let line = Line::from(vec![
-            Span::styled(format!(" {name}"), Style::default().fg(th.bar_active_fg).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {name}"),
+                Style::default()
+                    .fg(th.bar_active_fg)
+                    .bg(th.bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(loc_disp, Style::default().fg(th.status_fg).bg(th.bg)),
             Span::styled(" ".repeat(pad), bg),
-            Span::styled(right, Style::default().fg(rcol).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                right,
+                Style::default()
+                    .fg(rcol)
+                    .bg(th.bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
-        f.render_widget(Paragraph::new(line).style(bg), Rect::new(area.x, area.y, w, 1));
+        f.render_widget(
+            Paragraph::new(line).style(bg),
+            Rect::new(area.x, area.y, w, 1),
+        );
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let th = &self.cfg.theme;
         // draw_mobile_header owns the mobile-focus case; here narrow shows ☰, wide
         // shows the plain logo.
-        let logo_text = if self.narrow() { " ☰ ruckus " } else { "  ruckus  " };
+        let logo_text = if self.narrow() {
+            " ☰ ruckus "
+        } else {
+            "  ruckus  "
+        };
         let logo = Span::styled(
             logo_text,
-            Style::default().bg(th.accent).fg(th.sidebar_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(th.accent)
+                .fg(th.sidebar_bg)
+                .add_modifier(Modifier::BOLD),
         );
         // Narrow names the space (the tab strip shows tabs); wide shows the full
         // space › tab breadcrumb.
         let crumb = if self.narrow() {
-            self.active_space().map(|s| format!("  {}", s.name)).unwrap_or_default()
+            self.active_space()
+                .map(|s| format!("  {}", s.name))
+                .unwrap_or_default()
         } else {
             match (self.active_space(), self.active_tab()) {
                 (Some(s), Some(t)) => format!("  {}  ›  {}", s.name, t.name),
@@ -3095,8 +3437,18 @@ impl App {
         };
         let crumb_span = Span::styled(crumb.clone(), Style::default().fg(th.bar_active_fg));
 
-        let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
-        let working = self.snap.panes.iter().filter(|p| p.activity == Activity::Working).count();
+        let waiting = self
+            .snap
+            .panes
+            .iter()
+            .filter(|p| p.activity == Activity::Waiting)
+            .count();
+        let working = self
+            .snap
+            .panes
+            .iter()
+            .filter(|p| p.activity == Activity::Working)
+            .count();
         let done = self
             .snap
             .panes
@@ -3141,7 +3493,8 @@ impl App {
             return;
         }
         let (top, pinned) = sections.split_at(sections.len() - 1);
-        let bottom_h = ((area.height as f64 * split) as u16).clamp(3, area.height.saturating_sub(3));
+        let bottom_h =
+            ((area.height as f64 * split) as u16).clamp(3, area.height.saturating_sub(3));
         let top_h = area.height.saturating_sub(bottom_h + 1); // -1 for divider
         let top_rect = Rect::new(area.x, area.y, area.width, top_h);
         let div_row = area.y + top_h;
@@ -3156,7 +3509,13 @@ impl App {
         self.draw_sidebar_region(f, bot_rect, pinned, true);
     }
 
-    fn draw_sidebar_region(&mut self, f: &mut Frame, area: Rect, sections: &[String], append: bool) {
+    fn draw_sidebar_region(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        sections: &[String],
+        append: bool,
+    ) {
         let th = self.cfg.theme.clone();
         let inner = area;
         f.render_widget(
@@ -3189,10 +3548,10 @@ impl App {
 
         push!(Line::raw(""), None::<Target>);
 
-        for section in sections.iter().cloned().collect::<Vec<_>>() {
+        for section in sections {
             match section.as_str() {
                 "needs_you" => {
-                    let attention: Vec<(u64, Vec<(&str, String)>, (String, Color))> = self
+                    let attention: Vec<AttnRow> = self
                         .attention()
                         .iter()
                         .map(|p| {
@@ -3215,7 +3574,9 @@ impl App {
                     push!(
                         Line::from(Span::styled(
                             " NEEDS YOU",
-                            Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(th.status_fg)
+                                .add_modifier(Modifier::BOLD),
                         )),
                         None::<Target>
                     );
@@ -3243,7 +3604,11 @@ impl App {
                             &icon,
                             &vars,
                             row_style,
-                            if selected { th.bar_active_fg } else { th.bar_fg },
+                            if selected {
+                                th.bar_active_fg
+                            } else {
+                                th.bar_fg
+                            },
                         ));
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
@@ -3259,7 +3624,9 @@ impl App {
                     push!(
                         Line::from(Span::styled(
                             " AGENTS",
-                            Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(th.status_fg)
+                                .add_modifier(Modifier::BOLD),
                         )),
                         None::<Target>
                     );
@@ -3317,7 +3684,9 @@ impl App {
                     push!(
                         Line::from(Span::styled(
                             " SPACES",
-                            Style::default().fg(th.status_fg).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(th.status_fg)
+                                .add_modifier(Modifier::BOLD),
                         )),
                         None::<Target>
                     );
@@ -3332,7 +3701,7 @@ impl App {
                     let tab_numbers = self.cfg.ui.tab_numbers;
                     let show_tabs = self.cfg.ui.sidebar_tabs;
                     let no_icon = (String::new(), th.status_fg);
-                    for (_si, s) in spaces.iter().enumerate() {
+                    for s in spaces.iter() {
                         for _ in 0..row_gap {
                             push!(Line::raw(""), None::<Target>);
                         }
@@ -3347,7 +3716,11 @@ impl App {
                         } else {
                             Style::default()
                         };
-                        let text_fg = if s_active { th.accent } else { th.bar_active_fg };
+                        let text_fg = if s_active {
+                            th.accent
+                        } else {
+                            th.bar_active_fg
+                        };
                         let vars = vec![
                             ("name", s.name.clone()),
                             ("title", s.name.clone()),
@@ -3368,15 +3741,13 @@ impl App {
                             Span::styled(" ".to_string(), row_style)
                         };
                         let mut spans = vec![lead];
-                        spans.extend(
-                            template_spans(
-                                &space_tpl,
-                                &icon,
-                                &vars,
-                                row_style.add_modifier(Modifier::BOLD),
-                                text_fg,
-                            ),
-                        );
+                        spans.extend(template_spans(
+                            &space_tpl,
+                            &icon,
+                            &vars,
+                            row_style.add_modifier(Modifier::BOLD),
+                            text_fg,
+                        ));
                         // Hover reveals a × close button at the row's right edge.
                         let row_hovered = hover_row == Some(y);
                         if row_hovered && w >= 3 {
@@ -3421,7 +3792,11 @@ impl App {
                                 th.sidebar_bg
                             };
                             let row_style = Style::default().bg(self.tab_flash_bg(t, base_bg));
-                            let text_fg = if t_active { th.bar_active_fg } else { th.bar_fg };
+                            let text_fg = if t_active {
+                                th.bar_active_fg
+                            } else {
+                                th.bar_fg
+                            };
                             let active_pane = self.snap.pane(t.active_pane);
                             let vars = vec![
                                 ("title", t.name.clone()),
@@ -3433,7 +3808,9 @@ impl App {
                                 ),
                                 (
                                     "cwd",
-                                    active_pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
+                                    active_pane
+                                        .map(|p| home_relative(&p.cwd))
+                                        .unwrap_or_default(),
                                 ),
                             ];
                             let mut spans = if marker_on && t_active {
@@ -3451,9 +3828,8 @@ impl App {
                                     row_style.fg(th.status_fg),
                                 ));
                             }
-                            spans.extend(template_spans(
-                                &tab_tpl, &icon, &vars, row_style, text_fg,
-                            ));
+                            spans
+                                .extend(template_spans(&tab_tpl, &icon, &vars, row_style, text_fg));
                             let pad = w.saturating_sub(spans_width(&spans));
                             spans.push(Span::styled(" ".repeat(pad), row_style));
                             let tab_target = Target::Tab {
@@ -3461,18 +3837,17 @@ impl App {
                                 tab: t.id,
                                 pane: t.active_pane,
                             };
-                            push!(Line::from(spans), Some(tab_target.clone()));
+                            push!(Line::from(spans), Some(tab_target));
 
                             if !tab_sub.is_empty() {
                                 let sub_fg = if t_active { th.bar_fg } else { th.status_fg };
-                                let mut sub =
-                                    vec![Span::styled("      ".to_string(), row_style)];
+                                let mut sub = vec![Span::styled("      ".to_string(), row_style)];
                                 sub.extend(template_spans(
                                     &tab_sub, &no_icon, &vars, row_style, sub_fg,
                                 ));
                                 let pad = w.saturating_sub(spans_width(&sub));
                                 sub.push(Span::styled(" ".repeat(pad), row_style));
-                                push!(Line::from(sub), Some(tab_target.clone()));
+                                push!(Line::from(sub), Some(tab_target));
                             }
                         }
                     }
@@ -3543,7 +3918,11 @@ impl App {
                 spans.push(Span::styled(" ".to_string(), base));
                 spans.push(Span::styled(
                     "×".to_string(),
-                    base.fg(if close_hover { th.done_err } else { th.status_fg }),
+                    base.fg(if close_hover {
+                        th.done_err
+                    } else {
+                        th.status_fg
+                    }),
                 ));
                 spans.push(Span::styled(pad.clone(), base));
                 spans.push(Span::raw(" ")); // gap between pills
@@ -3559,9 +3938,15 @@ impl App {
         spans.push(Span::styled(
             plus_label,
             if plus_hover {
-                Style::default().bg(th.accent).fg(th.surface).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(th.accent)
+                    .fg(th.surface)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(th.select_bg)
+                    .fg(th.accent)
+                    .add_modifier(Modifier::BOLD)
             },
         ));
         hits.push((None, plus_range));
@@ -3597,7 +3982,10 @@ impl App {
         for cmd in cmds {
             let out = tokio::time::timeout(
                 Duration::from_secs(3),
-                tokio::process::Command::new("sh").arg("-c").arg(&cmd).output(),
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output(),
             )
             .await;
             let val = match out {
@@ -3656,7 +4044,7 @@ impl App {
                 "host" => hostname(),
                 "cwd" => pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
                 "clock" => {
-                    let fmt = token.splitn(2, ':').nth(1).unwrap_or("%H:%M");
+                    let fmt = token.split_once(':').map(|x| x.1).unwrap_or("%H:%M");
                     chrono::Local::now().format(fmt).to_string()
                 }
                 _ => String::new(),
@@ -3682,7 +4070,11 @@ impl App {
                     }
                     name.push(c);
                 }
-                fg = if name.is_empty() { th.status_fg } else { resolve_color(&name) };
+                fg = if name.is_empty() {
+                    th.status_fg
+                } else {
+                    resolve_color(&name)
+                };
             } else if ch == '#' && chars.peek() == Some(&'(') {
                 chars.next(); // consume '('
                 let mut cmd = String::new();
@@ -3777,7 +4169,10 @@ impl App {
             let range = x..x + width;
             let hovered = self.hover_at(&range, area.y);
             let key_style = if hovered {
-                Style::default().bg(th.select_bg).fg(th.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(th.select_bg)
+                    .fg(th.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
             };
@@ -3817,7 +4212,9 @@ impl App {
             let focused = *pane == self.focused;
             let info = self.snap.pane(*pane);
             let (g, dot) = self.glyph(info);
-            let title_text = info.map(|i| i.title.clone()).unwrap_or_else(|| pane.to_string());
+            let title_text = info
+                .map(|i| i.title.clone())
+                .unwrap_or_else(|| pane.to_string());
             let scroll = self.views.get(pane).map(|v| v.scroll).unwrap_or(0);
 
             // Whole pane sits on the surface layer (padding shows as surface).
@@ -3829,11 +4226,14 @@ impl App {
             let mut content_y = rect.y;
             let mut content_h = rect.height;
             if titles {
-                let bar_bg =
-                    self.flash_bg(*pane, if focused { th.select_bg } else { th.bar_bg });
+                let bar_bg = self.flash_bg(*pane, if focused { th.select_bg } else { th.bar_bg });
                 let mut title_spans = vec![
                     Span::styled(
-                        if focused { self.cfg.glyphs.focus.clone() } else { " ".to_string() },
+                        if focused {
+                            self.cfg.glyphs.focus.clone()
+                        } else {
+                            " ".to_string()
+                        },
                         Style::default().fg(th.accent).bg(bar_bg),
                     ),
                     Span::styled(format!("{g} "), Style::default().fg(dot).bg(bar_bg)),
@@ -3855,7 +4255,11 @@ impl App {
                         Style::default().fg(th.waiting).bg(bar_bg),
                     ));
                 }
-                if let Some(PaneInfo { status: PaneStatus::Exited { code }, .. }) = info {
+                if let Some(PaneInfo {
+                    status: PaneStatus::Exited { code },
+                    ..
+                }) = info
+                {
                     title_spans.push(Span::styled(
                         format!(" exit {code} "),
                         Style::default()
@@ -3864,8 +4268,7 @@ impl App {
                     ));
                 }
                 f.render_widget(
-                    Paragraph::new(Line::from(title_spans))
-                        .style(Style::default().bg(bar_bg)),
+                    Paragraph::new(Line::from(title_spans)).style(Style::default().bg(bar_bg)),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 content_y += 1;
@@ -3903,8 +4306,11 @@ impl App {
                 if focused {
                     if let Some(q) = self.search.as_ref().filter(|q| !q.is_empty()) {
                         let ql = q.to_lowercase();
-                        let row_texts: Vec<String> =
-                            screen.contents().split('\n').map(|s| s.to_lowercase()).collect();
+                        let row_texts: Vec<String> = screen
+                            .contents()
+                            .split('\n')
+                            .map(|s| s.to_lowercase())
+                            .collect();
                         for (i, line) in lines.iter_mut().enumerate() {
                             if row_texts.get(i).is_some_and(|t| t.contains(&ql)) {
                                 for sp in &mut line.spans {
@@ -3920,7 +4326,11 @@ impl App {
                 );
             }
             // Dead-pane frame: status banner + restart/close hints over the content.
-            if let Some(PaneInfo { status: PaneStatus::Exited { code }, .. }) = info {
+            if let Some(PaneInfo {
+                status: PaneStatus::Exited { code },
+                ..
+            }) = info
+            {
                 if content.height >= 2 && content.width >= 12 {
                     let ok = *code == 0;
                     let status_fg = if ok { th.done_ok } else { th.done_err };
@@ -3943,12 +4353,7 @@ impl App {
                                 .bg(th.surface)
                                 .add_modifier(Modifier::BOLD),
                         )),
-                        Rect::new(
-                            ban_x,
-                            mid_y.saturating_sub(1).max(content.y),
-                            ban_w,
-                            1,
-                        ),
+                        Rect::new(ban_x, mid_y.saturating_sub(1).max(content.y), ban_w, 1),
                     );
                     if content.height >= 3 {
                         f.render_widget(
@@ -3956,12 +4361,7 @@ impl App {
                                 hints,
                                 Style::default().fg(th.status_fg).bg(th.surface),
                             )),
-                            Rect::new(
-                                hint_x,
-                                mid_y.min(content.y + content.height - 1),
-                                hint_w,
-                                1,
-                            ),
+                            Rect::new(hint_x, mid_y.min(content.y + content.height - 1), hint_w, 1),
                         );
                     }
                 }
@@ -3983,7 +4383,9 @@ impl App {
 
         // Large centered overlay.
         let w = self.size.0.saturating_sub(4).min(100);
-        let h = ((self.size.1 as u32 * 4 / 5) as u16).max(8).min(self.size.1.saturating_sub(2));
+        let h = ((self.size.1 as u32 * 4 / 5) as u16)
+            .max(8)
+            .min(self.size.1.saturating_sub(2));
         let x = self.size.0.saturating_sub(w) / 2;
         let y = self.size.1.saturating_sub(h) / 2;
         let r = Rect::new(x, y, w, h);
@@ -4021,7 +4423,11 @@ impl App {
             } else if cap > 0 && p.sel >= p.scroll + cap {
                 p.scroll = p.sel + 1 - cap;
             }
-            p.scroll = if len > cap { p.scroll.min(len - cap) } else { 0 };
+            p.scroll = if len > cap {
+                p.scroll.min(len - cap)
+            } else {
+                0
+            };
             (p.sel, p.scroll)
         };
 
@@ -4029,10 +4435,17 @@ impl App {
         let bg = Style::default().bg(th.sidebar_bg);
 
         // Query line.
-        let cursor = if (self.tick / 4) % 2 == 0 { "▏" } else { " " };
+        let cursor = if (self.tick / 4).is_multiple_of(2) {
+            "▏"
+        } else {
+            " "
+        };
         let mut qspans = vec![Span::styled(" › ", bg.fg(th.accent))];
         if commands {
-            qspans.push(Span::styled("> ", bg.fg(th.accent).add_modifier(Modifier::BOLD)));
+            qspans.push(Span::styled(
+                "> ",
+                bg.fg(th.accent).add_modifier(Modifier::BOLD),
+            ));
         }
         let shown_q = if commands {
             query.strip_prefix('>').unwrap_or(&query).to_string()
@@ -4041,23 +4454,38 @@ impl App {
         };
         qspans.push(Span::styled(shown_q, bg.fg(th.bar_active_fg)));
         qspans.push(Span::styled(cursor.to_string(), bg.fg(th.accent)));
-        f.render_widget(Paragraph::new(Line::from(qspans)).style(bg), Rect::new(inner.x, inner.y, inner.width, 1));
+        f.render_widget(
+            Paragraph::new(Line::from(qspans)).style(bg),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
 
         // Rows.
         let mut hits = Vec::new();
         let mut yy = list_top;
         for (i, row) in rows.iter().enumerate().skip(scroll).take(cap) {
             let selected = i == sel;
-            let base = if selected { Style::default().bg(th.select_bg) } else { bg };
+            let base = if selected {
+                Style::default().bg(th.select_bg)
+            } else {
+                bg
+            };
             let marker = if selected { "❯" } else { " " };
             let indent = "  ".repeat(row.depth as usize);
             let twisty = if row.expandable {
-                if row.expanded { "▾" } else { "▸" }
+                if row.expanded {
+                    "▾"
+                } else {
+                    "▸"
+                }
             } else {
                 " "
             };
             let (g, gcol) = &row.glyph;
-            let glyph_part = if g.is_empty() { String::new() } else { format!("{g} ") };
+            let glyph_part = if g.is_empty() {
+                String::new()
+            } else {
+                format!("{g} ")
+            };
             let name_fg = if row.dim {
                 th.status_fg
             } else if selected {
@@ -4066,28 +4494,46 @@ impl App {
                 th.bar_fg
             };
             let mut spans = vec![
-                Span::styled(format!("{marker} "), base.fg(th.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{marker} "),
+                    base.fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(indent.clone(), base),
                 Span::styled(format!("{twisty} "), base.fg(th.status_fg)),
             ];
             if !glyph_part.is_empty() {
                 spans.push(Span::styled(glyph_part.clone(), base.fg(*gcol)));
             }
-            spans.extend(hl_spans(&row.label, &row.hl, base, name_fg, th.accent, !row.dim));
-            let lead =
-                2 + indent.chars().count() + 2 + glyph_part.chars().count() + row.label.chars().count();
+            spans.extend(hl_spans(
+                &row.label, &row.hl, base, name_fg, th.accent, !row.dim,
+            ));
+            let lead = 2
+                + indent.chars().count()
+                + 2
+                + glyph_part.chars().count()
+                + row.label.chars().count();
             let mw = row.meta.chars().count();
             let pad = iw.saturating_sub(lead + mw + 1);
             spans.push(Span::styled(" ".repeat(pad), base));
-            spans.push(Span::styled(format!("{} ", row.meta), base.fg(th.status_fg)));
-            f.render_widget(Paragraph::new(Line::from(spans)).style(base), Rect::new(inner.x, yy, inner.width, 1));
+            spans.push(Span::styled(
+                format!("{} ", row.meta),
+                base.fg(th.status_fg),
+            ));
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(base),
+                Rect::new(inner.x, yy, inner.width, 1),
+            );
             hits.push((Rect::new(inner.x, yy, inner.width, 1), i));
             yy += 1;
         }
         self.palette_hits = hits;
 
         if rows.is_empty() {
-            let msg = if commands { "  no command" } else { "  no match" };
+            let msg = if commands {
+                "  no command"
+            } else {
+                "  no match"
+            };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(msg, bg.fg(th.status_fg)))).style(bg),
                 Rect::new(inner.x, list_top, inner.width, 1),
@@ -4111,7 +4557,10 @@ impl App {
             Span::styled(" ".repeat(hpad), bg),
             Span::styled(format!("{arrows} "), bg.fg(th.accent)),
         ]);
-        f.render_widget(Paragraph::new(hint).style(bg), Rect::new(inner.x, hint_row, inner.width, 1));
+        f.render_widget(
+            Paragraph::new(hint).style(bg),
+            Rect::new(inner.x, hint_row, inner.width, 1),
+        );
     }
 
     fn draw_action_bar(&mut self, f: &mut Frame, area: Rect) {
@@ -4140,13 +4589,24 @@ impl App {
                 let pfx = self.cfg.prefix.map(|b| b.compact()).unwrap_or_default();
                 let t = format!("{pfx} ");
                 x += t.chars().count() as u16;
-                spans.push(Span::styled(t, Style::default().fg(th.status_fg).bg(th.bar_bg)));
+                spans.push(Span::styled(
+                    t,
+                    Style::default().fg(th.status_fg).bg(th.bar_bg),
+                ));
             }
             for (label, chip, action) in cmds {
                 let key = if prefixed {
-                    self.cfg.prefix_keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
+                    self.cfg
+                        .prefix_keys
+                        .get(&action)
+                        .and_then(|b| b.first())
+                        .map(|b| b.compact())
                 } else {
-                    self.cfg.keys.get(&action).and_then(|b| b.first()).map(|b| b.compact())
+                    self.cfg
+                        .keys
+                        .get(&action)
+                        .and_then(|b| b.first())
+                        .map(|b| b.compact())
                 };
                 let width = (key.as_ref().map(|k| k.chars().count() + 1).unwrap_or(0)
                     + label.chars().count()) as u16;
@@ -4157,9 +4617,24 @@ impl App {
                 let hovered = self.hover_at(&range, area.y);
                 let kbg = if hovered { th.select_bg } else { th.bar_bg };
                 if let Some(k) = &key {
-                    spans.push(Span::styled(format!("{k} "), Style::default().fg(th.accent).bg(kbg).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(
+                        format!("{k} "),
+                        Style::default()
+                            .fg(th.accent)
+                            .bg(kbg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 }
-                spans.push(Span::styled(label.to_string(), Style::default().fg(if hovered { th.bar_active_fg } else { th.status_fg }).bg(kbg)));
+                spans.push(Span::styled(
+                    label.to_string(),
+                    Style::default()
+                        .fg(if hovered {
+                            th.bar_active_fg
+                        } else {
+                            th.status_fg
+                        })
+                        .bg(kbg),
+                ));
                 spans.push(Span::styled("   ", bar_bg));
                 hits.push((chip, area.y, range));
                 x += width + 3;
@@ -4267,7 +4742,12 @@ impl App {
         let bgstyle = Style::default().bg(th.bg);
 
         // ---- Title row: ☰  ruckus … ● N needs you ----
-        let waiting = self.snap.panes.iter().filter(|p| p.activity == Activity::Waiting).count();
+        let waiting = self
+            .snap
+            .panes
+            .iter()
+            .filter(|p| p.activity == Activity::Waiting)
+            .count();
         let (sumtxt, sumcol) = if waiting > 0 {
             (format!("● {waiting} needs you"), th.waiting)
         } else {
@@ -4277,15 +4757,34 @@ impl App {
         let tpad = (cw as usize).saturating_sub(used);
         let title = Line::from(vec![
             Span::styled("☰  ", Style::default().fg(th.accent).bg(th.bg)),
-            Span::styled("ruckus", Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "ruckus",
+                Style::default()
+                    .fg(th.accent)
+                    .bg(th.bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" ".repeat(tpad), bgstyle),
-            Span::styled(sumtxt.clone(), Style::default().fg(sumcol).bg(th.bg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                sumtxt.clone(),
+                Style::default()
+                    .fg(sumcol)
+                    .bg(th.bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
-        f.render_widget(Paragraph::new(title).style(bgstyle), Rect::new(cx, area.y, cw, 1));
-        self.deck_hits.push((Rect::new(area.x, area.y, inset + 4, 1), DeckHit::Menu));
+        f.render_widget(
+            Paragraph::new(title).style(bgstyle),
+            Rect::new(cx, area.y, cw, 1),
+        );
+        self.deck_hits
+            .push((Rect::new(area.x, area.y, inset + 4, 1), DeckHit::Menu));
         if waiting > 0 {
             let sw = sumtxt.chars().count() as u16;
-            self.deck_hits.push((Rect::new(cx + cw.saturating_sub(sw), area.y, sw, 1), DeckHit::Jump));
+            self.deck_hits.push((
+                Rect::new(cx + cw.saturating_sub(sw), area.y, sw, 1),
+                DeckHit::Jump,
+            ));
         }
 
         // ---- Space selector (row 2) ----
@@ -4296,16 +4795,23 @@ impl App {
             let active = s.id == self.snap.active_space;
             let w = s.name.chars().count() as u16;
             let style = if active {
-                Style::default().fg(th.accent).bg(th.bg).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                Style::default()
+                    .fg(th.accent)
+                    .bg(th.bg)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default().fg(th.status_fg).bg(th.bg)
             };
             spans.push(Span::styled(s.name.clone(), style));
             spans.push(Span::styled("    ", bgstyle));
-            self.deck_hits.push((Rect::new(x, area.y + 2, w, 1), DeckHit::Space(s.id)));
+            self.deck_hits
+                .push((Rect::new(x, area.y + 2, w, 1), DeckHit::Space(s.id)));
             x += w + 4;
         }
-        f.render_widget(Paragraph::new(Line::from(spans)).style(bgstyle), Rect::new(cx, area.y + 2, cw, 1));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(bgstyle),
+            Rect::new(cx, area.y + 2, cw, 1),
+        );
 
         // Selection cursor: 0..ncards = cards, then +tab, +space. Clamp it.
         let ncards = self.active_space().map(|s| s.tabs.len()).unwrap_or(0);
@@ -4315,12 +4821,19 @@ impl App {
         // ---- Bottom action row: subtle 1-row "+ tab" / "+ space" pills ----
         let brow = area.y + area.height - 1;
         let mut bx = cx;
-        for (i, (lbl, hit)) in
-            [(" + tab ", DeckHit::NewTab), (" + space ", DeckHit::NewSpace)].into_iter().enumerate()
+        for (i, (lbl, hit)) in [
+            (" + tab ", DeckHit::NewTab),
+            (" + space ", DeckHit::NewSpace),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let focused = sel == ncards + i;
             let st = if focused {
-                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(th.accent)
+                    .fg(th.bg)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().bg(th.surface).fg(th.accent)
             };
@@ -4334,7 +4847,9 @@ impl App {
         }
 
         // ---- Cards: floating inset surface blocks, smart height ----
-        let Some(sp) = self.active_space() else { return };
+        let Some(sp) = self.active_space() else {
+            return;
+        };
         let sp_id = sp.id;
         let tabs = sp.tabs.clone();
         let list_top = area.y + 4;
@@ -4355,7 +4870,9 @@ impl App {
                 self.deck_scroll = sel + 1 - capacity_loose;
             }
         }
-        self.deck_scroll = self.deck_scroll.min(tabs.len().saturating_sub(capacity_loose));
+        self.deck_scroll = self
+            .deck_scroll
+            .min(tabs.len().saturating_sub(capacity_loose));
         let start = self.deck_scroll;
 
         let mut y = list_top;
@@ -4379,19 +4896,32 @@ impl App {
             let loc = pane.map(pane_loc).unwrap_or_default();
             let preview = pane.map(|p| p.preview.clone()).unwrap_or_default();
             let el = self.elapsed_label(t.active_pane);
-            let statelbl = if el.is_empty() { label.to_string() } else { format!("{label} {el}") };
+            let statelbl = if el.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} {el}")
+            };
 
             // Selected card: raised bg + accent ❯ marker (the app's "selected" cue).
             let sb = Style::default().bg(if selected { th.select_bg } else { th.surface });
-            let (marker, mcol) = if selected { ("❯", th.accent) } else { ("▎", color) };
+            let (marker, mcol) = if selected {
+                ("❯", th.accent)
+            } else {
+                ("▎", color)
+            };
             let name = t.name.clone();
             let lead_w = 4usize; // marker + " g "
             let name_w = name.chars().count();
             let right = format!("{statelbl} ");
             let right_w = right.chars().count();
             let room = (cw as usize).saturating_sub(lead_w + name_w + right_w + 4);
-            let loc_disp = if loc.is_empty() || room < 3 { String::new() } else { format!("  {}", loc.chars().take(room).collect::<String>()) };
-            let pad = (cw as usize).saturating_sub(lead_w + name_w + loc_disp.chars().count() + right_w);
+            let loc_disp = if loc.is_empty() || room < 3 {
+                String::new()
+            } else {
+                format!("  {}", loc.chars().take(room).collect::<String>())
+            };
+            let pad =
+                (cw as usize).saturating_sub(lead_w + name_w + loc_disp.chars().count() + right_w);
             let line1 = Line::from(vec![
                 Span::styled(marker, sb.fg(mcol).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" {g} "), sb.fg(color)),
@@ -4402,13 +4932,27 @@ impl App {
             ]);
             f.render_widget(Paragraph::new(line1).style(sb), Rect::new(cx, y, cw, 1));
             if has_preview {
-                let body: String = format!("      {preview}").chars().take(cw as usize).collect();
+                let body: String = format!("      {preview}")
+                    .chars()
+                    .take(cw as usize)
+                    .collect();
                 f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(body, Style::default().fg(th.bar_fg)))).style(sb),
+                    Paragraph::new(Line::from(Span::styled(
+                        body,
+                        Style::default().fg(th.bar_fg),
+                    )))
+                    .style(sb),
                     Rect::new(cx, y + 1, cw, 1),
                 );
             }
-            self.deck_hits.push((Rect::new(cx, y, cw, rows), DeckHit::Tab { space: sp_id, tab: t.id, pane: t.active_pane }));
+            self.deck_hits.push((
+                Rect::new(cx, y, cw, rows),
+                DeckHit::Tab {
+                    space: sp_id,
+                    tab: t.id,
+                    pane: t.active_pane,
+                },
+            ));
             y += rows + 1;
             shown += 1;
         }
@@ -4417,17 +4961,34 @@ impl App {
         let below = tabs.len().saturating_sub(start + shown);
         let mut hint: Vec<Span> = Vec::new();
         if start > 0 {
-            self.deck_hits.push((Rect::new(area.x, hint_row, area.width / 2, 1), DeckHit::ScrollUp));
+            self.deck_hits.push((
+                Rect::new(area.x, hint_row, area.width / 2, 1),
+                DeckHit::ScrollUp,
+            ));
             hint.push(Span::styled("  ▲ more", Style::default().fg(th.accent)));
         }
         if below > 0 {
-            self.deck_hits.push((Rect::new(area.x + area.width / 2, hint_row, area.width / 2, 1), DeckHit::ScrollDown));
-            let pad = (area.width as usize).saturating_sub(hint.iter().map(|s| s.content.chars().count()).sum::<usize>() + format!("▼ {below} more  ").chars().count());
+            self.deck_hits.push((
+                Rect::new(area.x + area.width / 2, hint_row, area.width / 2, 1),
+                DeckHit::ScrollDown,
+            ));
+            let pad = (area.width as usize).saturating_sub(
+                hint.iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>()
+                    + format!("▼ {below} more  ").chars().count(),
+            );
             hint.push(Span::raw(" ".repeat(pad)));
-            hint.push(Span::styled(format!("▼ {below} more  "), Style::default().fg(th.accent)));
+            hint.push(Span::styled(
+                format!("▼ {below} more  "),
+                Style::default().fg(th.accent),
+            ));
         }
         if !hint.is_empty() {
-            f.render_widget(Paragraph::new(Line::from(hint)).style(bgstyle), Rect::new(area.x, hint_row, area.width, 1));
+            f.render_widget(
+                Paragraph::new(Line::from(hint)).style(bgstyle),
+                Rect::new(area.x, hint_row, area.width, 1),
+            );
         }
     }
 
@@ -4438,7 +4999,10 @@ impl App {
             Span::styled(" 🔍 ", Style::default().bg(th.bar_bg).fg(th.accent)),
             Span::styled(
                 format!("{q}  "),
-                Style::default().bg(th.bar_bg).fg(th.bar_active_fg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(th.bar_bg)
+                    .fg(th.bar_active_fg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "n/N next·prev   esc clear",
@@ -4459,7 +5023,9 @@ impl App {
         let Some(t) = self.active_tab() else { return };
         let mut segs = Vec::new();
         node_dividers(&t.layout, self.frame.panes, self.cfg.ui.gutter, &mut segs);
-        let style = Style::default().fg(self.cfg.theme.border).bg(self.cfg.theme.bg);
+        let style = Style::default()
+            .fg(self.cfg.theme.border)
+            .bg(self.cfg.theme.bg);
         for (rect, vertical) in segs {
             if vertical {
                 let lines: Vec<Line> = (0..rect.height)
@@ -4476,7 +5042,11 @@ impl App {
     /// Tint the selected cells so a drag-selection is visible.
     fn draw_selection(&self, f: &mut Frame) {
         let Some(sel) = self.select else { return };
-        let Some(rect) = self.pane_rects.iter().find(|(p, _)| *p == sel.pane).map(|(_, r)| *r)
+        let Some(rect) = self
+            .pane_rects
+            .iter()
+            .find(|(p, _)| *p == sel.pane)
+            .map(|(_, r)| *r)
         else {
             return;
         };
@@ -4486,8 +5056,15 @@ impl App {
         }
         let ((sr, sc), (er, ec)) = sel.ordered();
         // Flash green briefly right after a copy, else the normal selection tint.
-        let copied = self.copied_at.map(|t| t.elapsed().as_millis() < 1000).unwrap_or(false);
-        let bg = if copied { self.cfg.theme.done_ok } else { self.cfg.theme.select_bg };
+        let copied = self
+            .copied_at
+            .map(|t| t.elapsed().as_millis() < 1000)
+            .unwrap_or(false);
+        let bg = if copied {
+            self.cfg.theme.done_ok
+        } else {
+            self.cfg.theme.select_bg
+        };
         let last_row = c.height.saturating_sub(1);
         let last_col = c.width.saturating_sub(1);
         let buf = f.buffer_mut();
@@ -4538,7 +5115,9 @@ impl App {
                 Line::from(Span::styled(
                     format!(
                         " {label}{} ",
-                        " ".repeat((inner.width as usize).saturating_sub(label.chars().count() + 2))
+                        " ".repeat(
+                            (inner.width as usize).saturating_sub(label.chars().count() + 2)
+                        )
                     ),
                     style,
                 ))
@@ -4553,7 +5132,10 @@ impl App {
         }
         let th = &self.cfg.theme;
         let entries: Vec<(String, &str)> = vec![
-            (self.cfg.hint(Action::JumpWaiting), "jump to next pane that needs you"),
+            (
+                self.cfg.hint(Action::JumpWaiting),
+                "jump to next pane that needs you",
+            ),
             (self.cfg.hint(Action::SplitRight), "split pane right"),
             (self.cfg.hint(Action::SplitDown), "split pane down"),
             (self.cfg.hint(Action::ClosePane), "close pane"),
@@ -4569,7 +5151,10 @@ impl App {
             (self.cfg.hint(Action::ScrollDown), "scroll history down"),
             (self.cfg.hint(Action::ToggleSidebar), "toggle sidebar"),
             (self.cfg.hint(Action::Zoom), "zoom focused pane"),
-            (self.cfg.hint(Action::Search), "search scrollback (n/N cycle)"),
+            (
+                self.cfg.hint(Action::Search),
+                "search scrollback (n/N cycle)",
+            ),
             (self.cfg.hint(Action::Palette), "command palette"),
             (self.cfg.hint(Action::Deck), "mobile deck view (cards)"),
             ("alt+1..9".into(), "jump to tab"),
@@ -4659,7 +5244,10 @@ impl App {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 text,
-                Style::default().bg(th.accent).fg(th.bg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(th.accent)
+                    .fg(th.bg)
+                    .add_modifier(Modifier::BOLD),
             ))),
             rect,
         );
@@ -4708,7 +5296,10 @@ impl App {
         let p = self.popup.as_ref().unwrap();
         let screen = p.parser.screen();
         let lines = screen_to_lines(screen, true, false);
-        f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.surface)), inner);
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(th.surface)),
+            inner,
+        );
         if !screen.hide_cursor() {
             let (crow, ccol) = screen.cursor_position();
             let cx = inner.x + ccol.min(inner.width.saturating_sub(1));
@@ -4726,7 +5317,11 @@ impl App {
         let elapsed = at.elapsed().as_millis();
         let total = self.cfg.ui.toast_seconds as u128 * 1000;
         let fade = elapsed < 160 || elapsed + 450 > total;
-        let dim = if fade { Modifier::DIM } else { Modifier::empty() };
+        let dim = if fade {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
+        };
         let w = (msg.chars().count() as u16 + 4).min(sw.saturating_sub(2));
         let (x, y) = match self.cfg.ui.toast_pos {
             ToastPos::BottomRight => (sw.saturating_sub(w + 2), sh.saturating_sub(4)),
@@ -4849,7 +5444,12 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         .iter()
         .find(|s| s.id == snap.active_space)
         .or(snap.spaces.first())
-        .and_then(|s| s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()))
+        .and_then(|s| {
+            s.tabs
+                .iter()
+                .find(|t| t.id == s.active_tab)
+                .or(s.tabs.first())
+        })
         .map(|t| t.active_pane)
         .unwrap_or(0);
 
@@ -4936,7 +5536,11 @@ pub async fn run(initial: Option<String>) -> Result<()> {
             EnableBracketedPaste
         )?;
     } else {
-        crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        )?;
     }
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -5079,11 +5683,26 @@ mod tests {
     #[test]
     fn templates_expand_tokens() {
         let icon = ("◉".to_string(), Color::Yellow);
-        let vars = vec![("title", "claude·3".to_string()), ("cwd", "/tmp".to_string())];
-        let spans = template_spans("{icon} {title} · {cwd}", &icon, &vars, Style::default(), Color::White);
+        let vars = vec![
+            ("title", "claude·3".to_string()),
+            ("cwd", "/tmp".to_string()),
+        ];
+        let spans = template_spans(
+            "{icon} {title} · {cwd}",
+            &icon,
+            &vars,
+            Style::default(),
+            Color::White,
+        );
         assert_eq!(text_of(&spans), "◉ claude·3 · /tmp");
         // unknown tokens render literally rather than vanishing
-        let spans = template_spans("{icon} {nope}", &icon, &vars, Style::default(), Color::White);
+        let spans = template_spans(
+            "{icon} {nope}",
+            &icon,
+            &vars,
+            Style::default(),
+            Color::White,
+        );
         assert_eq!(text_of(&spans), "◉ {nope}");
     }
 
@@ -5101,6 +5720,42 @@ mod tests {
         assert_eq!(out.len(), 2);
         // gutter cell exists between the chunks
         assert!(out[1].1.x > out[0].1.x + out[0].1.width);
+    }
+
+    #[test]
+    fn link_argv_substitutes_and_keeps_single_args() {
+        // ${url}/${match}/${0} = full match; the matched text stays ONE arg even
+        // with spaces (substituted after the template is split → no shell-split).
+        assert_eq!(
+            link_argv("open ${url}", "https://x.dev/a b", &[]),
+            vec!["open", "https://x.dev/a b"]
+        );
+        // ${1}.. = capture groups
+        assert_eq!(
+            link_argv("gh issue view ${1} --web", "#42", &["42"]),
+            vec!["gh", "issue", "view", "42", "--web"]
+        );
+        assert_eq!(link_argv("echo ${0}", "abc", &[]), vec!["echo", "abc"]);
+    }
+
+    #[test]
+    fn hl_spans_split_matched_from_unmatched() {
+        let base = Style::default();
+        // "ag" matched, "ent" not → two spans, text preserved
+        let spans = hl_spans("agent", &[0, 1], base, Color::White, Color::Red, false);
+        assert_eq!(text_of(&spans), "agent");
+        assert_eq!(spans.len(), 2);
+        // no matches → a single span
+        let spans = hl_spans("agent", &[], base, Color::White, Color::Red, false);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn activity_word_labels() {
+        assert_eq!(activity_word(Activity::Waiting), "waiting");
+        assert_eq!(activity_word(Activity::Working), "working");
+        assert_eq!(activity_word(Activity::Done), "done");
+        assert_eq!(activity_word(Activity::Idle), "idle");
     }
 }
 
@@ -5140,5 +5795,104 @@ mod palette_tests {
         assert_eq!(score("anything", ""), Some(0));
         // the matched char indices come back for highlighting
         assert_eq!(fuzzy_indices("split", "sp").unwrap().1, vec![0, 1]);
+    }
+
+    fn pane(id: u64, title: &str) -> PaneInfo {
+        PaneInfo {
+            id,
+            title: title.into(),
+            cmd: Vec::new(),
+            cwd: String::new(),
+            status: PaneStatus::Running,
+            activity: Activity::Idle,
+            created: 0,
+            agent: None,
+            preview: String::new(),
+            activity_since: 0,
+            git_branch: String::new(),
+        }
+    }
+    fn tab(id: u64, name: &str, pane_id: u64) -> TabInfo {
+        TabInfo {
+            id,
+            name: name.into(),
+            active_pane: pane_id,
+            layout: Node::Leaf { pane: pane_id },
+        }
+    }
+    fn fixture() -> Snapshot {
+        let s1 = SpaceInfo {
+            id: 1,
+            name: "work".into(),
+            active_tab: 11,
+            tabs: vec![tab(11, "agent", 10), tab(12, "build", 20)],
+        };
+        let s2 = SpaceInfo {
+            id: 2,
+            name: "personal".into(),
+            active_tab: 21,
+            tabs: vec![tab(21, "notes", 30)],
+        };
+        Snapshot {
+            spaces: vec![s1, s2],
+            active_space: 1,
+            panes: vec![pane(10, "p10"), pane(20, "p20"), pane(30, "p30")],
+        }
+    }
+
+    #[test]
+    fn pane_name_prefers_title_then_cmd() {
+        let mut p = pane(1, "my-title");
+        assert_eq!(pane_name(Some(&p)), "my-title");
+        p.title.clear();
+        p.cmd = vec!["claude".into(), "--foo".into()];
+        assert_eq!(pane_name(Some(&p)), "claude --foo");
+        p.cmd.clear();
+        assert_eq!(pane_name(Some(&p)), "pane 1");
+        assert_eq!(pane_name(None), "pane");
+    }
+
+    #[test]
+    fn palette_tree_default_folds_inactive_spaces() {
+        let snap = fixture();
+        // Mimic Palette::new's default collapse: every space but active + every tab.
+        let collapsed: HashSet<u64> = [2u64, 11, 12, 21].into_iter().collect();
+        let rows = palette_tree(&snap, "", &collapsed);
+        // work (expanded) + its two tabs + personal (collapsed, no children)
+        let kinds: Vec<(u8, bool)> = rows.iter().map(|r| (r.depth, r.expanded)).collect();
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0].kind, PKind::Space(1)));
+        assert!(rows[0].expanded);
+        assert_eq!(rows[1].label, "agent");
+        assert_eq!(rows[2].label, "build");
+        assert!(matches!(rows[3].kind, PKind::Space(2)));
+        assert!(!rows[3].expanded); // personal stays folded
+        assert!(!kinds.iter().any(|(d, _)| *d == 2)); // no pane rows (single-pane tabs)
+    }
+
+    #[test]
+    fn palette_tree_filter_keeps_matches_and_dims_context() {
+        let snap = fixture();
+        let empty = HashSet::new();
+        // Query a tab name: only that branch survives; its space shows as context.
+        let rows = palette_tree(&snap, "agent", &empty);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, PKind::Space(1)));
+        assert!(rows[0].dim, "space shown only as context is dimmed");
+        assert_eq!(rows[1].label, "agent");
+        assert!(!rows[1].dim, "the actual match is not dimmed");
+    }
+
+    #[test]
+    fn palette_tree_filter_by_space_shows_all_its_tabs() {
+        let snap = fixture();
+        let empty = HashSet::new();
+        let rows = palette_tree(&snap, "work", &empty);
+        // matching the space name reveals its tabs (dimmed, as context)
+        assert_eq!(rows.len(), 3);
+        assert!(!rows[0].dim); // "work" itself matched
+        assert_eq!(rows[1].label, "agent");
+        assert_eq!(rows[2].label, "build");
+        assert!(rows[1].dim && rows[2].dim);
     }
 }

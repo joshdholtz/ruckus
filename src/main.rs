@@ -15,7 +15,11 @@ use client::{connect, ensure_daemon, locate_pane, resolve_pane};
 use protocol::*;
 
 #[derive(Parser)]
-#[command(name = "ruckus", version, about = "a persistent runtime for your coding agents")]
+#[command(
+    name = "ruckus",
+    version,
+    about = "a persistent runtime for your coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -172,8 +176,16 @@ async fn main() -> Result<()> {
         Some(Cmd::Tail { target }) => tail(target).await,
         Some(Cmd::Events) => events_cmd().await,
         Some(Cmd::Status { json }) => status(json).await,
-        Some(Cmd::Send { target, no_enter, text }) => send(target, no_enter, text).await,
-        Some(Cmd::Split { target, direction, cmd }) => split(target, direction, cmd).await,
+        Some(Cmd::Send {
+            target,
+            no_enter,
+            text,
+        }) => send(target, no_enter, text).await,
+        Some(Cmd::Split {
+            target,
+            direction,
+            cmd,
+        }) => split(target, direction, cmd).await,
         Some(Cmd::Focus { target }) => focus(target).await,
         Some(Cmd::Rename { kind, id, name }) => rename(kind, id, name).await,
         Some(Cmd::Restart { target }) => restart(target).await,
@@ -235,7 +247,10 @@ async fn theme_cmd(name: Option<String>) -> Result<()> {
         return Ok(());
     };
     if config::theme_preset(&name).is_none() {
-        anyhow::bail!("unknown theme '{name}' — try: {}", config::THEME_NAMES.join(", "));
+        anyhow::bail!(
+            "unknown theme '{name}' — try: {}",
+            config::THEME_NAMES.join(", ")
+        );
     }
     let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
     if doc.get("theme").is_none() {
@@ -252,7 +267,10 @@ async fn keymap_cmd(name: Option<String>) -> Result<()> {
     let path = config::ensure_config_file();
     let current = {
         let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
-        doc.get("keymap").and_then(|v| v.as_str()).unwrap_or("tmux").to_string()
+        doc.get("keymap")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tmux")
+            .to_string()
     };
     let Some(name) = name else {
         println!("keymaps:");
@@ -269,7 +287,10 @@ async fn keymap_cmd(name: Option<String>) -> Result<()> {
         return Ok(());
     };
     if !config::KEYMAP_NAMES.contains(&name.as_str()) {
-        anyhow::bail!("unknown keymap '{name}' — try: {}", config::KEYMAP_NAMES.join(", "));
+        anyhow::bail!(
+            "unknown keymap '{name}' — try: {}",
+            config::KEYMAP_NAMES.join(", ")
+        );
     }
     let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
     doc["keymap"] = toml_edit::value(name.as_str());
@@ -309,7 +330,9 @@ async fn reload_if_running() {
 async fn new_space(name: Option<String>) -> Result<()> {
     ensure_daemon().await?;
     let (client, _events) = connect().await?;
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let msg = client.request(Request::NewSpace { name, cwd }).await?;
     if let ServerMsg::Created { space, pane, .. } = msg {
         println!("space {space} created (pane {pane})");
@@ -340,7 +363,10 @@ async fn send(target: String, no_enter: bool, text: Vec<String>) -> Result<()> {
         bytes.push(b'\r');
     }
     client
-        .request(Request::Input { pane: pane.id, data: B64.encode(&bytes) })
+        .request(Request::Input {
+            pane: pane.id,
+            data: B64.encode(&bytes),
+        })
         .await?;
     println!("sent to pane {} ({})", pane.id, pane.title);
     Ok(())
@@ -351,10 +377,21 @@ async fn split(target: String, direction: String, cmd: Vec<String>) -> Result<()
     let (client, _events) = connect().await?;
     let snap = client.snapshot().await?;
     let pane = resolve_pane(&snap, &target)?;
-    let dir = if direction == "right" { Dir::Right } else { Dir::Down };
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let dir = if direction == "right" {
+        Dir::Right
+    } else {
+        Dir::Down
+    };
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let msg = client
-        .request(Request::Split { pane: pane.id, dir, cmd, cwd })
+        .request(Request::Split {
+            pane: pane.id,
+            dir,
+            cmd,
+            cwd,
+        })
         .await?;
     if let ServerMsg::Created { pane, .. } = msg {
         println!("pane {pane} created");
@@ -370,7 +407,13 @@ async fn focus(target: String) -> Result<()> {
     let Some((space, tab)) = locate_pane(&snap, pane.id) else {
         anyhow::bail!("pane {} is not in any tab", pane.id);
     };
-    client.request(Request::SetActive { space, tab, pane: pane.id }).await?;
+    client
+        .request(Request::SetActive {
+            space,
+            tab,
+            pane: pane.id,
+        })
+        .await?;
     println!("focused pane {} ({})", pane.id, pane.title);
     Ok(())
 }
@@ -379,9 +422,15 @@ async fn rename(kind: String, id: u64, name: String) -> Result<()> {
     ensure_daemon().await?;
     let (client, _events) = connect().await?;
     let req = if kind == "space" {
-        Request::RenameSpace { space: id, name: name.clone() }
+        Request::RenameSpace {
+            space: id,
+            name: name.clone(),
+        }
     } else {
-        Request::RenameTab { tab: id, name: name.clone() }
+        Request::RenameTab {
+            tab: id,
+            name: name.clone(),
+        }
     };
     client.request(req).await?;
     println!("{kind} {id} renamed to {name}");
@@ -411,7 +460,11 @@ fn parse_plugin_ref(repo: &str) -> Result<(String, String, String)> {
         anyhow::bail!("expected owner/repo or owner/repo/subpath");
     }
     let owner_repo = format!("{}/{}", parts[0], parts[1]);
-    Ok((format!("https://github.com/{owner_repo}"), owner_repo, parts[2..].join("/")))
+    Ok((
+        format!("https://github.com/{owner_repo}"),
+        owner_repo,
+        parts[2..].join("/"),
+    ))
 }
 
 /// Walk up from `start` (following symlinks) to the enclosing git repo, if any.
@@ -443,9 +496,20 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
                 } else {
                     format!("  [{}]", p.capabilities.join(", "))
                 };
-                let ver = if p.version.is_empty() { String::new() } else { format!(" v{}", p.version) };
-                let alias = if p.name != p.id { format!(" ({})", p.name) } else { String::new() };
-                println!("• {}{alias}{ver}  — {} binds, {} links{caps}", p.id, p.binds, p.links);
+                let ver = if p.version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" v{}", p.version)
+                };
+                let alias = if p.name != p.id {
+                    format!(" ({})", p.name)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "• {}{alias}{ver}  — {} binds, {} links{caps}",
+                    p.id, p.binds, p.links
+                );
                 if !p.description.is_empty() {
                     println!("    {}", p.description);
                 }
@@ -464,12 +528,19 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
                     }
                 }
                 if sources.is_empty() {
-                    anyhow::bail!("{}: no ruckus-plugin.toml (or plugin subdirs)", src.display());
+                    anyhow::bail!(
+                        "{}: no ruckus-plugin.toml (or plugin subdirs)",
+                        src.display()
+                    );
                 }
             }
             sources.sort();
             for s in sources {
-                let name = s.file_name().and_then(|n| n.to_str()).unwrap_or("plugin").to_string();
+                let name = s
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("plugin")
+                    .to_string();
                 let dst = dir.join(&name);
                 if dst.symlink_metadata().is_ok() {
                     println!("· {name} already installed");
@@ -489,7 +560,11 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             // same monorepo reuse it (and `update` pulls it once).
             let cache = dir.join(".cache").join(owner_repo.replace('/', "__"));
             if cache.join(".git").exists() {
-                std::process::Command::new("git").arg("-C").arg(&cache).args(["pull", "--ff-only"]).status()?;
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&cache)
+                    .args(["pull", "--ff-only"])
+                    .status()?;
             } else {
                 std::fs::create_dir_all(cache.parent().unwrap()).ok();
                 let ok = std::process::Command::new("git")
@@ -501,11 +576,19 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
                     anyhow::bail!("git clone failed");
                 }
             }
-            let src = if subpath.is_empty() { cache.clone() } else { cache.join(&subpath) };
+            let src = if subpath.is_empty() {
+                cache.clone()
+            } else {
+                cache.join(&subpath)
+            };
             if !src.join("ruckus-plugin.toml").exists() {
                 anyhow::bail!("{}: no ruckus-plugin.toml there", src.display());
             }
-            let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+            let name = src
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin")
+                .to_string();
             let dst = dir.join(&name);
             if dst.symlink_metadata().is_ok() {
                 anyhow::bail!("{name} already installed (ruckus plugin remove {name})");
@@ -518,7 +601,9 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
         PluginCmd::Update { name } => {
             use std::collections::HashSet;
             let targets: Vec<(String, std::path::PathBuf)> = match name {
-                Some(n) if dir.join(&n).symlink_metadata().is_ok() => vec![(n.clone(), dir.join(&n))],
+                Some(n) if dir.join(&n).symlink_metadata().is_ok() => {
+                    vec![(n.clone(), dir.join(&n))]
+                }
                 Some(n) => match list_plugins().into_iter().find(|p| p.name == n) {
                     Some(p) => vec![(p.id, p.path)],
                     None => anyhow::bail!("no plugin {n}"),
@@ -702,9 +787,16 @@ async fn new_tab(name: Option<String>, detach: bool, cmd: Vec<String>) -> Result
         .or(snap.spaces.first())
         .map(|s| s.id)
         .ok_or_else(|| anyhow::anyhow!("daemon has no spaces"))?;
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let msg = client
-        .request(Request::NewTab { space, name, cmd, cwd })
+        .request(Request::NewTab {
+            space,
+            name,
+            cmd,
+            cwd,
+        })
         .await?;
     if let ServerMsg::Created { pane, .. } = msg {
         if detach {
@@ -753,7 +845,11 @@ async fn tail(target: String) -> Result<()> {
     let pane = resolve_pane(&snap, &target)?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let msg = client
-        .request(Request::Attach { pane: pane.id, rows, cols })
+        .request(Request::Attach {
+            pane: pane.id,
+            rows,
+            cols,
+        })
         .await?;
     let mut out = std::io::stdout();
     if let ServerMsg::Attached { scrollback, .. } = msg {
@@ -781,4 +877,29 @@ async fn tail(target: String) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_ref_parses_owner_repo_and_subpath() {
+        let (url, key, sub) = parse_plugin_ref("owner/repo").unwrap();
+        assert_eq!(url, "https://github.com/owner/repo");
+        assert_eq!(key, "owner/repo");
+        assert_eq!(sub, "");
+        // monorepo subfolder
+        let (url, key, sub) = parse_plugin_ref("owner/repo/plugins/gh-dash").unwrap();
+        assert_eq!(url, "https://github.com/owner/repo");
+        assert_eq!(key, "owner/repo");
+        assert_eq!(sub, "plugins/gh-dash");
+        // a bare name is not a valid ref
+        assert!(parse_plugin_ref("justaname").is_err());
+        // full URL: cloned as-is, no subpath, cache key from the tail
+        let (url, key, sub) = parse_plugin_ref("https://gitlab.com/me/thing.git").unwrap();
+        assert_eq!(url, "https://gitlab.com/me/thing.git");
+        assert_eq!(key, "me/thing");
+        assert_eq!(sub, "");
+    }
 }

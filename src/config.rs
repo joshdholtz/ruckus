@@ -61,14 +61,47 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
 /// sending alt+key. Map those characters back to the key they came from (US layout).
 pub fn mac_option_char(c: char) -> Option<char> {
     Some(match c {
-        'å' => 'a', '∫' => 'b', 'ç' => 'c', '∂' => 'd', 'ƒ' => 'f', '©' => 'g',
-        '˙' => 'h', '∆' => 'j', '˚' => 'k', '¬' => 'l', 'µ' => 'm', 'ø' => 'o',
-        'π' => 'p', 'œ' => 'q', '®' => 'r', 'ß' => 's', '†' => 't', '√' => 'v',
-        '∑' => 'w', '≈' => 'x', '¥' => 'y', 'Ω' => 'z',
-        '≤' => ',', '≥' => '.', '“' => '[', '‘' => ']', '–' => '-', '≠' => '=',
-        '…' => ';', 'æ' => '\'', '«' => '\\', '÷' => '/',
-        '¡' => '1', '™' => '2', '£' => '3', '¢' => '4', '∞' => '5', '§' => '6',
-        '¶' => '7', '•' => '8', 'ª' => '9',
+        'å' => 'a',
+        '∫' => 'b',
+        'ç' => 'c',
+        '∂' => 'd',
+        'ƒ' => 'f',
+        '©' => 'g',
+        '˙' => 'h',
+        '∆' => 'j',
+        '˚' => 'k',
+        '¬' => 'l',
+        'µ' => 'm',
+        'ø' => 'o',
+        'π' => 'p',
+        'œ' => 'q',
+        '®' => 'r',
+        'ß' => 's',
+        '†' => 't',
+        '√' => 'v',
+        '∑' => 'w',
+        '≈' => 'x',
+        '¥' => 'y',
+        'Ω' => 'z',
+        '≤' => ',',
+        '≥' => '.',
+        '“' => '[',
+        '‘' => ']',
+        '–' => '-',
+        '≠' => '=',
+        '…' => ';',
+        'æ' => '\'',
+        '«' => '\\',
+        '÷' => '/',
+        '¡' => '1',
+        '™' => '2',
+        '£' => '3',
+        '¢' => '4',
+        '∞' => '5',
+        '§' => '6',
+        '¶' => '7',
+        '•' => '8',
+        'ª' => '9',
         _ => return None,
     })
 }
@@ -175,7 +208,10 @@ pub fn parse_binding(spec: &str) -> Result<Binding> {
             other => return Err(anyhow!("unknown key part '{other}' in '{spec}'")),
         }
     }
-    Ok(Binding { code: code.ok_or_else(|| anyhow!("no key in '{spec}'"))?, mods })
+    Ok(Binding {
+        code: code.ok_or_else(|| anyhow!("no key in '{spec}'"))?,
+        mods,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -208,52 +244,84 @@ impl Default for Theme {
 }
 
 /// Built-in theme names, in the order `ruckus theme list` shows them.
-pub const THEME_NAMES: &[&str] =
-    &["macchiato", "latte", "gruvbox", "nord", "tokyonight", "dracula", "rosepine"];
+pub const THEME_NAMES: &[&str] = &[
+    "macchiato",
+    "latte",
+    "gruvbox",
+    "nord",
+    "tokyonight",
+    "dracula",
+    "rosepine",
+];
 
 /// A named built-in palette. Fields map: accent, border, bg, surface, bar_bg,
 /// bar_fg, bar_active_fg, status_fg, sidebar_bg, select_bg, working, waiting,
 /// idle, done_ok, done_err.
 pub fn theme_preset(name: &str) -> Option<Theme> {
-    let t = |accent, border, bg, surface, bar_bg, bar_fg, bar_active_fg, status_fg, sidebar_bg,
-             select_bg, working, waiting, idle, done_ok, done_err| Theme {
-        accent: rgb(accent), border: rgb(border), bg: rgb(bg), surface: rgb(surface),
-        bar_bg: rgb(bar_bg), bar_fg: rgb(bar_fg), bar_active_fg: rgb(bar_active_fg),
-        status_fg: rgb(status_fg), sidebar_bg: rgb(sidebar_bg), select_bg: rgb(select_bg),
-        working: rgb(working), waiting: rgb(waiting), idle: rgb(idle),
-        done_ok: rgb(done_ok), done_err: rgb(done_err),
+    let t = |accent,
+             border,
+             bg,
+             surface,
+             bar_bg,
+             bar_fg,
+             bar_active_fg,
+             status_fg,
+             sidebar_bg,
+             select_bg,
+             working,
+             waiting,
+             idle,
+             done_ok,
+             done_err| Theme {
+        accent: rgb(accent),
+        border: rgb(border),
+        bg: rgb(bg),
+        surface: rgb(surface),
+        bar_bg: rgb(bar_bg),
+        bar_fg: rgb(bar_fg),
+        bar_active_fg: rgb(bar_active_fg),
+        status_fg: rgb(status_fg),
+        sidebar_bg: rgb(sidebar_bg),
+        select_bg: rgb(select_bg),
+        working: rgb(working),
+        waiting: rgb(waiting),
+        idle: rgb(idle),
+        done_ok: rgb(done_ok),
+        done_err: rgb(done_err),
     };
-    Some(match name.to_lowercase().replace(['-', '_', ' '], "").as_str() {
-        "macchiato" | "default" | "catppuccin" => t(
-            0xf5a97f, 0x3b4058, 0x0f1117, 0x1c2030, 0x161925, 0x8f93a2, 0xcad3f5, 0x6e738d,
-            0x161925, 0x2e3348, 0x8aadf4, 0xeed49f, 0x5b6078, 0xa6da95, 0xed8796,
-        ),
-        "latte" => t(
-            0xfe640b, 0xbcc0cc, 0xeff1f5, 0xe6e9ef, 0xdce0e8, 0x6c6f85, 0x4c4f69, 0x8c8fa1,
-            0xdce0e8, 0xccd0da, 0x1e66f5, 0xdf8e1d, 0x9ca0b0, 0x40a02b, 0xd20f39,
-        ),
-        "gruvbox" => t(
-            0xfe8019, 0x504945, 0x1d2021, 0x282828, 0x1d2021, 0x928374, 0xebdbb2, 0x7c6f64,
-            0x1d2021, 0x3c3836, 0x83a598, 0xfabd2f, 0x665c54, 0xb8bb26, 0xfb4934,
-        ),
-        "nord" => t(
-            0x88c0d0, 0x434c5e, 0x2e3440, 0x3b4252, 0x2e3440, 0x616e88, 0xeceff4, 0x4c566a,
-            0x2e3440, 0x434c5e, 0x81a1c1, 0xebcb8b, 0x4c566a, 0xa3be8c, 0xbf616a,
-        ),
-        "tokyonight" => t(
-            0xff9e64, 0x3b4261, 0x1a1b26, 0x24283b, 0x16161e, 0x565f89, 0xc0caf5, 0x545c7e,
-            0x16161e, 0x2f334d, 0x7aa2f7, 0xe0af68, 0x565f89, 0x9ece6a, 0xf7768e,
-        ),
-        "dracula" => t(
-            0xff79c6, 0x44475a, 0x282a36, 0x1e2029, 0x191a21, 0x6272a4, 0xf8f8f2, 0x6272a4,
-            0x191a21, 0x44475a, 0xbd93f9, 0xf1fa8c, 0x6272a4, 0x50fa7b, 0xff5555,
-        ),
-        "rosepine" => t(
-            0xebbcba, 0x403d52, 0x191724, 0x1f1d2e, 0x15131f, 0x6e6a86, 0xe0def4, 0x6e6a86,
-            0x15131f, 0x26233a, 0x31748f, 0xf6c177, 0x6e6a86, 0x9ccfd8, 0xeb6f92,
-        ),
-        _ => return None,
-    })
+    Some(
+        match name.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "macchiato" | "default" | "catppuccin" => t(
+                0xf5a97f, 0x3b4058, 0x0f1117, 0x1c2030, 0x161925, 0x8f93a2, 0xcad3f5, 0x6e738d,
+                0x161925, 0x2e3348, 0x8aadf4, 0xeed49f, 0x5b6078, 0xa6da95, 0xed8796,
+            ),
+            "latte" => t(
+                0xfe640b, 0xbcc0cc, 0xeff1f5, 0xe6e9ef, 0xdce0e8, 0x6c6f85, 0x4c4f69, 0x8c8fa1,
+                0xdce0e8, 0xccd0da, 0x1e66f5, 0xdf8e1d, 0x9ca0b0, 0x40a02b, 0xd20f39,
+            ),
+            "gruvbox" => t(
+                0xfe8019, 0x504945, 0x1d2021, 0x282828, 0x1d2021, 0x928374, 0xebdbb2, 0x7c6f64,
+                0x1d2021, 0x3c3836, 0x83a598, 0xfabd2f, 0x665c54, 0xb8bb26, 0xfb4934,
+            ),
+            "nord" => t(
+                0x88c0d0, 0x434c5e, 0x2e3440, 0x3b4252, 0x2e3440, 0x616e88, 0xeceff4, 0x4c566a,
+                0x2e3440, 0x434c5e, 0x81a1c1, 0xebcb8b, 0x4c566a, 0xa3be8c, 0xbf616a,
+            ),
+            "tokyonight" => t(
+                0xff9e64, 0x3b4261, 0x1a1b26, 0x24283b, 0x16161e, 0x565f89, 0xc0caf5, 0x545c7e,
+                0x16161e, 0x2f334d, 0x7aa2f7, 0xe0af68, 0x565f89, 0x9ece6a, 0xf7768e,
+            ),
+            "dracula" => t(
+                0xff79c6, 0x44475a, 0x282a36, 0x1e2029, 0x191a21, 0x6272a4, 0xf8f8f2, 0x6272a4,
+                0x191a21, 0x44475a, 0xbd93f9, 0xf1fa8c, 0x6272a4, 0x50fa7b, 0xff5555,
+            ),
+            "rosepine" => t(
+                0xebbcba, 0x403d52, 0x191724, 0x1f1d2e, 0x15131f, 0x6e6a86, 0xe0def4, 0x6e6a86,
+                0x15131f, 0x26233a, 0x31748f, 0xf6c177, 0x6e6a86, 0x9ccfd8, 0xeb6f92,
+            ),
+            _ => return None,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,8 +485,18 @@ impl Default for UiConfig {
             detect_osc133: false,
             detect_foreground: false,
             agent_commands: [
-                "claude", "codex", "aider", "goose", "opencode", "amp", "gemini",
-                "cursor-agent", "cline", "cody", "continue", "q",
+                "claude",
+                "codex",
+                "aider",
+                "goose",
+                "opencode",
+                "amp",
+                "gemini",
+                "cursor-agent",
+                "cline",
+                "cody",
+                "continue",
+                "q",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -439,7 +517,8 @@ impl Default for UiConfig {
             footer: BarPos::Bottom,
             footer_mode: FooterMode::Auto,
             status_left: "{space} › {tab}".to_string(),
-            status_right: "#[accent]⚡{agents}#[] ◉{needs}  #[bar_active_fg]{clock:%H:%M}".to_string(),
+            status_right: "#[accent]⚡{agents}#[] ◉{needs}  #[bar_active_fg]{clock:%H:%M}"
+                .to_string(),
             tab_strip: true,
             tab_border: false,
             mouse: true,
@@ -464,7 +543,10 @@ pub struct NotifyConfig {
 
 impl Default for NotifyConfig {
     fn default() -> Self {
-        NotifyConfig { system: true, events: vec!["waiting".to_string()] }
+        NotifyConfig {
+            system: true,
+            events: vec!["waiting".to_string()],
+        }
     }
 }
 
@@ -680,8 +762,16 @@ fn lower_binds(raw: &[RawBind]) -> Vec<CommandBind> {
             if cmd.is_empty() {
                 return None;
             }
-            let placement = b.place.as_deref().map(parse_placement).unwrap_or(Placement::SplitRight);
-            Some(CommandBind { binding, cmd, placement })
+            let placement = b
+                .place
+                .as_deref()
+                .map(parse_placement)
+                .unwrap_or(Placement::SplitRight);
+            Some(CommandBind {
+                binding,
+                cmd,
+                placement,
+            })
         })
         .collect()
 }
@@ -750,19 +840,31 @@ fn read_manifest(dir: &std::path::Path) -> Option<RawManifest> {
 /// Enumerate installed plugins (each subdir of the plugins dir with a manifest).
 pub fn list_plugins() -> Vec<PluginInfo> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(plugins_dir()) else { return out };
+    let Ok(entries) = std::fs::read_dir(plugins_dir()) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         // Skip hidden dirs (e.g. the .cache of cloned monorepos).
-        if entry.file_name().to_str().is_some_and(|n| n.starts_with('.')) {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with('.'))
+        {
             continue;
         }
-        let Some(m) = read_manifest(&path) else { continue };
+        let Some(m) = read_manifest(&path) else {
+            continue;
+        };
         let meta = m.plugin.unwrap_or_default();
-        let id = path.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+        let id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin")
+            .to_string();
         let name = meta.name.unwrap_or_else(|| id.clone());
         out.push(PluginInfo {
             id,
@@ -892,13 +994,20 @@ impl Config {
         let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
-                links.push(LinkRule { pattern, run: "open ${url}".to_string(), placement: None });
+                links.push(LinkRule {
+                    pattern,
+                    run: "open ${url}".to_string(),
+                    placement: None,
+                });
             }
         }
 
         let mut prefix_keys = HashMap::new();
         for (action, default) in PREFIX_DEFAULTS {
-            let name = ACTIONS.iter().find(|(a, _, _)| a == action).map(|(_, n, _)| *n);
+            let name = ACTIONS
+                .iter()
+                .find(|(a, _, _)| a == action)
+                .map(|(_, n, _)| *n);
             let specs: Vec<&str> = name
                 .and_then(|n| raw.prefix_keys.get(n))
                 .map(|s| s.specs())
@@ -951,19 +1060,37 @@ impl Config {
         let ui = UiConfig {
             sidebar_pos,
             sidebar_start_visible,
-            sidebar_width: raw.ui.sidebar_width.unwrap_or(d.sidebar_width).clamp(16, 60),
+            sidebar_width: raw
+                .ui
+                .sidebar_width
+                .unwrap_or(d.sidebar_width)
+                .clamp(16, 60),
             sidebar_sections: raw.ui.sidebar_sections.unwrap_or(d.sidebar_sections),
-            sidebar_split: raw.ui.sidebar_split.unwrap_or(d.sidebar_split).clamp(0.0, 0.9),
+            sidebar_split: raw
+                .ui
+                .sidebar_split
+                .unwrap_or(d.sidebar_split)
+                .clamp(0.0, 0.9),
             sidebar_row_gap: raw.ui.sidebar_row_gap.unwrap_or(d.sidebar_row_gap).min(3),
             sidebar_marker: raw.ui.sidebar_marker.unwrap_or(d.sidebar_marker),
             tab_numbers: raw.ui.tab_numbers.unwrap_or(d.tab_numbers),
             sidebar_tabs: raw.ui.sidebar_tabs.unwrap_or(d.sidebar_tabs),
-            working_style: match raw.ui.working_style.as_deref().map(|s| s.to_lowercase()).as_deref() {
+            working_style: match raw
+                .ui
+                .working_style
+                .as_deref()
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
                 Some("pulse") => WorkingStyle::Pulse,
                 Some("dot") => WorkingStyle::Dot,
                 _ => WorkingStyle::Spinner,
             },
-            activity_quiet_ms: raw.ui.activity_quiet_ms.unwrap_or(d.activity_quiet_ms).clamp(200, 10_000),
+            activity_quiet_ms: raw
+                .ui
+                .activity_quiet_ms
+                .unwrap_or(d.activity_quiet_ms)
+                .clamp(200, 10_000),
             detect_osc133: raw.ui.detect_osc133.unwrap_or(d.detect_osc133),
             detect_foreground: raw.ui.detect_foreground.unwrap_or(d.detect_foreground),
             agent_commands: raw.ui.agent_commands.unwrap_or(d.agent_commands),
@@ -999,7 +1126,13 @@ impl Config {
                 .clamp(1, 60),
             header: parse_bar(raw.ui.header.as_deref(), BarPos::Top),
             footer: parse_bar(raw.ui.footer.as_deref(), BarPos::Bottom),
-            footer_mode: match raw.ui.footer_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
+            footer_mode: match raw
+                .ui
+                .footer_mode
+                .as_deref()
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
                 Some("help") => FooterMode::Help,
                 Some("status") => FooterMode::Status,
                 _ => FooterMode::Auto,
@@ -1012,7 +1145,13 @@ impl Config {
             deck: raw.ui.deck.unwrap_or(d.deck),
             mouse_select: raw.ui.mouse_select.unwrap_or(d.mouse_select),
             mac_option_fallback: raw.ui.mac_option_fallback.unwrap_or(d.mac_option_fallback),
-            link_click: match raw.ui.link_click.as_deref().map(|s| s.to_lowercase()).as_deref() {
+            link_click: match raw
+                .ui
+                .link_click
+                .as_deref()
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
                 Some("shift") => LinkClick::Shift,
                 Some("plain") | Some("click") => LinkClick::Plain,
                 _ => LinkClick::Ctrl,
@@ -1043,7 +1182,17 @@ impl Config {
             events: raw.notify.events.unwrap_or(dn.events),
         };
 
-        Config { keys, prefix, prefix_keys, commands, links, theme, ui, glyphs, notify }
+        Config {
+            keys,
+            prefix,
+            prefix_keys,
+            commands,
+            links,
+            theme,
+            ui,
+            glyphs,
+            notify,
+        }
     }
 
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
@@ -1057,7 +1206,10 @@ impl Config {
     /// Does this key event match the tmux prefix?
     pub fn is_prefix(&self, ev: &KeyEvent) -> bool {
         let ev = normalize_key(ev, self.ui.mac_option_fallback);
-        self.prefix.as_ref().map(|b| b.matches(&ev)).unwrap_or(false)
+        self.prefix
+            .as_ref()
+            .map(|b| b.matches(&ev))
+            .unwrap_or(false)
     }
 
     /// Resolve a post-prefix key to an action. Matches on the key code alone
@@ -1089,7 +1241,6 @@ impl Config {
             .map(|b| b.label())
             .unwrap_or_default()
     }
-
 }
 
 const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
@@ -1342,7 +1493,9 @@ run = "nope"
         // No [[link]] → a built-in URL opener, ctrl trigger by default.
         let cfg = Config::from_toml_str("");
         assert_eq!(cfg.links.len(), 1);
-        assert!(cfg.links[0].pattern.is_match("see https://example.com/x now"));
+        assert!(cfg.links[0]
+            .pattern
+            .is_match("see https://example.com/x now"));
         assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
         // Custom rules replace the default; link_click is configurable.
         let cfg = Config::from_toml_str(

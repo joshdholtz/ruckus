@@ -21,38 +21,97 @@ pub fn socket_path() -> PathBuf {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Snapshot,
-    NewSpace { name: Option<String>, cwd: Option<String> },
-    NewTab { space: u64, name: Option<String>, cmd: Vec<String>, cwd: Option<String> },
-    Split { pane: u64, dir: Dir, cmd: Vec<String>, cwd: Option<String> },
+    NewSpace {
+        name: Option<String>,
+        cwd: Option<String>,
+    },
+    NewTab {
+        space: u64,
+        name: Option<String>,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+    },
+    Split {
+        pane: u64,
+        dir: Dir,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+    },
     /// Replace a tab's layout (same set of panes, new arrangement/weights).
-    SetLayout { tab: u64, layout: Node },
-    RenameSpace { space: u64, name: String },
-    RenameTab { tab: u64, name: String },
+    SetLayout {
+        tab: u64,
+        layout: Node,
+    },
+    RenameSpace {
+        space: u64,
+        name: String,
+    },
+    RenameTab {
+        tab: u64,
+        name: String,
+    },
     /// Respawn an exited pane's command in place (same pane id, scrollback kept).
-    Restart { pane: u64 },
-    ClosePane { pane: u64 },
+    Restart {
+        pane: u64,
+    },
+    ClosePane {
+        pane: u64,
+    },
     /// Close a whole tab (kills its panes; removes the space if it empties).
-    CloseTab { tab: u64 },
+    CloseTab {
+        tab: u64,
+    },
     /// Close a whole space (kills all its panes).
-    CloseSpace { space: u64 },
+    CloseSpace {
+        space: u64,
+    },
     /// Reorder a tab to index `to` within its space.
-    MoveTab { tab: u64, to: usize },
+    MoveTab {
+        tab: u64,
+        to: usize,
+    },
     /// Reorder a space to index `to` in the space list.
-    MoveSpace { space: u64, to: usize },
-    SetActive { space: u64, tab: u64, pane: u64 },
-    Attach { pane: u64, rows: u16, cols: u16 },
-    Detach { pane: u64 },
-    Input { pane: u64, data: String },
-    Resize { pane: u64, rows: u16, cols: u16 },
+    MoveSpace {
+        space: u64,
+        to: usize,
+    },
+    SetActive {
+        space: u64,
+        tab: u64,
+        pane: u64,
+    },
+    Attach {
+        pane: u64,
+        rows: u16,
+        cols: u16,
+    },
+    Detach {
+        pane: u64,
+    },
+    Input {
+        pane: u64,
+        data: String,
+    },
+    Resize {
+        pane: u64,
+        rows: u16,
+        cols: u16,
+    },
     /// Detector seam: report an authoritative activity for a pane, overriding
     /// the built-in output heuristic. Any external process on the socket can send
     /// it. `state`: "working" | "waiting" | "idle" | "auto" ("auto" hands the pane
     /// back to heuristic detection). Lets OSC 133 / shell-integration and
     /// foreground-process detectors live as plugins instead of core behaviour.
-    ReportActivity { pane: u64, state: String },
+    ReportActivity {
+        pane: u64,
+        state: String,
+    },
     /// Detector seam: report the agent running in a pane (e.g. "claude"), or
     /// `null` to clear. Sets PaneInfo.agent, which drives the AGENTS list.
-    ReportAgent { pane: u64, name: Option<String> },
+    ReportAgent {
+        pane: u64,
+        name: Option<String>,
+    },
     /// Re-read config.toml: daemon refreshes its own settings and tells every
     /// attached client to reload and re-render.
     Reload,
@@ -64,19 +123,49 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    State { snapshot: Snapshot },
-    Created { space: u64, tab: u64, pane: u64 },
-    Attached { pane: u64, scrollback: String },
+    State {
+        snapshot: Snapshot,
+    },
+    Created {
+        space: u64,
+        tab: u64,
+        pane: u64,
+    },
+    Attached {
+        pane: u64,
+        scrollback: String,
+    },
     Done,
-    Error { message: String },
-    Output { pane: u64, data: String },
-    Exited { pane: u64, code: u32 },
-    Activity { pane: u64, activity: Activity },
+    Error {
+        message: String,
+    },
+    Output {
+        pane: u64,
+        data: String,
+    },
+    Exited {
+        pane: u64,
+        code: u32,
+    },
+    Activity {
+        pane: u64,
+        activity: Activity,
+    },
     /// Lifecycle events (broadcast to every connection) so external subscribers
     /// can react without diffing full-state snapshots.
-    PaneOpened { space: u64, tab: u64, pane: u64 },
-    PaneClosed { pane: u64 },
-    Focus { space: u64, tab: u64, pane: u64 },
+    PaneOpened {
+        space: u64,
+        tab: u64,
+        pane: u64,
+    },
+    PaneClosed {
+        pane: u64,
+    },
+    Focus {
+        space: u64,
+        tab: u64,
+        pane: u64,
+    },
     /// Pushed to every client when config should be reloaded from disk.
     ConfigChanged,
 }
@@ -130,7 +219,9 @@ pub enum Dir {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
-    Leaf { pane: u64 },
+    Leaf {
+        pane: u64,
+    },
     Split {
         dir: Dir,
         children: Vec<Node>,
@@ -182,7 +273,9 @@ impl Node {
     pub fn valid_weights(&self) -> bool {
         match self {
             Node::Leaf { .. } => true,
-            Node::Split { children, weights, .. } => {
+            Node::Split {
+                children, weights, ..
+            } => {
                 (weights.is_empty()
                     || (weights.len() == children.len() && weights.iter().all(|w| *w > 0)))
                     && children.iter().all(|c| c.valid_weights())
@@ -203,7 +296,11 @@ impl Node {
                 true
             }
             Node::Leaf { .. } => false,
-            Node::Split { dir: d, children, weights } => {
+            Node::Split {
+                dir: d,
+                children,
+                weights,
+            } => {
                 if *d == dir {
                     if let Some(idx) = children
                         .iter()
@@ -217,7 +314,9 @@ impl Node {
                         return true;
                     }
                 }
-                children.iter_mut().any(|c| c.split_at(target, dir, new_pane))
+                children
+                    .iter_mut()
+                    .any(|c| c.split_at(target, dir, new_pane))
             }
         }
     }
@@ -227,7 +326,11 @@ impl Node {
         match self {
             Node::Leaf { pane: p } if p == pane => None,
             leaf @ Node::Leaf { .. } => Some(leaf),
-            Node::Split { dir, children, weights } => {
+            Node::Split {
+                dir,
+                children,
+                weights,
+            } => {
                 let weights = if weights.len() == children.len() {
                     weights
                 } else {
@@ -242,9 +345,12 @@ impl Node {
                     0 => None,
                     1 => Some(kept.into_iter().next().unwrap().0),
                     _ => {
-                        let (children, weights): (Vec<Node>, Vec<u16>) =
-                            kept.into_iter().unzip();
-                        Some(Node::Split { dir, children, weights })
+                        let (children, weights): (Vec<Node>, Vec<u16>) = kept.into_iter().unzip();
+                        Some(Node::Split {
+                            dir,
+                            children,
+                            weights,
+                        })
                     }
                 }
             }
@@ -396,7 +502,9 @@ mod tests {
             weights: vec![10, 20, 30],
         };
         match n.remove_leaf(2).unwrap() {
-            Node::Split { weights, children, .. } => {
+            Node::Split {
+                weights, children, ..
+            } => {
                 assert_eq!(weights, vec![10, 30]);
                 assert_eq!(children.len(), 2);
             }
@@ -407,23 +515,43 @@ mod tests {
     #[test]
     fn weights_validation() {
         assert!(leaf(1).valid_weights());
-        let ok = Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![] };
+        let ok = Node::Split {
+            dir: Dir::Right,
+            children: vec![leaf(1), leaf(2)],
+            weights: vec![],
+        };
         assert!(ok.valid_weights());
-        let bad_len =
-            Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![1] };
+        let bad_len = Node::Split {
+            dir: Dir::Right,
+            children: vec![leaf(1), leaf(2)],
+            weights: vec![1],
+        };
         assert!(!bad_len.valid_weights());
-        let zero =
-            Node::Split { dir: Dir::Right, children: vec![leaf(1), leaf(2)], weights: vec![0, 1] };
+        let zero = Node::Split {
+            dir: Dir::Right,
+            children: vec![leaf(1), leaf(2)],
+            weights: vec![0, 1],
+        };
         assert!(!zero.valid_weights());
     }
 
     #[test]
     fn lifecycle_events_wire_format() {
-        let j = serde_json::to_string(&ServerMsg::PaneOpened { space: 1, tab: 2, pane: 3 }).unwrap();
+        let j = serde_json::to_string(&ServerMsg::PaneOpened {
+            space: 1,
+            tab: 2,
+            pane: 3,
+        })
+        .unwrap();
         assert_eq!(j, r#"{"type":"pane_opened","space":1,"tab":2,"pane":3}"#);
         let j = serde_json::to_string(&ServerMsg::PaneClosed { pane: 3 }).unwrap();
         assert_eq!(j, r#"{"type":"pane_closed","pane":3}"#);
-        let j = serde_json::to_string(&ServerMsg::Focus { space: 1, tab: 2, pane: 3 }).unwrap();
+        let j = serde_json::to_string(&ServerMsg::Focus {
+            space: 1,
+            tab: 2,
+            pane: 3,
+        })
+        .unwrap();
         assert_eq!(j, r#"{"type":"focus","space":1,"tab":2,"pane":3}"#);
     }
 
@@ -431,12 +559,24 @@ mod tests {
     fn frames_roundtrip() {
         let frame = ClientFrame {
             seq: 7,
-            req: Request::Split { pane: 3, dir: Dir::Down, cmd: vec!["claude".into()], cwd: None },
+            req: Request::Split {
+                pane: 3,
+                dir: Dir::Down,
+                cmd: vec!["claude".into()],
+                cwd: None,
+            },
         };
         let s = serde_json::to_string(&frame).unwrap();
         let back: ClientFrame = serde_json::from_str(&s).unwrap();
         assert_eq!(back.seq, 7);
-        assert!(matches!(back.req, Request::Split { pane: 3, dir: Dir::Down, .. }));
+        assert!(matches!(
+            back.req,
+            Request::Split {
+                pane: 3,
+                dir: Dir::Down,
+                ..
+            }
+        ));
 
         // weights default when omitted on the wire
         let n: Node = serde_json::from_str(

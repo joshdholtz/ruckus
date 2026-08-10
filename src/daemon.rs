@@ -250,20 +250,35 @@ fn do_upgrade(st: &mut State) -> Result<()> {
     for (id, p) in st.panes.iter() {
         let (rows, cols) = p.screen.screen().size();
         clear_cloexec(p.pty.master_fd);
-        panes.push(HandoffPane { id: *id, fd: p.pty.master_fd, pid: p.pty.pid, rows, cols });
+        panes.push(HandoffPane {
+            id: *id,
+            fd: p.pty.master_fd,
+            pid: p.pty.pid,
+            rows,
+            cols,
+        });
     }
     clear_cloexec(st.listener_fd);
-    let hf = Handoff { listener_fd: st.listener_fd, panes };
+    let hf = Handoff {
+        listener_fd: st.listener_fd,
+        panes,
+    };
     std::fs::write(handoff_path(), serde_json::to_vec(&hf)?)?;
     let exe = std::env::current_exe()?;
     use std::os::unix::process::CommandExt;
-    let e = std::process::Command::new(exe).arg("daemon").env("RUCKUS_HANDOFF", "1").exec();
+    let e = std::process::Command::new(exe)
+        .arg("daemon")
+        .env("RUCKUS_HANDOFF", "1")
+        .exec();
     Err(anyhow!("exec failed: {e}"))
 }
 
 /// Written on every tree change so a daemon restart can rebuild the world.
 fn save_state(st: &State) {
-    let p = Persisted { snapshot: st.snapshot(), next_id: st.next_id };
+    let p = Persisted {
+        snapshot: st.snapshot(),
+        next_id: st.next_id,
+    };
     if let Ok(json) = serde_json::to_vec(&p) {
         let dir = ruckus_dir();
         let tmp = dir.join("state.json.tmp");
@@ -290,8 +305,12 @@ fn restore_state(
     handoff: Option<&HashMap<u64, HandoffPane>>,
 ) -> bool {
     let path = ruckus_dir().join("state.json");
-    let Ok(data) = std::fs::read(&path) else { return false };
-    let Ok(p) = serde_json::from_slice::<Persisted>(&data) else { return false };
+    let Ok(data) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(p) = serde_json::from_slice::<Persisted>(&data) else {
+        return false;
+    };
     st.next_id = st.next_id.max(p.next_id);
 
     let mut alive: Vec<u64> = Vec::new();
@@ -310,7 +329,14 @@ fn restore_state(
             sb.extend(
                 b"\r\n\x1b[2m-- ruckus: daemon restarted, process respawned --\x1b[0m\r\n".iter(),
             );
-            spawn_pane_with_id(state, st, info.id, info.cmd.clone(), Some(info.cwd.clone()), Some(sb))
+            spawn_pane_with_id(
+                state,
+                st,
+                info.id,
+                info.cmd.clone(),
+                Some(info.cwd.clone()),
+                Some(sb),
+            )
         };
         match result {
             Ok(()) => alive.push(info.id),
@@ -335,7 +361,12 @@ fn restore_state(
                 } else {
                     layout.first_leaf()
                 };
-                tabs.push(Tab { id: t.id, name: t.name.clone(), active_pane, layout });
+                tabs.push(Tab {
+                    id: t.id,
+                    name: t.name.clone(),
+                    active_pane,
+                    layout,
+                });
             }
         }
         if !tabs.is_empty() {
@@ -344,7 +375,12 @@ fn restore_state(
             } else {
                 tabs[0].id
             };
-            st.spaces.push(Space { id: sp.id, name: sp.name.clone(), active_tab, tabs });
+            st.spaces.push(Space {
+                id: sp.id,
+                name: sp.name.clone(),
+                active_tab,
+                tabs,
+            });
         }
     }
     if !st.spaces.iter().any(|s| s.id == p.snapshot.active_space) {
@@ -354,7 +390,11 @@ fn restore_state(
     } else {
         st.active_space = p.snapshot.active_space;
     }
-    info!("restored {} panes across {} spaces", alive.len(), st.spaces.len());
+    info!(
+        "restored {} panes across {} spaces",
+        alive.len(),
+        st.spaces.len()
+    );
     !st.spaces.is_empty()
 }
 
@@ -396,8 +436,7 @@ fn looks_like_input_prompt(line: &str) -> bool {
         return true;
     }
     let lower = t.to_lowercase();
-    if lower.contains("password") || lower.contains("passphrase") || lower.contains("continue?")
-    {
+    if lower.contains("password") || lower.contains("passphrase") || lower.contains("continue?") {
         return true;
     }
     // Trailing-colon prompts only when short and not an obvious log/status line.
@@ -460,9 +499,7 @@ pub(crate) fn classify_tail(prog: &str, text: &str) -> Activity {
 
     // Agent working markers: still busy even while producing no output
     // (long tool calls run silent). Covers Claude Code, Codex, and friends.
-    if recent_lower.contains("esc to interrupt")
-        || recent_lower.contains("ctrl+c to interrupt")
-    {
+    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
         return Activity::Working;
     }
 
@@ -620,7 +657,10 @@ pub async fn run() -> Result<()> {
     let listener = if let Some(hf) = &handoff {
         let std_l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(hf.listener_fd) };
         std_l.set_nonblocking(true)?;
-        info!("ruckus daemon adopted {} panes across upgrade", hf.panes.len());
+        info!(
+            "ruckus daemon adopted {} panes across upgrade",
+            hf.panes.len()
+        );
         UnixListener::from_std(std_l)?
     } else {
         if UnixStream::connect(&sock).await.is_ok() {
@@ -689,22 +729,25 @@ pub async fn run() -> Result<()> {
                     }
                 }
                 for (pane, activity) in &changes {
-                    broadcast(&st, ServerMsg::Activity { pane: *pane, activity: *activity });
+                    broadcast(
+                        &st,
+                        ServerMsg::Activity {
+                            pane: *pane,
+                            activity: *activity,
+                        },
+                    );
                 }
                 for (pane, activity) in changes {
                     if activity == Activity::Waiting && st.notify_waiting {
                         if let Some(p) = st.panes.get(&pane) {
                             if p.subs.is_empty() {
-                                notify_system(
-                                    "ruckus",
-                                    &format!("🐏 {} needs you", p.info.title),
-                                );
+                                notify_system("ruckus", &format!("🐏 {} needs you", p.info.title));
                             }
                         }
                     }
                 }
                 // ~ every 5s (ticker runs at 250ms)
-                if n % 20 == 0 {
+                if n.is_multiple_of(20) {
                     flush_scrollbacks(&mut st);
                 }
             }
@@ -748,17 +791,10 @@ pub async fn run() -> Result<()> {
                             if &p.info.cwd != cwd {
                                 p.info.cwd = cwd.clone();
                                 // Keep shell pane titles in sync with the directory.
-                                let prog = p
-                                    .info
-                                    .cmd
-                                    .first()
-                                    .map(|s| basename(s))
-                                    .unwrap_or_default();
+                                let prog =
+                                    p.info.cmd.first().map(|s| basename(s)).unwrap_or_default();
                                 if SHELLS.contains(&prog.as_str())
-                                    || matches!(
-                                        prog.as_str(),
-                                        "tcsh" | "ksh" | "pwsh"
-                                    )
+                                    || matches!(prog.as_str(), "tcsh" | "ksh" | "pwsh")
                                 {
                                     p.info.title = default_pane_title(
                                         p.info.cmd.first().map(String::as_str).unwrap_or("sh"),
@@ -777,7 +813,8 @@ pub async fn run() -> Result<()> {
                     // An empty allowlist means "any non-shell command".
                     let is_agent = !base.is_empty()
                         && !SHELLS.contains(&base.as_str())
-                        && (allow.is_empty() || allow.iter().any(|a| a.eq_ignore_ascii_case(&base)));
+                        && (allow.is_empty()
+                            || allow.iter().any(|a| a.eq_ignore_ascii_case(&base)));
                     let agent = if is_agent { Some(base) } else { None };
                     if let Some(p) = st.panes.get_mut(&id) {
                         if p.info.agent != agent {
@@ -845,7 +882,13 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
         };
         reader.consume(used);
         if buf.len() > MAX_LINE {
-            send(&tx, None, ServerMsg::Error { message: "request too large".into() });
+            send(
+                &tx,
+                None,
+                ServerMsg::Error {
+                    message: "request too large".into(),
+                },
+            );
             break;
         }
         if found_nl {
@@ -860,9 +903,13 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
                     let msg = handle_request(&state, conn_id, frame.req);
                     send(&tx, Some(frame.seq), msg);
                 }
-                Err(e) => {
-                    send(&tx, None, ServerMsg::Error { message: format!("bad request: {e}") })
-                }
+                Err(e) => send(
+                    &tx,
+                    None,
+                    ServerMsg::Error {
+                        message: format!("bad request: {e}"),
+                    },
+                ),
             }
         }
         if eof {
@@ -913,7 +960,12 @@ fn broadcast(st: &State, msg: ServerMsg) {
 }
 
 fn broadcast_state(st: &State) {
-    broadcast(st, ServerMsg::State { snapshot: st.snapshot() });
+    broadcast(
+        st,
+        ServerMsg::State {
+            snapshot: st.snapshot(),
+        },
+    );
     save_state(st);
 }
 
@@ -1022,21 +1074,34 @@ fn move_space(state: &Arc<Mutex<State>>, space: u64, to: usize) -> Result<Server
 }
 
 fn err(message: impl Into<String>) -> ServerMsg {
-    ServerMsg::Error { message: message.into() }
+    ServerMsg::Error {
+        message: message.into(),
+    }
 }
 
 fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> ServerMsg {
     match req {
         Request::Snapshot => {
             let st = state.lock().unwrap();
-            ServerMsg::State { snapshot: st.snapshot() }
+            ServerMsg::State {
+                snapshot: st.snapshot(),
+            }
         }
-        Request::NewSpace { name, cwd } => new_space(state, name, cwd)
-            .unwrap_or_else(|e| err(format!("{e:#}"))),
-        Request::NewTab { space, name, cmd, cwd } => new_tab(state, space, name, cmd, cwd)
-            .unwrap_or_else(|e| err(format!("{e:#}"))),
-        Request::Split { pane, dir, cmd, cwd } => split(state, pane, dir, cmd, cwd)
-            .unwrap_or_else(|e| err(format!("{e:#}"))),
+        Request::NewSpace { name, cwd } => {
+            new_space(state, name, cwd).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
+        Request::NewTab {
+            space,
+            name,
+            cmd,
+            cwd,
+        } => new_tab(state, space, name, cmd, cwd).unwrap_or_else(|e| err(format!("{e:#}"))),
+        Request::Split {
+            pane,
+            dir,
+            cmd,
+            cwd,
+        } => split(state, pane, dir, cmd, cwd).unwrap_or_else(|e| err(format!("{e:#}"))),
         Request::SetLayout { tab, layout } => {
             let mut st = state.lock().unwrap();
             let Some(t) = st
@@ -1106,8 +1171,9 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 Err(e) => err(format!("restart failed: {e:#}")),
             }
         }
-        Request::ClosePane { pane } => close_pane(state, pane)
-            .unwrap_or_else(|e| err(format!("{e:#}"))),
+        Request::ClosePane { pane } => {
+            close_pane(state, pane).unwrap_or_else(|e| err(format!("{e:#}")))
+        }
         Request::CloseTab { tab } => {
             close_tab(state, tab).unwrap_or_else(|e| err(format!("{e:#}")))
         }
@@ -1196,12 +1262,18 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             }
             ServerMsg::Done
         }
-        Request::ReportActivity { pane, state: report } => {
+        Request::ReportActivity {
+            pane,
+            state: report,
+        } => {
             let mut st = state.lock().unwrap();
             if !st.panes.contains_key(&pane) {
                 return err(format!("no pane {pane}"));
             }
-            let change = st.panes.get_mut(&pane).and_then(|p| apply_report(p, &report));
+            let change = st
+                .panes
+                .get_mut(&pane)
+                .and_then(|p| apply_report(p, &report));
             if let Some(a) = change {
                 broadcast(&st, ServerMsg::Activity { pane, activity: a });
             }
@@ -1221,7 +1293,8 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
         Request::Reload => {
             let mut st = state.lock().unwrap();
             let cfg = crate::config::Config::load();
-            st.notify_waiting = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
+            st.notify_waiting =
+                cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
             st.notify_done = cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
             st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
             st.detect_osc133 = cfg.ui.detect_osc133;
@@ -1289,13 +1362,22 @@ fn spawn_pane_with_id(
     cwd: Option<String>,
     scrollback: Option<VecDeque<u8>>,
 ) -> Result<()> {
-    let cmdline = if cmd.is_empty() { vec![default_shell()] } else { cmd };
+    let cmdline = if cmd.is_empty() {
+        vec![default_shell()]
+    } else {
+        cmd
+    };
     let cwd = cwd
         .or_else(|| dirs::home_dir().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "/".to_string());
 
     let pty = native_pty_system();
-    let pair = pty.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })?;
+    let pair = pty.openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
     let mut builder = CommandBuilder::new(&cmdline[0]);
     builder.args(&cmdline[1..]);
     builder.env("TERM", "xterm-256color");
@@ -1326,7 +1408,11 @@ fn spawn_pane_with_id(
     std::mem::forget(child);
     let reader = unsafe { File::from_raw_fd(reader_fd) };
     let writer = unsafe { File::from_raw_fd(writer_fd) };
-    let pty = Pty { master_fd, pid, writer };
+    let pty = Pty {
+        master_fd,
+        pid,
+        writer,
+    };
 
     let title = default_pane_title(&cmdline[0], &cwd);
     let info = PaneInfo {
@@ -1342,13 +1428,23 @@ fn spawn_pane_with_id(
         activity_since: unix_now(),
         git_branch: String::new(),
     };
-    install_pane(state, st, info, pty, reader, scrollback.unwrap_or_default(), 24, 80);
+    install_pane(
+        state,
+        st,
+        info,
+        pty,
+        reader,
+        scrollback.unwrap_or_default(),
+        24,
+        80,
+    );
     Ok(())
 }
 
 /// Wire a Pty into a PaneSession: start the reader thread (reap on EOF), the
 /// pump task, seed the screen from scrollback, and insert it. Shared by fresh
 /// spawns and post-upgrade adoption.
+#[allow(clippy::too_many_arguments)]
 fn install_pane(
     state: &Arc<Mutex<State>>,
     st: &mut State,
@@ -1414,9 +1510,14 @@ fn adopt_pane(
 ) -> Result<()> {
     let reader = unsafe { File::from_raw_fd(dup_fd(master_fd, true)?) };
     let writer = unsafe { File::from_raw_fd(dup_fd(master_fd, true)?) };
-    let pty = Pty { master_fd, pid, writer };
-    let scrollback: VecDeque<u8> =
-        std::fs::read(scrollback_path(info.id)).map(VecDeque::from).unwrap_or_default();
+    let pty = Pty {
+        master_fd,
+        pid,
+        writer,
+    };
+    let scrollback: VecDeque<u8> = std::fs::read(scrollback_path(info.id))
+        .map(VecDeque::from)
+        .unwrap_or_default();
     install_pane(state, st, info, pty, reader, scrollback, rows, cols);
     Ok(())
 }
@@ -1477,7 +1578,11 @@ fn resolve_fg_names(pids: &[i32]) -> HashMap<i32, String> {
     if pids.is_empty() {
         return map;
     }
-    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let list = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     if let Ok(out) = std::process::Command::new("ps")
         .args(["-o", "pid=,comm=", "-p", &list])
         .output()
@@ -1517,7 +1622,11 @@ fn resolve_cwds(pids: &[i32]) -> HashMap<i32, String> {
     {
         // lsof -a -d cwd -Fn -p p1,p2,…
         // emits blocks: p<pid>\n n<path>\n
-        let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+        let list = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let Ok(out) = std::process::Command::new("lsof")
             .args(["-a", "-d", "cwd", "-Fn", "-p", &list])
             .output()
@@ -1551,7 +1660,10 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 // pane that contends on the single State mutex.
                 let out_frame = serde_json::to_string(&ServerFrame {
                     seq: None,
-                    msg: ServerMsg::Output { pane: id, data: B64.encode(&bytes) },
+                    msg: ServerMsg::Output {
+                        pane: id,
+                        data: B64.encode(&bytes),
+                    },
                 })
                 .unwrap();
 
@@ -1563,7 +1675,9 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     let notify_waiting = st.notify_waiting;
                     let detect_osc = st.detect_osc133;
                     let (changed, notify_title, sub_txs) = {
-                        let Some(p) = st.panes.get_mut(&id) else { continue };
+                        let Some(p) = st.panes.get_mut(&id) else {
+                            continue;
+                        };
                         p.scrollback.extend(bytes.iter().copied());
                         while p.scrollback.len() > SCROLLBACK_MAX {
                             p.scrollback.pop_front();
@@ -1573,8 +1687,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                         p.screen.process(&bytes);
                         // Throttle full-screen agent-prompt scans — Claude redraws
                         // would otherwise peg the daemon under the lock.
-                        if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250)
-                        {
+                        if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250) {
                             let text = p.screen.screen().contents().to_lowercase();
                             p.prompt_cached = text.contains("esc to cancel")
                                 || text.contains("do you want to proceed")
@@ -1610,8 +1723,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                             }
                             _ => None,
                         };
-                        let sub_txs: Vec<Tx> =
-                            p.subs.values().map(|s| s.tx.clone()).collect();
+                        let sub_txs: Vec<Tx> = p.subs.values().map(|s| s.tx.clone()).collect();
                         (changed, notify_title, sub_txs)
                     }; // p borrow ends here
                     let osc_change = if detect_osc {
@@ -1628,10 +1740,22 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 if changed.is_some() || osc_change.is_some() {
                     let st = state.lock().unwrap();
                     if let Some(a) = changed {
-                        broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
+                        broadcast(
+                            &st,
+                            ServerMsg::Activity {
+                                pane: id,
+                                activity: a,
+                            },
+                        );
                     }
                     if let Some(a) = osc_change {
-                        broadcast(&st, ServerMsg::Activity { pane: id, activity: a });
+                        broadcast(
+                            &st,
+                            ServerMsg::Activity {
+                                pane: id,
+                                activity: a,
+                            },
+                        );
                     }
                 }
                 if let Some(title) = notify_waiting_title {
@@ -1672,7 +1796,11 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
     }
 }
 
-fn new_space(state: &Arc<Mutex<State>>, name: Option<String>, cwd: Option<String>) -> Result<ServerMsg> {
+fn new_space(
+    state: &Arc<Mutex<State>>,
+    name: Option<String>,
+    cwd: Option<String>,
+) -> Result<ServerMsg> {
     let mut st = state.lock().unwrap();
     let pane = spawn_pane(state, &mut st, Vec::new(), cwd)?;
     let tab_id = st.next();
@@ -1682,12 +1810,28 @@ fn new_space(state: &Arc<Mutex<State>>, name: Option<String>, cwd: Option<String
         id: space_id,
         name: name.unwrap_or_else(|| format!("space·{space_id}")),
         active_tab: tab_id,
-        tabs: vec![Tab { id: tab_id, name: tab_name, active_pane: pane, layout: Node::Leaf { pane } }],
+        tabs: vec![Tab {
+            id: tab_id,
+            name: tab_name,
+            active_pane: pane,
+            layout: Node::Leaf { pane },
+        }],
     });
     st.active_space = space_id;
     broadcast_state(&st);
-    broadcast(&st, ServerMsg::PaneOpened { space: space_id, tab: tab_id, pane });
-    Ok(ServerMsg::Created { space: space_id, tab: tab_id, pane })
+    broadcast(
+        &st,
+        ServerMsg::PaneOpened {
+            space: space_id,
+            tab: tab_id,
+            pane,
+        },
+    );
+    Ok(ServerMsg::Created {
+        space: space_id,
+        tab: tab_id,
+        pane,
+    })
 }
 
 fn new_tab(
@@ -1705,11 +1849,27 @@ fn new_tab(
     let tab_id = st.next();
     let tab_name = name.unwrap_or_else(|| st.panes[&pane].info.title.clone());
     let s = st.spaces.iter_mut().find(|s| s.id == space).unwrap();
-    s.tabs.push(Tab { id: tab_id, name: tab_name, active_pane: pane, layout: Node::Leaf { pane } });
+    s.tabs.push(Tab {
+        id: tab_id,
+        name: tab_name,
+        active_pane: pane,
+        layout: Node::Leaf { pane },
+    });
     s.active_tab = tab_id;
     broadcast_state(&st);
-    broadcast(&st, ServerMsg::PaneOpened { space, tab: tab_id, pane });
-    Ok(ServerMsg::Created { space, tab: tab_id, pane })
+    broadcast(
+        &st,
+        ServerMsg::PaneOpened {
+            space,
+            tab: tab_id,
+            pane,
+        },
+    );
+    Ok(ServerMsg::Created {
+        space,
+        tab: tab_id,
+        pane,
+    })
 }
 
 fn split(
@@ -1730,8 +1890,19 @@ fn split(
     t.layout.split_at(target, dir, pane);
     t.active_pane = pane;
     broadcast_state(&st);
-    broadcast(&st, ServerMsg::PaneOpened { space: space_id, tab: tab_id, pane });
-    Ok(ServerMsg::Created { space: space_id, tab: tab_id, pane })
+    broadcast(
+        &st,
+        ServerMsg::PaneOpened {
+            space: space_id,
+            tab: tab_id,
+            pane,
+        },
+    );
+    Ok(ServerMsg::Created {
+        space: space_id,
+        tab: tab_id,
+        pane,
+    })
 }
 
 fn close_pane(state: &Arc<Mutex<State>>, pane: u64) -> Result<ServerMsg> {
@@ -1789,7 +1960,12 @@ fn ensure_nonempty(state: &Arc<Mutex<State>>, st: &mut State) -> Result<()> {
         id: space_id,
         name: "main".to_string(),
         active_tab: tab_id,
-        tabs: vec![Tab { id: tab_id, name: tab_name, active_pane: pane, layout: Node::Leaf { pane } }],
+        tabs: vec![Tab {
+            id: tab_id,
+            name: tab_name,
+            active_pane: pane,
+            layout: Node::Leaf { pane },
+        }],
     });
     st.active_space = space_id;
     Ok(())
@@ -1827,10 +2003,22 @@ mod tests {
 
     #[test]
     fn log_colons_are_not_waiting() {
-        assert_eq!(classify_tail("cargo", "error: could not compile `foo`"), Activity::Idle);
-        assert_eq!(classify_tail("app", "Error: something failed"), Activity::Idle);
-        assert_eq!(classify_tail("app", "https://example.com/path:"), Activity::Idle);
-        assert_eq!(classify_tail("cargo", "   Compiling foo v0.1.0"), Activity::Idle);
+        assert_eq!(
+            classify_tail("cargo", "error: could not compile `foo`"),
+            Activity::Idle
+        );
+        assert_eq!(
+            classify_tail("app", "Error: something failed"),
+            Activity::Idle
+        );
+        assert_eq!(
+            classify_tail("app", "https://example.com/path:"),
+            Activity::Idle
+        );
+        assert_eq!(
+            classify_tail("cargo", "   Compiling foo v0.1.0"),
+            Activity::Idle
+        );
     }
 
     #[test]
@@ -1848,10 +2036,16 @@ mod tests {
     #[test]
     fn quiet_agent_waits_batch_tools_idle() {
         // Known agent command quiet without markers → needs you.
-        assert_eq!(classify_tail("claude", "some prior tool output"), Activity::Waiting);
+        assert_eq!(
+            classify_tail("claude", "some prior tool output"),
+            Activity::Waiting
+        );
         assert_eq!(classify_tail("codex", "thinking done"), Activity::Waiting);
         // Batch tools / unknown CLIs quiet → idle, not NEEDS YOU.
-        assert_eq!(classify_tail("cargo", "Compiling foo v0.1.0"), Activity::Idle);
+        assert_eq!(
+            classify_tail("cargo", "Compiling foo v0.1.0"),
+            Activity::Idle
+        );
         assert_eq!(classify_tail("pytest", "...."), Activity::Idle);
         assert_eq!(classify_tail("sleep", ""), Activity::Idle);
         assert_eq!(classify_tail("zsh", "some scrollback text"), Activity::Idle);

@@ -1,5 +1,6 @@
 //! Integration tests: spawn the real daemon on an isolated RUCKUS_DIR and
 //! drive it over the unix socket exactly like a client/plugin would.
+#![allow(clippy::zombie_processes)] // tests kill the daemon in teardown
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -65,9 +66,7 @@ fn rpc(dir: &Path, req: Value) -> Value {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let frame = json!({ "seq": 1, "req": req });
-    stream
-        .write_all(format!("{frame}\n").as_bytes())
-        .unwrap();
+    stream.write_all(format!("{frame}\n").as_bytes()).unwrap();
     let reader = BufReader::new(stream.try_clone().unwrap());
     for line in reader.lines() {
         let line = line.unwrap();
@@ -136,7 +135,10 @@ fn tab_lifecycle_and_exit_detection() {
         |s| pane_by_id(s, pane).is_some(),
         "new pane in snapshot",
     );
-    assert_eq!(pane_by_id(&snap, pane).unwrap()["status"]["state"], "running");
+    assert_eq!(
+        pane_by_id(&snap, pane).unwrap()["status"]["state"],
+        "running"
+    );
 
     // a quick script exits and is detected with its code
     let msg = rpc(
@@ -170,7 +172,10 @@ fn rename_and_restart() {
     let snap = snapshot(&d.dir);
     let space = snap["spaces"][0]["id"].as_u64().unwrap();
 
-    rpc(&d.dir, json!({"type": "rename_space", "space": space, "name": "workbench"}));
+    rpc(
+        &d.dir,
+        json!({"type": "rename_space", "space": space, "name": "workbench"}),
+    );
     let snap = snapshot(&d.dir);
     assert_eq!(snap["spaces"][0]["name"], "workbench");
 
@@ -182,7 +187,10 @@ fn rename_and_restart() {
     let pane = msg["pane"].as_u64().unwrap();
     let tab = msg["tab"].as_u64().unwrap();
 
-    rpc(&d.dir, json!({"type": "rename_tab", "tab": tab, "name": "flaky"}));
+    rpc(
+        &d.dir,
+        json!({"type": "rename_tab", "tab": tab, "name": "flaky"}),
+    );
     let snap = snapshot(&d.dir);
     let tabs = snap["spaces"][0]["tabs"].as_array().unwrap();
     assert!(tabs.iter().any(|t| t["name"] == "flaky"));
@@ -199,14 +207,19 @@ fn rename_and_restart() {
     let msg = rpc(&d.dir, json!({"type": "restart", "pane": pane}));
     assert_eq!(msg["type"], "done", "restart failed: {msg}");
     let snap = snapshot(&d.dir);
-    assert_eq!(pane_by_id(&snap, pane).unwrap()["status"]["state"], "running");
+    assert_eq!(
+        pane_by_id(&snap, pane).unwrap()["status"]["state"],
+        "running"
+    );
 }
 
 #[test]
 fn restart_refuses_running_pane() {
     let d = Daemon::start("restart-guard");
     let snap = snapshot(&d.dir);
-    let pane = snap["spaces"][0]["tabs"][0]["active_pane"].as_u64().unwrap();
+    let pane = snap["spaces"][0]["tabs"][0]["active_pane"]
+        .as_u64()
+        .unwrap();
     let msg = rpc(&d.dir, json!({"type": "restart", "pane": pane}));
     assert_eq!(msg["type"], "error");
 }
@@ -217,7 +230,9 @@ fn layout_and_weights_survive_set_layout() {
     let snap = snapshot(&d.dir);
     let space = snap["spaces"][0]["id"].as_u64().unwrap();
     let tab = snap["spaces"][0]["tabs"][0]["id"].as_u64().unwrap();
-    let first = snap["spaces"][0]["tabs"][0]["active_pane"].as_u64().unwrap();
+    let first = snap["spaces"][0]["tabs"][0]["active_pane"]
+        .as_u64()
+        .unwrap();
 
     let msg = rpc(
         &d.dir,
@@ -230,14 +245,23 @@ fn layout_and_weights_survive_set_layout() {
     let layout = json!({"kind": "split", "dir": "right",
         "children": [{"kind": "leaf", "pane": first}, {"kind": "leaf", "pane": second}],
         "weights": [25, 75]});
-    let msg = rpc(&d.dir, json!({"type": "set_layout", "tab": tab, "layout": layout}));
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "set_layout", "tab": tab, "layout": layout}),
+    );
     assert_eq!(msg["type"], "done", "{msg}");
     let snap = snapshot(&d.dir);
-    assert_eq!(snap["spaces"][0]["tabs"][0]["layout"]["weights"], json!([25, 75]));
+    assert_eq!(
+        snap["spaces"][0]["tabs"][0]["layout"]["weights"],
+        json!([25, 75])
+    );
 
     // wrong pane set is rejected
     let bad = json!({"kind": "leaf", "pane": 9999});
-    let msg = rpc(&d.dir, json!({"type": "set_layout", "tab": tab, "layout": bad}));
+    let msg = rpc(
+        &d.dir,
+        json!({"type": "set_layout", "tab": tab, "layout": bad}),
+    );
     assert_eq!(msg["type"], "error");
 }
 
@@ -247,7 +271,10 @@ fn state_survives_daemon_restart() {
     let snap = snapshot(&d.dir);
     let space = snap["spaces"][0]["id"].as_u64().unwrap();
 
-    rpc(&d.dir, json!({"type": "rename_space", "space": space, "name": "keeper"}));
+    rpc(
+        &d.dir,
+        json!({"type": "rename_space", "space": space, "name": "keeper"}),
+    );
     let msg = rpc(
         &d.dir,
         json!({"type": "new_tab", "space": space, "name": "surviving-tab",
@@ -287,7 +314,11 @@ fn cli_config_roundtrip() {
             .env("RUCKUS_DIR", &dir)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).to_string()
     };
 
@@ -338,7 +369,9 @@ fn reload_broadcasts_config_changed() {
     // Listener connection: register it by sending a snapshot, then watch for the
     // unsolicited ConfigChanged event.
     let mut listener = UnixStream::connect(d.dir.join("ruckus.sock")).unwrap();
-    listener.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     listener
         .write_all(b"{\"seq\":99,\"req\":{\"type\":\"snapshot\"}}\n")
         .unwrap();
@@ -376,7 +409,9 @@ fn reload_broadcasts_config_changed() {
 fn report_activity_overrides_heuristic() {
     let d = Daemon::start("report-act");
     let snap = snapshot(&d.dir);
-    let pane = snap["spaces"][0]["tabs"][0]["active_pane"].as_u64().unwrap();
+    let pane = snap["spaces"][0]["tabs"][0]["active_pane"]
+        .as_u64()
+        .unwrap();
 
     let msg = rpc(
         &d.dir,
@@ -408,7 +443,9 @@ fn multiple_requests_on_one_connection() {
     // back-to-back on a single connection must each get their matching response.
     let d = Daemon::start("multiplex");
     let mut stream = UnixStream::connect(d.dir.join("ruckus.sock")).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Send three snapshots at once (all in one write, no delays).
     let mut out = String::new();

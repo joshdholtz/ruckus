@@ -65,7 +65,14 @@ pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
         }
     });
 
-    Ok((Client { tx: out_tx, pending, seq: AtomicU64::new(1) }, ev_rx))
+    Ok((
+        Client {
+            tx: out_tx,
+            pending,
+            seq: AtomicU64::new(1),
+        },
+        ev_rx,
+    ))
 }
 
 impl Client {
@@ -151,7 +158,11 @@ pub fn resolve_pane(snapshot: &Snapshot, target: &str) -> Result<PaneInfo> {
             .filter(|t| t.name.contains(target))
             .map(|t| t.active_pane)
             .collect();
-        matches = snapshot.panes.iter().filter(|p| ids.contains(&p.id)).collect();
+        matches = snapshot
+            .panes
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .collect();
     }
     // Last resort: a space name → its active tab's active pane.
     if matches.is_empty() {
@@ -159,10 +170,19 @@ pub fn resolve_pane(snapshot: &Snapshot, target: &str) -> Result<PaneInfo> {
             .spaces
             .iter()
             .filter(|s| s.name == target || s.name.contains(target))
-            .filter_map(|s| s.tabs.iter().find(|t| t.id == s.active_tab).or(s.tabs.first()))
+            .filter_map(|s| {
+                s.tabs
+                    .iter()
+                    .find(|t| t.id == s.active_tab)
+                    .or(s.tabs.first())
+            })
             .map(|t| t.active_pane)
             .collect();
-        matches = snapshot.panes.iter().filter(|p| ids.contains(&p.id)).collect();
+        matches = snapshot
+            .panes
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .collect();
     }
     match matches.len() {
         0 => bail!("no pane, tab, or title matching '{target}'"),
