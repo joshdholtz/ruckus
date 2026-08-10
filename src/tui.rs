@@ -3651,6 +3651,8 @@ impl App {
         let mut rows: Vec<(u16, Target)> = Vec::new();
         let mut buttons: Vec<(u16, std::ops::Range<u16>, SidebarBtn)> = Vec::new();
         let mut y = inner.y;
+        // Line index of the active space, for scroll-follow when the list overflows.
+        let mut focus_idx: Option<usize> = None;
 
         macro_rules! push {
             ($line:expr, $target:expr) => {{
@@ -3889,6 +3891,12 @@ impl App {
                             let pad = w.saturating_sub(spans_width(&spans));
                             spans.push(Span::styled(" ".repeat(pad), row_style));
                         }
+                        // Remember the active space's line so an overflowing list
+                        // scrolls to keep it (and thus remote spaces you jump to)
+                        // in view instead of truncating it off the bottom.
+                        if s_active {
+                            focus_idx = Some(lines.len());
+                        }
                         push!(Line::from(spans), Some(Target::Space(s.id)));
 
                         if !space_sub.is_empty() {
@@ -3985,7 +3993,25 @@ impl App {
             }
         }
 
-        lines.truncate(inner.height as usize);
+        // Scroll the region so the active space stays visible instead of being
+        // truncated off the bottom (matters once you have more spaces — local or
+        // remote — than fit). No overflow → no scroll → unchanged behaviour.
+        let h = inner.height as usize;
+        if lines.len() > h {
+            let off = focus_idx
+                .map(|fi| fi.saturating_sub(h - 1))
+                .unwrap_or(0)
+                .min(lines.len() - h);
+            if off > 0 {
+                let off_u = off as u16;
+                lines.drain(0..off);
+                rows.retain(|(ry, _)| *ry >= inner.y + off_u);
+                rows.iter_mut().for_each(|(ry, _)| *ry -= off_u);
+                buttons.retain(|(by, _, _)| *by >= inner.y + off_u);
+                buttons.iter_mut().for_each(|(by, _, _)| *by -= off_u);
+            }
+        }
+        lines.truncate(h);
         if append {
             self.sidebar_rows.extend(rows);
             self.sidebar_buttons.extend(buttons);
