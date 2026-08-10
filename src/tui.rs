@@ -5203,9 +5203,14 @@ impl App {
                     &format!("{} [{w}]", c.cmd.join(" ")),
                 ));
             }
+            let click = match self.cfg.ui.link_click {
+                LinkClick::Ctrl => "⌃click",
+                LinkClick::Shift => "⇧click",
+                LinkClick::Plain => "click",
+            };
             for l in &self.cfg.links {
                 lines.push(key_line(
-                    "⌃click",
+                    click,
                     &format!("{}  →  {}", l.pattern.as_str(), l.run),
                 ));
             }

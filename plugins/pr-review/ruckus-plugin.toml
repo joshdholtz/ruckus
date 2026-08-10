@@ -1,10 +1,10 @@
 [plugin]
 name = "pr-review"
 version = "0.1.0"
-description = "ctrl-click a GitHub PR link → open a reviewer in a right split"
+description = "click a GitHub PR link → open a reviewer in a right split"
 capabilities = ["run-commands", "open-links"]
 
-# ctrl-click a PR URL to review it in a split. Swap `run` to your reviewer of
+# click a PR URL to review it in a split. Swap `run` to your reviewer of
 # choice — e.g. `tuicr ${url}`. `gh pr view` works out of the box with gh.
 [[link]]
 pattern = 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+'

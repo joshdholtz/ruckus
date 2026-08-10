@@ -18,6 +18,6 @@ ruckus plugin install joshdholtz/ruckus/plugins/pr-review
 
 | plugin | needs | does |
 |---|---|---|
-| pr-review | gh (or your reviewer) | ctrl-click a PR URL → review it in a split |
+| pr-review | gh (or your reviewer) | click a PR URL → review it in a split |
 | gh-dash | `gh extension install dlvhdr/gh-dash` | `alt-g` → gh-dash in a split |
 | scratch | — | ``alt-` `` → throwaway shell popup |

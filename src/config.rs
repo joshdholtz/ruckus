@@ -525,7 +525,7 @@ impl Default for UiConfig {
             deck: true,
             mouse_select: true,
             mac_option_fallback: true,
-            link_click: LinkClick::Ctrl,
+            link_click: LinkClick::Plain,
             space_row: "{icon} {name}".to_string(),
             tab_row: "{icon} {title}".to_string(),
             queue_row: "{icon} {title}".to_string(),
@@ -1253,9 +1253,9 @@ impl Config {
                 .map(|s| s.to_lowercase())
                 .as_deref()
             {
+                Some("ctrl") => LinkClick::Ctrl,
                 Some("shift") => LinkClick::Shift,
-                Some("plain") | Some("click") => LinkClick::Plain,
-                _ => LinkClick::Ctrl,
+                _ => LinkClick::Plain,
             },
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
             tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
@@ -1407,20 +1407,20 @@ palette = "alt-p"         # command palette: fuzzy-search every action
 # Link handlers: text matching `pattern` (Rust regex) becomes clickable and
 # runs `run` — ${url}/${match} are replaced with the matched text as ONE
 # argument (never shell-interpreted). Defaults to opening URLs if none set.
-# link_click below picks the trigger: ctrl | shift | plain.
+# link_click below picks the trigger: plain (default) | ctrl | shift.
 # Optional `where` opens the tool in a ruckus pane (right|down|tab|popup)
 # instead of running it detached — great for opening a reviewer on a PR link.
 # [[link]]
 # pattern = 'https?://\S+'
 # run = "open ${url}"          # no `where` = run detached
 #
-# [[link]]                       # ctrl-click a PR URL → review it in a split
+# [[link]]                       # click a PR URL → review it in a split
 # pattern = 'https://github.com/[^/]+/[^/]+/pull/[0-9]+'
 # run = "gh pr view ${url}"
 # where = "right"
 
 [ui]
-link_click = "ctrl"          # ctrl | shift | plain — how a click fires a link
+link_click = "plain"         # plain | ctrl | shift — how a click fires a link
 sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
 sidebar_sections = ["needs_you", "spaces"]  # order them, or drop one
@@ -1600,18 +1600,18 @@ run = "nope"
 
     #[test]
     fn link_rules_default_and_custom() {
-        // No [[link]] → a built-in URL opener, ctrl trigger by default.
+        // No [[link]] → a built-in URL opener; plain-click by default.
         let cfg = Config::from_toml_str("");
         assert_eq!(cfg.links.len(), 1);
         assert!(cfg.links[0]
             .pattern
             .is_match("see https://example.com/x now"));
-        assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
-        // Custom rules replace the default; link_click is configurable.
+        assert_eq!(cfg.ui.link_click, LinkClick::Plain);
+        // Custom rules replace the default; link_click is overridable.
         let cfg = Config::from_toml_str(
             r#"
 [ui]
-link_click = "plain"
+link_click = "ctrl"
 [[link]]
 pattern = '[A-Z]{2,}-[0-9]+'
 run = "open https://linear.app/issue/${match}"
@@ -1620,7 +1620,7 @@ run = "open https://linear.app/issue/${match}"
         assert_eq!(cfg.links.len(), 1);
         let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
         assert_eq!(m.as_str(), "FIS-42");
-        assert_eq!(cfg.ui.link_click, LinkClick::Plain);
+        assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
     }
 
     #[test]
