@@ -649,3 +649,87 @@ fn daemon_mirrors_remote_read_write_disconnect() {
     // B is unaffected.
     assert!(space_by_name(&snapshot(&b.dir), "remoteland").is_some());
 }
+
+/// Write an executable ssh-shim that ignores its args and proxies `dir`'s daemon.
+fn write_ssh_shim(at: &Path, target_dir: &Path) {
+    std::fs::write(
+        at,
+        format!(
+            "#!/bin/sh\nexec env RUCKUS_DIR='{}' '{}' __proxy\n",
+            target_dir.display(),
+            bin()
+        ),
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(at).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(at, perm).unwrap();
+}
+
+/// Regression for the freeze bug: a mirrored remote streaming continuous output
+/// must not starve the local request handler. Pre-fix, remote_event_loop held
+/// the state mutex across save_state (fsync) and relocked per frame, so an
+/// attached streaming remote wedged the daemon — local snapshots hung forever.
+#[test]
+fn remote_stream_does_not_freeze_local() {
+    // B: a remote whose pane streams output as fast as it can.
+    let b = Daemon::start("freeze-remote");
+    let bspace = snapshot(&b.dir)["spaces"][0]["id"].as_u64().unwrap();
+    rpc(
+        &b.dir,
+        json!({"type":"new_tab","space":bspace,"name":"streamer",
+               "cmd":["sh","-c","while true; do printf 'xxxxxxxx'; done"],"cwd":null}),
+    );
+
+    let shim = b.dir.join("ssh-shim.sh");
+    write_ssh_shim(&shim, &b.dir);
+    let a = Daemon::start_in_env(
+        std::env::temp_dir().join(format!("ruckus-test-{}-freeze-local", std::process::id())),
+        &[("RUCKUS_SSH", shim.to_str().unwrap())],
+    );
+    rpc(
+        &a.dir,
+        json!({"type":"connect_remote","host":"bee","args":[],"env":{}}),
+    );
+
+    // The remote pane mirrors in with an origin-encoded id.
+    let snap = wait_for(
+        &a.dir,
+        |s| {
+            s["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"].as_u64().map(|id| id >> 48 != 0).unwrap_or(false))
+        },
+        "remote streaming pane mirrored into A",
+    );
+    let rpane = snap["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|p| p["id"].as_u64().filter(|id| id >> 48 != 0))
+        .unwrap();
+
+    // Attach it so B actually streams Output through the proxy into A's event loop
+    // (that's the hot path that used to wedge the daemon).
+    let att = rpc(
+        &a.dir,
+        json!({"type":"attach","pane":rpane,"rows":24,"cols":80}),
+    );
+    assert_eq!(att["type"], "attached", "{att}");
+
+    // Now hammer local requests while the remote floods output. Each snapshot()
+    // panics if A is frozen (its read times out), and the whole batch must finish
+    // quickly — a starved handler would blow the wall-clock bound.
+    let start = Instant::now();
+    for _ in 0..20 {
+        let s = snapshot(&a.dir);
+        assert!(!s["spaces"].as_array().unwrap().is_empty());
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "local requests starved under remote streaming: {elapsed:?}"
+    );
+}

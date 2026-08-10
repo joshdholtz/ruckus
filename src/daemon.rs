@@ -295,9 +295,20 @@ fn do_upgrade(st: &mut State) -> Result<()> {
 }
 
 /// Written on every tree change so a daemon restart can rebuild the world.
+/// Persists LOCAL state only — mirrored remotes are ephemeral (memory-only), so
+/// they must never leak into state.json (else they'd "restore" as ghost spaces
+/// with no backing panes).
 fn save_state(st: &State) {
+    let mut snapshot = st.snapshot();
+    snapshot
+        .spaces
+        .retain(|s| remote::origin_of(s.id) == remote::LOCAL);
+    snapshot
+        .panes
+        .retain(|p| remote::origin_of(p.id) == remote::LOCAL);
+    snapshot.remote_hosts.clear();
     let p = Persisted {
-        snapshot: st.snapshot(),
+        snapshot,
         next_id: st.next_id,
     };
     if let Ok(json) = serde_json::to_vec(&p) {
@@ -1501,6 +1512,10 @@ fn spawn_remote_connect(state: Arc<Mutex<State>>, origin: Origin, spec: RemoteSp
             if !st.remote_specs.contains_key(&origin) {
                 return;
             }
+            // A concurrent connect already landed this origin — don't double-mirror.
+            if st.remotes.contains_key(&origin) {
+                return;
+            }
             st.remotes.insert(
                 origin,
                 RemoteConn {
@@ -1517,34 +1532,82 @@ fn spawn_remote_connect(state: Arc<Mutex<State>>, origin: Origin, spec: RemoteSp
     });
 }
 
+/// Max remote events coalesced into one lock acquisition (bounds work per batch).
+const REMOTE_BATCH: usize = 256;
+
 /// Pump one remote's event stream: origin-prefix each message, update the cached
-/// snapshot on State, and broadcast to local clients. On stream end drop the live
-/// conn (the reconnect ticker re-dials while its spec is still known).
+/// snapshot on State, and forward to local clients.
+///
+/// Hot-path discipline (this was the freeze bug): a mirrored remote streams
+/// output continuously, so we must NOT (a) hold the state mutex across I/O or
+/// (b) relock per message. So we **batch** a burst into one short lock, coalesce
+/// repeated State updates into a single merged broadcast, snapshot the client
+/// senders, then release the lock BEFORE serializing/sending — and never
+/// `save_state` here (remotes are ephemeral; one fsync per frame wedged it).
+/// On stream end the live conn is dropped (reconnect ticker re-dials from spec).
 async fn remote_event_loop(
     state: Arc<Mutex<State>>,
     origin: Origin,
     mut events: UnboundedReceiver<ServerMsg>,
 ) {
-    while let Some(msg) = events.recv().await {
-        if !state.lock().unwrap().remotes.contains_key(&origin) {
-            return; // disconnected under us
-        }
-        match msg {
-            ServerMsg::State { mut snapshot } => {
-                remote::prefix_snapshot(&mut snapshot, origin);
-                let mut st = state.lock().unwrap();
-                if let Some(rc) = st.remotes.get_mut(&origin) {
-                    rc.snapshot = snapshot;
-                }
-                broadcast_state(&st);
+    while let Some(first) = events.recv().await {
+        // Drain everything already queued so one lock handles the whole burst.
+        let mut batch = vec![first];
+        while batch.len() < REMOTE_BATCH {
+            match events.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
             }
-            mut other => {
-                remote::prefix_servermsg(&mut other, origin);
-                let st = state.lock().unwrap();
-                broadcast(&st, other);
+        }
+
+        let (frames, txs): (Vec<String>, Vec<Tx>) = {
+            let Ok(mut st) = state.lock() else { return };
+            if !st.remotes.contains_key(&origin) {
+                return; // disconnected under us
+            }
+            let mut frames: Vec<String> = Vec::new();
+            let mut state_changed = false;
+            for msg in batch {
+                match msg {
+                    ServerMsg::State { mut snapshot } => {
+                        remote::prefix_snapshot(&mut snapshot, origin);
+                        if let Some(rc) = st.remotes.get_mut(&origin) {
+                            rc.snapshot = snapshot;
+                        }
+                        state_changed = true; // coalesce: one merged State at the end
+                    }
+                    mut other => {
+                        remote::prefix_servermsg(&mut other, origin);
+                        if let Ok(s) = serde_json::to_string(&ServerFrame {
+                            seq: None,
+                            msg: other,
+                        }) {
+                            frames.push(s);
+                        }
+                    }
+                }
+            }
+            if state_changed {
+                if let Ok(s) = serde_json::to_string(&ServerFrame {
+                    seq: None,
+                    msg: ServerMsg::State {
+                        snapshot: st.snapshot(),
+                    },
+                }) {
+                    frames.push(s);
+                }
+            }
+            let txs = st.conns.values().cloned().collect();
+            (frames, txs)
+        }; // lock released before any send
+
+        for f in &frames {
+            for tx in &txs {
+                let _ = tx.send(f.clone());
             }
         }
     }
+
     let mut st = state.lock().unwrap();
     if st.remotes.remove(&origin).is_some() {
         info!("remote origin {origin} link dropped");

@@ -128,6 +128,16 @@ enum Cmd {
     /// Upgrade the running daemon to the current binary WITHOUT killing panes
     /// (re-execs in place; your agents keep running)
     Upgrade,
+    /// Mirror a remote ruckus over SSH into this daemon: `ruckus connect-remote workbox`
+    ConnectRemote {
+        host: String,
+        /// Extra ssh options, e.g. -- -p 2222
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Drop a mirrored remote by host or origin — CLI escape hatch. No target
+    /// disconnects them all: `ruckus disconnect-remote` / `… workbox` / `… 1`
+    DisconnectRemote { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -218,7 +228,78 @@ async fn main() -> Result<()> {
         Some(Cmd::Keymap { name }) => keymap_cmd(name).await,
         Some(Cmd::Reload) => reload().await,
         Some(Cmd::Upgrade) => upgrade().await,
+        Some(Cmd::ConnectRemote { host, args }) => connect_remote_cmd(host, args).await,
+        Some(Cmd::DisconnectRemote { target }) => disconnect_remote_cmd(target).await,
     }
+}
+
+/// The caller's live SSH env, forwarded so the detached daemon authenticates as
+/// the user (agent auth / hardware-key touch are agent-side).
+fn ssh_env() -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    for k in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
+        if let Ok(v) = std::env::var(k) {
+            env.insert(k.to_string(), v);
+        }
+    }
+    env
+}
+
+async fn connect_remote_cmd(host: String, args: Vec<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    client
+        .request(Request::ConnectRemote {
+            host: host.clone(),
+            args,
+            env: ssh_env(),
+        })
+        .await?;
+    println!("connecting {host} — mirroring in the background");
+    Ok(())
+}
+
+async fn disconnect_remote_cmd(target: Option<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    let snap = client.snapshot().await?;
+    // origin -> host, from the daemon's merged snapshot.
+    let hosts = &snap.remote_hosts;
+    if hosts.is_empty() {
+        println!("no remotes connected");
+        return Ok(());
+    }
+    // Resolve which origins to drop: all, an exact origin number, or a host match.
+    let origins: Vec<u16> = match target.as_deref() {
+        None => hosts.keys().copied().collect(),
+        Some(t) => {
+            if let Ok(n) = t.parse::<u16>() {
+                if hosts.contains_key(&n) {
+                    vec![n]
+                } else {
+                    vec![]
+                }
+            } else {
+                hosts
+                    .iter()
+                    .filter(|(_, h)| h.contains(t))
+                    .map(|(o, _)| *o)
+                    .collect()
+            }
+        }
+    };
+    if origins.is_empty() {
+        println!("no remote matching {:?}", target.unwrap_or_default());
+        return Ok(());
+    }
+    for o in origins {
+        let host = hosts.get(&o).cloned().unwrap_or_default();
+        client
+            .request(Request::DisconnectRemote { origin: o })
+            .await?;
+        println!("disconnected {host} (origin {o})");
+    }
+    Ok(())
 }
 
 async fn upgrade() -> Result<()> {
