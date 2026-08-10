@@ -4110,7 +4110,7 @@ impl App {
         // truncated off the bottom (matters once you have more spaces — local or
         // remote — than fit). No overflow → no scroll → unchanged behaviour.
         let h = inner.height as usize;
-        if lines.len() > h {
+        if lines.len() > h && h >= 1 {
             let off = focus_idx
                 .map(|fi| fi.saturating_sub(h - 1))
                 .unwrap_or(0)
@@ -4122,6 +4122,26 @@ impl App {
                 rows.iter_mut().for_each(|(ry, _)| *ry -= off_u);
                 buttons.retain(|(by, _, _)| *by >= inner.y + off_u);
                 buttons.iter_mut().for_each(|(by, _, _)| *by -= off_u);
+            }
+            // Overflow affordance: show how many rows are hidden above/below so a
+            // space (e.g. a freshly-mirrored remote) can't hide silently.
+            let hidden_above = off;
+            let hidden_below = lines.len().saturating_sub(h);
+            let hint = |n: usize, arrow: &str| {
+                Line::from(Span::styled(
+                    format!("  {arrow} {n} more"),
+                    Style::default().fg(th.status_fg).add_modifier(Modifier::DIM),
+                ))
+            };
+            if hidden_above > 0 {
+                if let Some(first) = lines.first_mut() {
+                    *first = hint(hidden_above, "▴");
+                }
+            }
+            if hidden_below > 0 {
+                if let Some(last) = lines.get_mut(h - 1) {
+                    *last = hint(hidden_below, "▾");
+                }
             }
         }
         lines.truncate(h);
