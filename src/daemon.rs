@@ -19,6 +19,84 @@ use crate::remote::{self, Origin};
 
 type Tx = UnboundedSender<String>;
 
+// --- state-lock watchdog -------------------------------------------------
+// Every acquisition of the State mutex goes through `lock_state`, which records
+// where and when it was taken; a background task logs a loud warning if the lock
+// stays held too long. This turns an otherwise-invisible "the daemon wedged"
+// into a precise `src/daemon.rs:NNN held 5123ms` line in daemon.log.
+static LOCK_SINCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOCK_LOC: std::sync::atomic::AtomicPtr<std::panic::Location<'static>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// RAII guard around `MutexGuard<State>` that clears the watchdog on drop.
+struct StateGuard<'a>(std::sync::MutexGuard<'a, State>);
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.0
+    }
+}
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        LOCK_SINCE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Acquire the State lock, recording the call site + acquire time for the
+/// watchdog. Recovers from poisoning rather than propagating a panic.
+#[track_caller]
+fn lock_state(state: &Arc<Mutex<State>>) -> StateGuard<'_> {
+    let loc = std::panic::Location::caller();
+    let g = state.lock().unwrap_or_else(|e| e.into_inner());
+    LOCK_LOC.store(
+        loc as *const _ as *mut _,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LOCK_SINCE_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    StateGuard(g)
+}
+
+/// Background watchdog: warn loudly if the State lock is ever held > threshold.
+fn spawn_lock_watchdog() {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut warned_at = 0u64;
+        loop {
+            tick.tick().await;
+            let since = LOCK_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if since == 0 {
+                warned_at = 0;
+                continue;
+            }
+            let held = now_ms().saturating_sub(since);
+            // Warn once per stuck episode, then again every ~2s while still stuck.
+            if held > 300 && (warned_at == 0 || since != warned_at || held % 2000 < 250) {
+                warned_at = since;
+                let loc = LOCK_LOC.load(std::sync::atomic::Ordering::Relaxed);
+                let where_ = if loc.is_null() {
+                    "?".to_string()
+                } else {
+                    // Safe: the pointer is a &'static Location.
+                    unsafe { format!("{}", *loc) }
+                };
+                error!("⚠ state lock held {held}ms at {where_} — daemon may be wedged");
+            }
+        }
+    });
+}
+
 /// How to reach a remote: ssh host + options + the client's live SSH env. Kept in
 /// `remote_specs` so a dropped connection can be auto-reconnected without a client.
 #[derive(Clone)]
@@ -635,7 +713,10 @@ impl State {
                 .map(|p| {
                     let mut info = p.info.clone();
                     info.preview = pane_preview(&p.screen);
-                    info.git_branch = git_branch(&p.info.cwd);
+                    // NB: git_branch is CACHED on info and refreshed off-lock by the
+                    // process-probe ticker. Never compute it here — snapshot() runs
+                    // under the state lock and on the remote hot path, and a disk
+                    // walk per pane (×38 panes, or a slow/dead cwd) wedges the daemon.
                     info
                 })
                 .collect(),
@@ -744,7 +825,7 @@ pub async fn run() -> Result<()> {
     }));
 
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(&state);
         let hmap: Option<HashMap<u64, HandoffPane>> = handoff
             .as_ref()
             .map(|hf| hf.panes.iter().map(|p| (p.id, p.clone())).collect());
@@ -756,6 +837,9 @@ pub async fn run() -> Result<()> {
     }
     let _ = std::fs::remove_file(handoff_path());
 
+    // Watchdog: log loudly if the State lock is ever held too long (deadlock aid).
+    spawn_lock_watchdog();
+
     // Remote reconnect ticker: re-dial any known remote whose link dropped. The
     // spec (incl. the client's SSH env) is retained, so this works with no client
     // attached — as long as those credentials are still valid.
@@ -766,7 +850,7 @@ pub async fn run() -> Result<()> {
             loop {
                 tick.tick().await;
                 let todo: Vec<(Origin, RemoteSpecEnv)> = {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     let pending: Vec<(Origin, RemoteSpecEnv)> = st
                         .remote_specs
                         .iter()
@@ -794,7 +878,7 @@ pub async fn run() -> Result<()> {
             loop {
                 tick.tick().await;
                 n += 1;
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(&state);
                 let quiet_after = st.quiet_after;
                 let mut changes = Vec::new();
                 for (id, p) in st.panes.iter_mut() {
@@ -846,7 +930,7 @@ pub async fn run() -> Result<()> {
             loop {
                 tick.tick().await;
                 let (targets, detect_fg) = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     let targets: Vec<(u64, i32)> = st
                         .panes
                         .iter()
@@ -860,15 +944,31 @@ pub async fn run() -> Result<()> {
                 }
                 let pids: Vec<i32> = targets.iter().map(|(_, pid)| *pid).collect();
                 let cwds = resolve_cwds(&pids);
+                // Compute each pane's git branch HERE, off the lock — this is disk
+                // I/O and must never run under the state mutex (see snapshot()).
+                let branches: HashMap<i32, String> = cwds
+                    .iter()
+                    .map(|(pid, cwd)| (*pid, git_branch(cwd)))
+                    .collect();
                 let names = if detect_fg {
                     resolve_fg_names(&pids)
                 } else {
                     HashMap::new()
                 };
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(&state);
                 let allow = st.agent_commands.clone();
                 let mut changed = false;
                 for (id, pid) in targets {
+                    // Store the off-lock-computed branch (changes on checkout even
+                    // when cwd doesn't).
+                    if let Some(b) = branches.get(&pid) {
+                        if let Some(p) = st.panes.get_mut(&id) {
+                            if p.info.git_branch != *b {
+                                p.info.git_branch = b.clone();
+                                changed = true;
+                            }
+                        }
+                    }
                     if let Some(cwd) = cwds.get(&pid) {
                         if let Some(p) = st.panes.get_mut(&id) {
                             if &p.info.cwd != cwd {
@@ -932,7 +1032,7 @@ pub async fn run() -> Result<()> {
 async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let (tx, mut rx) = unbounded_channel::<String>();
-    state.lock().unwrap().conns.insert(conn_id, tx.clone());
+    lock_state(&state).conns.insert(conn_id, tx.clone());
 
     let writer_task = tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
@@ -1029,7 +1129,7 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
     }
 
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(&state);
         st.conns.remove(&conn_id);
         for p in st.panes.values_mut() {
             p.subs.remove(&conn_id);
@@ -1090,7 +1190,7 @@ fn drop_pane(st: &mut State, pane: u64) {
 }
 
 fn close_tab(state: &Arc<Mutex<State>>, tab: u64) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let leaves: Vec<u64> = {
         let mut v = Vec::new();
         let found = st.spaces.iter().flat_map(|s| &s.tabs).find(|t| t.id == tab);
@@ -1128,7 +1228,7 @@ fn close_tab(state: &Arc<Mutex<State>>, tab: u64) -> Result<ServerMsg> {
 }
 
 fn close_space(state: &Arc<Mutex<State>>, space: u64) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let leaves: Vec<u64> = {
         let Some(s) = st.spaces.iter().find(|s| s.id == space) else {
             return Ok(err(format!("no space {space}")));
@@ -1154,7 +1254,7 @@ fn close_space(state: &Arc<Mutex<State>>, space: u64) -> Result<ServerMsg> {
 }
 
 fn move_tab(state: &Arc<Mutex<State>>, tab: u64, to: usize) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let mut moved = false;
     for s in st.spaces.iter_mut() {
         if let Some(i) = s.tabs.iter().position(|t| t.id == tab) {
@@ -1173,7 +1273,7 @@ fn move_tab(state: &Arc<Mutex<State>>, tab: u64, to: usize) -> Result<ServerMsg>
 }
 
 fn move_space(state: &Arc<Mutex<State>>, space: u64, to: usize) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let Some(i) = st.spaces.iter().position(|s| s.id == space) else {
         return Ok(err(format!("no space {space}")));
     };
@@ -1193,7 +1293,7 @@ fn err(message: impl Into<String>) -> ServerMsg {
 fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> ServerMsg {
     match req {
         Request::Snapshot => {
-            let st = state.lock().unwrap();
+            let st = lock_state(state);
             ServerMsg::State {
                 snapshot: st.snapshot(),
             }
@@ -1214,7 +1314,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             cwd,
         } => split(state, pane, dir, cmd, cwd).unwrap_or_else(|e| err(format!("{e:#}"))),
         Request::SetLayout { tab, layout } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(t) = st
                 .spaces
                 .iter_mut()
@@ -1241,7 +1341,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::RenameSpace { space, name } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(s) = st.spaces.iter_mut().find(|s| s.id == space) else {
                 return err(format!("no space {space}"));
             };
@@ -1250,7 +1350,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::RenameTab { tab, name } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(t) = st
                 .spaces
                 .iter_mut()
@@ -1264,7 +1364,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::Restart { pane } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(p) = st.panes.get(&pane) else {
                 return err(format!("no pane {pane}"));
             };
@@ -1298,7 +1398,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             move_space(state, space, to).unwrap_or_else(|e| err(format!("{e:#}")))
         }
         Request::SetActive { space, tab, pane } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             if st.spaces.iter().any(|s| s.id == space) {
                 st.active_space = space;
             }
@@ -1317,7 +1417,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::Attach { pane, rows, cols } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(tx) = st.conns.get(&conn_id).cloned() else {
                 return err("connection not registered");
             };
@@ -1333,7 +1433,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Attached { pane, scrollback }
         }
         Request::Detach { pane } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             if let Some(p) = st.panes.get_mut(&pane) {
                 p.subs.remove(&conn_id);
                 // Recompute size from remaining subscribers (if any).
@@ -1342,7 +1442,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::Input { pane, data } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(p) = st.panes.get_mut(&pane) else {
                 return err(format!("no pane {pane}"));
             };
@@ -1355,7 +1455,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             }
         }
         Request::Resize { pane, rows, cols } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(p) = st.panes.get_mut(&pane) else {
                 return err(format!("no pane {pane}"));
             };
@@ -1377,7 +1477,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             pane,
             state: report,
         } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             if !st.panes.contains_key(&pane) {
                 return err(format!("no pane {pane}"));
             }
@@ -1391,7 +1491,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::ReportAgent { pane, name } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let Some(p) = st.panes.get_mut(&pane) else {
                 return err(format!("no pane {pane}"));
             };
@@ -1402,7 +1502,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::Reload => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let cfg = crate::config::Config::load();
             st.notify_waiting =
                 cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
@@ -1416,7 +1516,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::Upgrade => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             info!("upgrading: re-exec keeping {} panes alive", st.panes.len());
             // On success this never returns (the process image is replaced).
             match do_upgrade(&mut st) {
@@ -1430,7 +1530,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 args,
                 env,
             };
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             // Stable origin per host, so a reconnect reuses ids the client knows.
             let origin = match st.remote_origins.get(&host) {
                 Some(o) => *o,
@@ -1452,7 +1552,7 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
             ServerMsg::Done
         }
         Request::DisconnectRemote { origin } => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(state);
             let host = st.remotes.get(&origin).map(|r| r.host.clone());
             st.remotes.remove(&origin); // drop → kill_on_drop kills the ssh
             st.remote_specs.remove(&origin); // forget → no auto-reconnect
@@ -1486,7 +1586,7 @@ fn spawn_remote_connect(state: Arc<Mutex<State>>, origin: Origin, spec: RemoteSp
         ssh_args.extend(spec.args.iter().cloned());
         info!("connect remote {} (origin {origin})", spec.host);
         let done = |state: &Arc<Mutex<State>>| {
-            state.lock().unwrap().connecting.remove(&origin);
+            lock_state(state).connecting.remove(&origin);
         };
         let (client, events, child) =
             match crate::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
@@ -1506,7 +1606,7 @@ fn spawn_remote_connect(state: Arc<Mutex<State>>, origin: Origin, spec: RemoteSp
         };
         remote::prefix_snapshot(&mut snap, origin);
         {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(&state);
             st.connecting.remove(&origin);
             // A concurrent disconnect may have forgotten this origin — respect it.
             if !st.remote_specs.contains_key(&origin) {
@@ -1561,7 +1661,7 @@ async fn remote_event_loop(
         }
 
         let (frames, txs): (Vec<String>, Vec<Tx>) = {
-            let Ok(mut st) = state.lock() else { return };
+            let mut st = lock_state(&state);
             if !st.remotes.contains_key(&origin) {
                 return; // disconnected under us
             }
@@ -1608,7 +1708,7 @@ async fn remote_event_loop(
         }
     }
 
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(&state);
     if st.remotes.remove(&origin).is_some() {
         info!("remote origin {origin} link dropped");
         broadcast_state(&st);
@@ -1970,7 +2070,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 // handles. Fan-out and notifications run after unlock so a slow
                 // client cannot stall every other pane on the single mutex.
                 let (changed, notify_waiting_title, osc_change, sub_txs) = {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     let notify_waiting = st.notify_waiting;
                     let detect_osc = st.detect_osc133;
                     let (changed, notify_title, sub_txs) = {
@@ -2037,7 +2137,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                     let _ = tx.send(out_frame.clone());
                 }
                 if changed.is_some() || osc_change.is_some() {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     if let Some(a) = changed {
                         broadcast(
                             &st,
@@ -2062,7 +2162,7 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 }
             }
             SessionEvent::Exited(code) => {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(&state);
                 let known = if let Some(p) = st.panes.get_mut(&id) {
                     p.info.status = PaneStatus::Exited { code };
                     p.info.activity = Activity::Done;
@@ -2100,7 +2200,7 @@ fn new_space(
     name: Option<String>,
     cwd: Option<String>,
 ) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let pane = spawn_pane(state, &mut st, Vec::new(), cwd)?;
     let tab_id = st.next();
     let space_id = st.next();
@@ -2140,7 +2240,7 @@ fn new_tab(
     cmd: Vec<String>,
     cwd: Option<String>,
 ) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     if !st.spaces.iter().any(|s| s.id == space) {
         return Ok(err(format!("no space {space}")));
     }
@@ -2178,7 +2278,7 @@ fn split(
     cmd: Vec<String>,
     cwd: Option<String>,
 ) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     let Some((space_id, tab_id)) = locate(&st, target) else {
         return Ok(err(format!("pane {target} not in any tab")));
     };
@@ -2205,7 +2305,7 @@ fn split(
 }
 
 fn close_pane(state: &Arc<Mutex<State>>, pane: u64) -> Result<ServerMsg> {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     if let Some(mut p) = st.panes.remove(&pane) {
         kill_pane_session(&mut p);
     }

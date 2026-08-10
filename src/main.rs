@@ -136,8 +136,14 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Drop a mirrored remote by host or origin — CLI escape hatch. No target
-    /// disconnects them all: `ruckus disconnect-remote` / `… workbox` / `… 1`
-    DisconnectRemote { target: Option<String> },
+    /// disconnects them all: `ruckus disconnect-remote` / `… workbox` / `… 1`.
+    /// `--force` kills the ssh proxy processes directly WITHOUT contacting the
+    /// daemon — the recovery path when a bad remote has wedged it.
+    DisconnectRemote {
+        target: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,7 +235,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Reload) => reload().await,
         Some(Cmd::Upgrade) => upgrade().await,
         Some(Cmd::ConnectRemote { host, args }) => connect_remote_cmd(host, args).await,
-        Some(Cmd::DisconnectRemote { target }) => disconnect_remote_cmd(target).await,
+        Some(Cmd::DisconnectRemote { target, force }) => disconnect_remote_cmd(target, force).await,
     }
 }
 
@@ -259,7 +265,25 @@ async fn connect_remote_cmd(host: String, args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn disconnect_remote_cmd(target: Option<String>) -> Result<()> {
+async fn disconnect_remote_cmd(target: Option<String>, force: bool) -> Result<()> {
+    if force {
+        // Lock-free recovery: kill the local `ssh … ruckus __proxy` processes
+        // directly, without touching the (possibly wedged) daemon. This drops
+        // every mirror and stops the remote data flooding in; if the daemon is
+        // still stuck afterward, `ruckus upgrade` re-execs it (panes survive).
+        match std::process::Command::new("pkill")
+            .arg("-f")
+            .arg("ruckus __proxy")
+            .status()
+        {
+            Ok(s) if s.success() => {
+                println!("killed remote proxy connections — run `ruckus upgrade` if the daemon is still wedged")
+            }
+            Ok(_) => println!("no remote proxy connections found"),
+            Err(e) => println!("could not run pkill: {e}"),
+        }
+        return Ok(());
+    }
     ensure_daemon().await?;
     let (client, _events) = connect().await?;
     let snap = client.snapshot().await?;
