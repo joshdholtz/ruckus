@@ -699,9 +699,12 @@ struct App {
     sidebar_scrollbars: Vec<(String, Rect, usize)>,
     /// Region whose scrollbar thumb is currently being dragged.
     sidebar_dragbar: Option<String>,
-    /// Last active space id — when it changes, sidebar scroll is reset so the
-    /// newly-active space is auto-revealed (then manual scroll takes over again).
+    /// Last active space id — used to detect a space switch.
     last_active_space: u64,
+    /// Set for one frame after the active space changes: reveal the newly-active
+    /// row *only if it's off-screen* (minimal nudge), without disturbing scroll
+    /// when the clicked row was already visible.
+    sidebar_follow_once: bool,
     /// A floating command popup (display-popup style), if one is open.
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
@@ -3803,14 +3806,16 @@ impl App {
         self.sidebar_rows.clear();
         self.sidebar_buttons.clear();
         self.sidebar_scrollbars.clear();
-        // Switching spaces resets manual scroll so the new active space is
-        // auto-revealed; after that, wheel/drag offsets are honored again.
+        // On a space switch, reveal the newly-active row for one frame — but only
+        // nudge if it's off-screen (see draw_sidebar_region), so clicking a
+        // visible row doesn't jerk the scroll.
         if self.snap.active_space != self.last_active_space {
             self.last_active_space = self.snap.active_space;
-            self.sidebar_scroll.clear();
+            self.sidebar_follow_once = true;
         }
         if split <= 0.0 || sections.len() < 2 || area.height < 8 {
             self.draw_sidebar_region(f, area, &sections, true);
+            self.sidebar_follow_once = false;
             return;
         }
         let (top, pinned) = sections.split_at(sections.len() - 1);
@@ -3828,6 +3833,7 @@ impl App {
             Rect::new(area.x, div_row, area.width, 1),
         );
         self.draw_sidebar_region(f, bot_rect, pinned, true);
+        self.sidebar_follow_once = false;
     }
 
     fn draw_sidebar_region(
@@ -4224,17 +4230,21 @@ impl App {
         let mut scrollbar: Option<(usize, usize, usize, usize)> = None; // off, body_total, max_off, fixed_top
         if body_total > body_h && body_h >= 1 {
             let max_off = body_total - body_h;
-            // Honor the manual (wheel/drag) offset. Only auto-follow the active row
-            // when there's no manual offset yet — it's cleared on active-space
-            // change (see draw_sidebar) — so following never fights your scroll.
-            let off = match self.sidebar_scroll.get(&key).copied() {
-                Some(o) => o.min(max_off),
-                None => focus_idx
-                    .filter(|fi| *fi >= fixed_top)
-                    .map(|fi| (fi - fixed_top).saturating_sub(body_h - 1))
-                    .unwrap_or(0)
-                    .min(max_off),
-            };
+            // Honor the manual (wheel/drag) offset; default to top.
+            let mut off = self.sidebar_scroll.get(&key).copied().unwrap_or(0).min(max_off);
+            // Just after a space switch, reveal the active row — but only if it's
+            // off-screen, and by the minimum needed (so a click on a visible row
+            // leaves the scroll exactly where it was).
+            if self.sidebar_follow_once {
+                if let Some(fib) = focus_idx.filter(|fi| *fi >= fixed_top).map(|fi| fi - fixed_top) {
+                    if fib < off {
+                        off = fib;
+                    } else if fib >= off + body_h {
+                        off = fib + 1 - body_h;
+                    }
+                }
+            }
+            off = off.min(max_off);
             self.sidebar_scroll.insert(key.clone(), off);
             if off > 0 {
                 let off_u = off as u16;
@@ -6104,6 +6114,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         sidebar_scrollbars: Vec::new(),
         sidebar_dragbar: None,
         last_active_space: 0,
+        sidebar_follow_once: false,
         tab_hits: Vec::new(),
         tab_close_hits: Vec::new(),
         tab_drag: None,
