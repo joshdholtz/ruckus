@@ -4202,7 +4202,7 @@ impl App {
         let h = inner.height as usize;
         let key = sections.first().cloned().unwrap_or_default();
         let total = lines.len();
-        let mut scrollbar: Option<(usize, usize)> = None; // (offset, total)
+        let mut scrollbar: Option<(usize, usize, usize)> = None; // (offset, total, max_off)
         if total > h && h >= 1 {
             let max_off = total - h;
             let mut off = self.sidebar_scroll.get(&key).copied().unwrap_or(0).min(max_off);
@@ -4229,7 +4229,7 @@ impl App {
             let bar_x = inner.x + inner.width.saturating_sub(2);
             self.sidebar_scrollbars
                 .push((key.clone(), Rect::new(bar_x, inner.y, 1, inner.height), max_off));
-            scrollbar = Some((off, total));
+            scrollbar = Some((off, total, max_off));
         }
         lines.truncate(h);
         if append {
@@ -4245,17 +4245,27 @@ impl App {
         );
         // ratatui's built-in Scrollbar for the visual; mouse wheel/drag is wired
         // separately (the widget itself isn't interactive).
-        if let Some((off, total)) = scrollbar {
+        if let Some((off, total, max_off)) = scrollbar {
+            // ratatui maps position over content_length-1 (thumb hits bottom when
+            // the last line is at the *top* of the viewport). Our offset only
+            // reaches total-viewport, so scale it across the full range or the
+            // thumb tops out early and looks fixed.
+            let pos = if max_off > 0 {
+                off * (total - 1) / max_off
+            } else {
+                0
+            };
             let mut state = ScrollbarState::new(total)
                 .viewport_content_length(h)
-                .position(off);
-            // No track line (it broke the sidebar↔pane contrast edge) — just a
-            // thumb. Render one column in from the edge (inner.width-2).
+                .position(pos);
+            // Bar lives in the gutter (inner.width-2) with a gap before the pane,
+            // so a subtle track is safe now and shows the full scroll range.
             let bar_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
-                .track_symbol(None)
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(th.idle))
                 .thumb_symbol("▐")
                 .thumb_style(Style::default().fg(th.accent));
             f.render_stateful_widget(bar, bar_area, &mut state);
