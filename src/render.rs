@@ -157,6 +157,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn osc8_hyperlink_stamped_on_cells() {
+        // Our vendored vt100 patch: OSC 8 marks cells with the real URL, so a
+        // click resolves the link even when the visible label isn't a URL.
+        let mut p = vt100::Parser::new(2, 40, 0);
+        p.process(b"\x1b]8;;https://ex.com/x\x07click\x1b]8;;\x07 more");
+        let s = p.screen();
+        assert_eq!(s.cell(0, 0).unwrap().hyperlink(), Some("https://ex.com/x")); // 'c'
+        assert_eq!(s.cell(0, 4).unwrap().hyperlink(), Some("https://ex.com/x")); // 'k'
+        assert!(s.cell(0, 5).unwrap().hyperlink().is_none()); // after the close
+    }
+
+    #[test]
     fn wheel_encodes_sgr_1based() {
         // wheel-up at content cell (0,0) → button 64 at col 1, row 1, press (M)
         assert_eq!(

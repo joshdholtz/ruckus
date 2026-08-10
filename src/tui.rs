@@ -1425,6 +1425,12 @@ impl App {
         col: u16,
     ) -> Option<(String, Vec<String>, Option<Placement>)> {
         let screen = self.views.get(&pane)?.parser.screen();
+        // OSC 8 hyperlink stamped on the cell itself: the real URL, even when the
+        // visible label isn't one (e.g. claude's links). Opens via the default.
+        if let Some(url) = screen.cell(row, col).and_then(|c| c.hyperlink()) {
+            let url = url.to_string();
+            return Some((url.clone(), vec!["open".to_string(), url], None));
+        }
         let contents = screen.contents();
         let line = contents.lines().nth(row as usize)?;
         for rule in &self.cfg.links {
