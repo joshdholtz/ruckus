@@ -3143,6 +3143,12 @@ impl App {
     async fn reload_config(&mut self) {
         let was_mouse = self.cfg.ui.mouse;
         self.cfg = Config::load();
+        // Pick up any newly-declared plugins (cheap when all are already present).
+        if !self.cfg.plugins.is_empty()
+            && !crate::config::ensure_declared(&self.cfg.plugins).is_empty()
+        {
+            self.cfg = Config::load();
+        }
         if self.cfg.ui.mouse != was_mouse {
             let mut out = std::io::stdout();
             if self.cfg.ui.mouse {
@@ -5164,8 +5170,48 @@ impl App {
             ("mouse".into(), "click to focus · right-click for menu"),
             ("".into(), "drag pane gutters to resize · wheel scrolls"),
         ];
-        let w: u16 = 56;
-        let h = entries.len() as u16 + 4;
+        let key_line = |k: &str, d: &str| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {k:>12}  "),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(d.to_string(), Style::default().fg(th.bar_active_fg)),
+            ])
+        };
+        let mut lines: Vec<Line> = std::iter::once(Line::raw(""))
+            .chain(entries.iter().map(|(k, d)| key_line(k, d)))
+            .collect();
+        // Discoverability: surface plugin/custom command shortcuts + link rules.
+        if !self.cfg.commands.is_empty() || self.cfg.links.len() > 1 {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  PLUGINS & CUSTOM",
+                Style::default()
+                    .fg(th.status_fg)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for c in &self.cfg.commands {
+                let w = match c.placement {
+                    Placement::SplitRight => "split →",
+                    Placement::SplitDown => "split ↓",
+                    Placement::Tab => "new tab",
+                    Placement::Popup => "popup",
+                };
+                lines.push(key_line(
+                    &c.binding.compact(),
+                    &format!("{} [{w}]", c.cmd.join(" ")),
+                ));
+            }
+            for l in &self.cfg.links {
+                lines.push(key_line(
+                    "⌃click",
+                    &format!("{}  →  {}", l.pattern.as_str(), l.run),
+                ));
+            }
+        }
+        let w: u16 = 60;
+        let h = lines.len() as u16 + 3;
         let x = self.size.0.saturating_sub(w) / 2;
         let y = self.size.1.saturating_sub(h) / 2;
         let r = Rect::new(x, y, w.min(self.size.0), h.min(self.size.1));
@@ -5180,17 +5226,6 @@ impl App {
             )));
         let inner = block.inner(r);
         f.render_widget(block, r);
-        let lines: Vec<Line> = std::iter::once(Line::raw(""))
-            .chain(entries.iter().map(|(k, d)| {
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {k:>12}  "),
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(d.to_string(), Style::default().fg(th.bar_active_fg)),
-                ])
-            }))
-            .collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -5435,7 +5470,12 @@ impl App {
 
 pub async fn run(initial: Option<String>) -> Result<()> {
     ensure_daemon().await?;
-    let cfg = Config::load();
+    let mut cfg = Config::load();
+    // Install any config-declared plugins that aren't present yet (fresh machine),
+    // then reload so their binds/links merge in. Cheap when nothing's missing.
+    if !cfg.plugins.is_empty() && !crate::config::ensure_declared(&cfg.plugins).is_empty() {
+        cfg = Config::load();
+    }
     let (client, mut events) = connect().await?;
     let snap = client.snapshot().await?;
 

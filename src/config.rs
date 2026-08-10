@@ -612,6 +612,9 @@ pub struct Config {
     pub commands: Vec<CommandBind>,
     /// Link handlers: pattern → command. Defaults to opening URLs.
     pub links: Vec<LinkRule>,
+    /// Declared plugin refs (`owner/repo[/subpath]`) — installed on startup so a
+    /// copied config.toml reproduces your setup on a new machine.
+    pub plugins: Vec<String>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -881,6 +884,101 @@ pub fn list_plugins() -> Vec<PluginInfo> {
     out
 }
 
+/// Parse a plugin reference into (clone url, owner/repo cache key, subpath).
+/// Accepts `owner/repo`, `owner/repo/sub/dir`, or a full git URL (no subpath).
+pub fn parse_plugin_ref(repo: &str) -> Result<(String, String, String)> {
+    if repo.starts_with("http") || repo.contains("://") || repo.starts_with("git@") {
+        let tail: Vec<&str> = repo.trim_end_matches(".git").rsplit('/').take(2).collect();
+        let key = tail.into_iter().rev().collect::<Vec<_>>().join("/");
+        return Ok((repo.to_string(), key, String::new()));
+    }
+    let parts: Vec<&str> = repo.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        return Err(anyhow!("expected owner/repo or owner/repo/subpath"));
+    }
+    let owner_repo = format!("{}/{}", parts[0], parts[1]);
+    Ok((
+        format!("https://github.com/{owner_repo}"),
+        owner_repo,
+        parts[2..].join("/"),
+    ))
+}
+
+/// Install a plugin ref (idempotent). Clones the repo once into a shared cache
+/// (only if missing — `ruckus plugin update` pulls), then symlinks the target
+/// into the plugins dir. A subpath that is a *folder of plugins* installs each.
+/// Returns each `(handle, freshly_installed)`.
+pub fn install_plugin(repo: &str) -> Result<Vec<(String, bool)>> {
+    let dir = plugins_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let (url, owner_repo, subpath) = parse_plugin_ref(repo)?;
+    let cache = dir.join(".cache").join(owner_repo.replace('/', "__"));
+    if !cache.join(".git").exists() {
+        std::fs::create_dir_all(cache.parent().unwrap()).ok();
+        let ok = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", &url])
+            .arg(&cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(anyhow!("git clone failed for {url}"));
+        }
+    }
+    let root = if subpath.is_empty() {
+        cache.clone()
+    } else {
+        cache.join(&subpath)
+    };
+    // A single plugin, or a directory of them.
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+    if root.join("ruckus-plugin.toml").exists() {
+        sources.push(root.clone());
+    } else if root.is_dir() {
+        for e in std::fs::read_dir(&root)?.flatten() {
+            if e.path().join("ruckus-plugin.toml").exists() {
+                sources.push(e.path());
+            }
+        }
+    }
+    if sources.is_empty() {
+        return Err(anyhow!(
+            "{}: no ruckus-plugin.toml (or plugin subdirs)",
+            root.display()
+        ));
+    }
+    sources.sort();
+    let mut out = Vec::new();
+    for s in sources {
+        let name = s
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("plugin")
+            .to_string();
+        let dst = dir.join(&name);
+        if dst.symlink_metadata().is_ok() {
+            out.push((name, false)); // already installed
+            continue;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&s, &dst)?;
+        out.push((name, true));
+    }
+    Ok(out)
+}
+
+/// Ensure every config-declared plugin ref is installed (best-effort — offline
+/// or bad refs are skipped). Returns the handles freshly installed this call.
+pub fn ensure_declared(refs: &[String]) -> Vec<String> {
+    let mut fresh = Vec::new();
+    for r in refs {
+        if let Ok(installed) = install_plugin(r) {
+            fresh.extend(installed.into_iter().filter(|(_, f)| *f).map(|(n, _)| n));
+        }
+    }
+    fresh
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     /// Base keymap preset: "tmux" | "alt" | "both".
@@ -893,6 +991,9 @@ struct RawConfig {
     /// Link handlers: pattern → command.
     #[serde(default)]
     link: Vec<RawLink>,
+    /// Declared plugin refs installed on startup.
+    #[serde(default)]
+    plugins: Vec<String>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -1188,6 +1289,7 @@ impl Config {
             prefix_keys,
             commands,
             links,
+            plugins: raw.plugins,
             theme,
             ui,
             glyphs,
@@ -1256,6 +1358,14 @@ const DEFAULT_CONFIG: &str = r##"# ruckus config — make it feel like yours.
 # "alt" = one-step alt+key; "both" = both at once. Switch with `ruckus keymap
 # <name>`. The [keys] / [prefix_keys] overrides below still win over the preset.
 keymap = "tmux"
+
+# Plugins to install on startup (owner/repo, or owner/repo/subfolder for a
+# monorepo). Copy this config to another machine and they're fetched for you.
+# Run `ruckus plugin sync` to install them now.
+# plugins = [
+#   "joshdholtz/ruckus/plugins/gh-dash",
+#   "joshdholtz/ruckus/plugins/pr-review",
+# ]
 
 [keys]
 quit = ["alt-q", "ctrl-q"]  # leave the TUI (everything keeps running in the daemon)

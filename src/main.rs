@@ -148,6 +148,8 @@ enum PluginCmd {
     Link { path: String },
     /// Install a plugin from a GitHub repo: `ruckus plugin install owner/repo`
     Install { repo: String },
+    /// Install every plugin declared in config.toml (for a fresh machine)
+    Sync,
     /// Update installed plugins (git pull); NAME updates just one
     Update { name: Option<String> },
     /// Remove an installed plugin by name
@@ -447,26 +449,6 @@ async fn restart(target: String) -> Result<()> {
     Ok(())
 }
 
-/// Parse a plugin reference into (clone url, owner/repo cache key, subpath).
-/// Accepts `owner/repo`, `owner/repo/sub/dir`, or a full git URL (no subpath).
-fn parse_plugin_ref(repo: &str) -> Result<(String, String, String)> {
-    if repo.starts_with("http") || repo.contains("://") || repo.starts_with("git@") {
-        let tail: Vec<&str> = repo.trim_end_matches(".git").rsplit('/').take(2).collect();
-        let key = tail.into_iter().rev().collect::<Vec<_>>().join("/");
-        return Ok((repo.to_string(), key, String::new()));
-    }
-    let parts: Vec<&str> = repo.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 {
-        anyhow::bail!("expected owner/repo or owner/repo/subpath");
-    }
-    let owner_repo = format!("{}/{}", parts[0], parts[1]);
-    Ok((
-        format!("https://github.com/{owner_repo}"),
-        owner_repo,
-        parts[2..].join("/"),
-    ))
-}
-
 /// Walk up from `start` (following symlinks) to the enclosing git repo, if any.
 fn git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut p = start.canonicalize().ok()?;
@@ -553,50 +535,36 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             println!("run `ruckus reload` to pick it up");
         }
         PluginCmd::Install { repo } => {
-            // Accept `owner/repo`, `owner/repo/sub/dir` (monorepo subfolder), or a
-            // full git URL (optionally with a subfolder after the repo name).
-            let (url, owner_repo, subpath) = parse_plugin_ref(&repo)?;
-            // Clone the repo once into a shared cache; multiple plugins from the
-            // same monorepo reuse it (and `update` pulls it once).
-            let cache = dir.join(".cache").join(owner_repo.replace('/', "__"));
-            if cache.join(".git").exists() {
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&cache)
-                    .args(["pull", "--ff-only"])
-                    .status()?;
-            } else {
-                std::fs::create_dir_all(cache.parent().unwrap()).ok();
-                let ok = std::process::Command::new("git")
-                    .args(["clone", "--depth", "1", &url])
-                    .arg(&cache)
-                    .status()?
-                    .success();
-                if !ok {
-                    anyhow::bail!("git clone failed");
+            // owner/repo, owner/repo/sub/dir (single plugin OR a folder of them),
+            // or a full git URL.
+            let mut any_fresh = false;
+            for (name, fresh) in config::install_plugin(&repo)? {
+                if fresh {
+                    println!("installed {name}");
+                    any_fresh = true;
+                } else {
+                    println!("· {name} already installed");
                 }
             }
-            let src = if subpath.is_empty() {
-                cache.clone()
+            if any_fresh {
+                println!("run `ruckus reload` to pick it up");
+            }
+        }
+        PluginCmd::Sync => {
+            let cfg = config::Config::load();
+            if cfg.plugins.is_empty() {
+                println!("no plugins declared in config.toml (add a `plugins = [...]` list)");
             } else {
-                cache.join(&subpath)
-            };
-            if !src.join("ruckus-plugin.toml").exists() {
-                anyhow::bail!("{}: no ruckus-plugin.toml there", src.display());
+                let fresh = config::ensure_declared(&cfg.plugins);
+                for n in &fresh {
+                    println!("installed {n}");
+                }
+                println!(
+                    "{} declared, {} newly installed — `ruckus reload` to apply",
+                    cfg.plugins.len(),
+                    fresh.len()
+                );
             }
-            let name = src
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("plugin")
-                .to_string();
-            let dst = dir.join(&name);
-            if dst.symlink_metadata().is_ok() {
-                anyhow::bail!("{name} already installed (ruckus plugin remove {name})");
-            }
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&src, &dst)?;
-            println!("installed {name}");
-            println!("run `ruckus reload` to pick it up");
         }
         PluginCmd::Update { name } => {
             use std::collections::HashSet;
@@ -881,7 +849,7 @@ async fn tail(target: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::parse_plugin_ref;
 
     #[test]
     fn plugin_ref_parses_owner_repo_and_subpath() {

@@ -49,13 +49,29 @@ works without ruckus needing to render it.
 ## CLI
 
 ```sh
-ruckus plugin install owner/repo   # git clone from GitHub into the plugins dir
-ruckus plugin link ./my-plugin     # symlink a local dir (dev)
-ruckus plugin list                 # what's installed (handle, binds/links, caps)
-ruckus plugin remove <handle>      # by directory handle or manifest name
-ruckus plugin path                 # print the plugins dir
-ruckus reload                      # apply changes live (no restart)
+ruckus plugin install owner/repo            # from a repo root
+ruckus plugin install owner/repo/plugins/x  # from a subfolder (monorepo)
+ruckus plugin install owner/repo/plugins    # a whole FOLDER of plugins at once
+ruckus plugin link ./plugins                # symlink a local dir (dev; also a folder)
+ruckus plugin list / remove <h> / update    # manage
+ruckus plugin sync                          # install everything declared in config
+ruckus reload                               # apply live (no restart)
 ```
+
+## Portable setup (a new machine)
+
+List your plugins in `config.toml` and they install themselves on startup —
+copy that one file to another machine and you're done:
+
+```toml
+plugins = [
+  "joshdholtz/ruckus/plugins/gh-dash",
+  "joshdholtz/ruckus/plugins/pr-review",
+]
+```
+
+`ruckus` installs any missing ones when it starts (or run `ruckus plugin sync`).
+Cheap when they're all present; only clones what's missing.
 
 ## Status & roadmap
 
