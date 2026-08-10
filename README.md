@@ -6,7 +6,7 @@ Your agents keep running in a background daemon that owns their terminals. Close
 
 ## Status
 
-Early. Core runtime works: daemon, spaces/tabs/panes, live split rendering, activity detection, config (keys + theme), JSON-RPC plugin socket.
+Usable, still pre-1.0. Working: the daemon + spaces/tabs/panes, live split rendering, agent-aware activity detection, a choose-tree command palette, floating popups, click-to-open link handlers, session persistence across restarts, a JSON-RPC socket with a lifecycle **event stream**, and an installable **plugin system**. Wire formats may still shift before 1.0.
 
 ## Install
 
@@ -25,6 +25,7 @@ ruckus status --json    # full state as JSON (for scripts and agents)
 ruckus send 4 "yes"     # type into a pane
 ruckus restart 4        # respawn an exited pane in place
 ruckus tail 4           # stream a pane's output (like tail -f)
+ruckus events           # stream lifecycle events as JSON (agents/plugins)
 ruckus attach 4         # open the TUI focused on pane 4
 ruckus kill 4           # kill + remove a pane
 ```
@@ -49,24 +50,26 @@ Quitting the TUI never kills your sessions — they live in the daemon.
  ● api          │
     ● srv·7     │
 ────────────────┴─────────────────────────────────────────────────
- alt+a next waiting   alt+v split   alt+t tab   alt+b sidebar   …
+ ⌃b a next waiting   ⌃b % split   ⌃b c tab   ⌃b b sidebar   …
 ```
 
 Header: logo, breadcrumb, live attention counts. Sidebar: a **NEEDS YOU** queue (click to jump) plus the full spaces → tabs tree. Everything is clickable; every dot is an activity state aggregated upward.
 
-Look: no box borders — panes are **background layers** separated by dark gutters, each with a filled title bar (`▎` accent marker on the focused one), IDE-style. Working panes animate a braille spinner, waiting panes pulse, unfocused panes dim. Hover highlights rows, tabs, and footer buttons. Right-click a pane for a context menu (split / new tab / close). **Drag the gutters to resize** — layouts persist in the daemon. `alt+/` opens the key reference; errors appear as toasts that fade after a few seconds.
+Look: no box borders — panes are **background layers** separated by dark gutters, each with a filled title bar (`▎` accent marker on the focused one), IDE-style. Working panes animate a braille spinner, waiting panes pulse, unfocused panes dim. Hover highlights rows, tabs, and footer buttons. Right-click a pane for a context menu (split / new tab / close). **Drag the gutters — or the sidebar edge — to resize**; layouts and sidebar width persist. **Click a URL** to open it (a copy shows a brief confirmation popup); `alt+/` opens the key reference and lists your plugin bindings.
+
+**Command palette** (`alt+p`) is a **choose-tree navigator**: fuzzy-jump to any space / tab / pane, fold branches with `←/→`, or type `>` for the flat command list. **Popups** (`⌃q` to close) run a tool — lazygit, k9s, a scratch shell — in a floating window without cluttering the tree.
 
 ### Mobile / SSH
 
 Still fully usable — same daemon, same panes — but **triage-first** on a phone. Over SSH (Termius, Blink, Prompt) taps are clicks, so you never need a modifier key:
 
-- Under ~70 columns the sidebar becomes a `☰` drawer, the focused pane **auto-zooms**, and the footer becomes compact nav (`[next] [zoom] [bar] [···]`)
-- When a pane is **waiting**, an action bar appears: `[y] [n] [enter] [type…] [next]` — approve without hunting for keys
-- When a pane has **exited**: `[restart] [close] [next]` (or enter / esc on a keyboard)
+- The home screen is the **deck**: big state-colored cards, one per tab, attention-sorted. Tap a card to drop into that pane near-fullscreen; `☰` (or the command bar) brings you back.
+- The palette's tree jumps anywhere; a slim command bar shows the real keys for your keymap.
+- Under ~70 columns the sidebar becomes a `☰` drawer and the focused pane **auto-zooms**.
 
 Desktop stays the multi-pane chaos surface. Phone is glance → decide → reply.
 
-On desktop macOS, stock Terminal/iTerm sends Option+key as a special character (`œ`, `ß`, …) — ruckus maps those back automatically, and `ctrl+q` always quits. For alt+i / alt+n (dead keys) enable "Use Option as Meta" (Terminal) or "Esc+" (iTerm).
+On desktop macOS, stock Terminal/iTerm sends Option+key as a special character (`œ`, `ß`, …) — ruckus maps those back automatically. For alt+i / alt+n (dead keys) enable "Use Option as Meta" (Terminal) or "Esc+" (iTerm).
 
 Every dot is an activity state, aggregated upward (pane → tab → space), so a glance at the space bar tells you if anything anywhere needs you.
 
@@ -77,11 +80,11 @@ Every dot is an activity state, aggregated upward (pane → tab → space), so a
 | idle | nothing happening | quiet + shell-prompt tail line |
 | done | process exited | exit code (green ok / red err) |
 
-Detection is heuristic v0 — per-agent adapters and plugin-supplied detectors are on the roadmap.
+Detection is heuristic v0 — external detectors can override it over the socket (`ruckus report-activity`), and per-agent adapters are on the roadmap.
 
 ## Default keys
 
-All rebindable in `~/.ruckus/config.toml` (created on first run).
+The default keymap is **`tmux`** — a `⌃b` prefix (`⌃b c` new tab, `⌃b z` zoom, `⌃b /` search, `⌃b d` detach…) with the one-step **alt** keys below as a fallback. Switch the base scheme with `ruckus keymap alt | tmux | both`. Everything is rebindable in `~/.ruckus/config.toml` (created on first run).
 
 | Key | Action | Key | Action |
 |---|---|---|---|
@@ -91,11 +94,11 @@ All rebindable in `~/.ruckus/config.toml` (created on first run).
 | alt+o / alt+i | next / prev pane | alt+n | new space |
 | alt+pgup / alt+pgdn | scroll history | alt+. / alt+, | next / prev space |
 | alt+a | jump to next pane that needs you | alt+b | toggle sidebar |
-| alt+p | command palette (fuzzy-find any action) | alt+f | search scrollback (n/N cycle) |
-| alt+z | zoom focused pane | alt+/ | key reference overlay |
-| alt+q or ctrl+q | quit TUI (daemon keeps running) | | |
+| alt+p | palette (jump to any space/tab/pane · `>` for commands) | alt+f | search scrollback (n/N cycle) |
+| alt+z | zoom focused pane | alt+d | deck (mobile card view) |
+| alt+/ | key reference + your plugin binds | alt+q / ctrl+q | quit TUI (daemon keeps running) |
 
-Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, panes. Right-click panes for a menu. Drag borders to resize. Wheel scrolls history.
+Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, panes, and **URLs** (open in browser). Right-click panes for a menu. Drag pane gutters or the sidebar edge to resize. Wheel scrolls history — or the app inside the pane, if it wants the mouse.
 
 ## Customization
 
@@ -103,9 +106,12 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 
 | Section | Controls |
 |---|---|
-| `[keys]` | Every action, multiple bindings per action; footer hints re-render from your bindings |
+| `[keys]` / `[prefix_keys]` | Every action, multiple bindings each; the `keymap` preset (alt / tmux / both) |
+| `[[bind]]` | Key → run a command in a split / tab / popup (`where = "right\|down\|tab\|popup"`) |
+| `[[link]]` | Regex on pane text → run a command (`${url}`/`${1}`…); `link_click = plain\|ctrl\|shift` |
+| `plugins` | Plugin refs installed on startup — portable across machines |
 | `[theme]` | All 15 colors — 4 background layers, accent, text tiers, state colors |
-| `[ui]` | Sidebar side (`left`/`right`/`off`) + width + section order; gutter width (0 = dense, 2 = airy); pane padding; pane title bars on/off; header/footer position (`top`/`bottom`/`off`); tab strip on/off; narrow-collapse threshold (`narrow_below = 0` keeps the sidebar on phones); spinner speed; toast position/duration; mouse capture |
+| `[ui]` | Sidebar side/width/section order; gutter + pane padding; title bars; header/footer position; tab strip; narrow-collapse threshold; deck on/off; spinner speed; toast position; mouse |
 | `[glyphs]` | State icons, focus marker, spinner frames |
 | Row templates | `space_row` / `tab_row` / `queue_row` with `{icon} {title} {name} {id} {cmd} {cwd}` tokens |
 
@@ -113,36 +119,61 @@ Or pick a built-in theme: `ruckus theme` lists them (macchiato, latte, gruvbox, 
 
 **Live reload:** `ruckus config set …` applies to a running TUI instantly (theme, glyphs, keys, layout — all of it). Hand-edited the file? `ruckus reload` pushes it to every attached client. Only `spinner_ms` needs a restart.
 
-## Plugins / scripting
+## Plugins
 
-The daemon speaks newline-delimited JSON-RPC over `~/.ruckus/ruckus.sock` — the same protocol the TUI uses, available to any language. See [docs/PROTOCOL.md](docs/PROTOCOL.md). A Raycast script, a Stream Deck button, or a phone client is a socket connection away. Embedded scripting (Lua) is planned.
+A plugin is a folder with a `ruckus-plugin.toml` that adds **command shortcuts** and **link handlers** — no build step, no runtime, any language for the tools it launches.
+
+```toml
+[[bind]]                      # a key → open a command in a split / tab / popup
+key = "alt-g"
+run = "lazygit"
+where = "popup"
+
+[[link]]                      # click matching text → run a command
+pattern = 'https://github.com/[^/]+/[^/]+/pull/[0-9]+'
+run = "gh pr view ${url}"
+where = "right"
+```
+
+```sh
+ruckus plugin install owner/repo             # or owner/repo/subfolder (monorepo)
+ruckus plugin link ./plugins                 # dev: link a whole folder of plugins
+ruckus plugin list / update / remove <name>
+```
+
+**Portable setup** — list them in config and they install on startup, so a copied `config.toml` reproduces your setup on a new machine:
+
+```toml
+plugins = ["joshdholtz/ruckus/plugins/gh-dash", "joshdholtz/ruckus/plugins/pr-review"]
+```
+
+**Scriptable** — the daemon speaks newline-delimited JSON-RPC over `~/.ruckus/ruckus.sock`, the same protocol the TUI uses. `ruckus events` streams lifecycle events (pane opened/closed, activity, focus, exit) as JSON, and every spawned pane gets `RUCKUS_SOCK` / `RUCKUS_DIR` / `RUCKUS_PANE` in its env — so a tool running *inside* a pane can drive ruckus back (jump, spawn, send input, subscribe). See **[docs/PROTOCOL.md](docs/PROTOCOL.md)** and **[docs/PLUGINS.md](docs/PLUGINS.md)**.
+
+Capabilities are declared in the manifest and surfaced by `ruckus plugin list`, but not yet enforced — install ones you trust.
 
 ## Architecture
 
 | Piece | What |
 |---|---|
-| daemon | tokio; owns every PTY via portable-pty; scrollback ring per pane; survives client disconnects |
-| protocol | JSON-RPC over unix socket; requests + pushed events (output, activity, state) |
-| TUI | ratatui; renders vt100 state per visible pane; full mouse support |
-| config | TOML keymap + theme, loaded per client |
+| daemon | tokio; owns every PTY via portable-pty; scrollback ring per pane; survives client disconnects and zero-downtime `ruckus upgrade` |
+| protocol | JSON-RPC over a unix socket; requests + pushed events (output, activity, pane opened/closed, focus, exit, state) |
+| TUI | ratatui; renders vt100 state per visible pane; full mouse support; client-local popups |
+| config | TOML keymap + theme + `[[bind]]`/`[[link]]` + declared plugins, loaded per client |
 
 ## Roadmap
 
-- [x] persistent daemon, spaces / tabs / panes, live splits
+- [x] persistent daemon, spaces / tabs / panes, live splits, session persistence
 - [x] activity detection (working / waiting / idle / done) + aggregated dots
-- [x] rebindable keys (multi-binding), theme, mouse, hover, right-click menus
-- [x] drag-to-resize pane borders (weights persist in the daemon)
-- [x] attention queue (sidebar NEEDS YOU + alt+a jump)
-- [x] spinner/pulse animation, dimmed unfocused panes, toasts, help overlay
-- [x] mobile-SSH mode: tappable footer actions, auto-collapsing sidebar
-- [x] JSON-RPC socket (plugin API v0) + agent CLI (status/send/split/config…)
-- [x] agent-aware activity detection (esc-to-interrupt / input-box cues)
-- [x] pane zoom, restart-in-place, tab/space rename
-- [x] session persistence across daemon restarts (panes respawn under same ids)
-- [x] system notifications when a pane needs you and nobody's attached
-- [x] command palette (alt+p), scrollback search (alt+f)
-- [x] theme presets (`ruckus theme`), state-change motion, graceful reconnect
-- [x] first-run welcome, drag-select copy (OSC 52 — reaches your phone)
-- [ ] layout presets, swipe gestures
-- [ ] Lua scripting
+- [x] rebindable keys (multi-binding + keymap presets), theme presets, mouse, hover, right-click menus
+- [x] drag-to-resize pane gutters **and** the sidebar (weights + width persist)
+- [x] attention queue (sidebar NEEDS YOU + alt+a jump) + system notifications
+- [x] choose-tree command palette (jump spaces/tabs/panes · `>` commands), scrollback search
+- [x] floating command popups (lazygit/k9s/scratch in a window)
+- [x] click-to-open link handlers (regex → command, in a pane or detached)
+- [x] mobile deck (card home) + tree, tappable, auto-collapsing sidebar
+- [x] JSON-RPC socket + lifecycle **event stream** + `RUCKUS_*` context env
+- [x] plugin system: `ruckus plugin install/link/sync`, manifests, config-declared portable setup
+- [x] agent CLI (status/send/split/config/events…), cwd-aware splits, bracketed paste, mouse forwarding
+- [ ] `[[event]]` handlers (run a command on an event) + capability enforcement
+- [ ] plugin-rendered pane UI / native widgets
 - [ ] remote transport (TCP + auth) → native phone / web clients
