@@ -1217,7 +1217,10 @@ impl App {
             .collect();
         for p in stale {
             self.views.remove(&p);
-            let _ = self.route(Request::Detach { pane: p }).await;
+            // Fire-and-forget: we don't use the reply, and awaiting it per stale
+            // pane (each up to the request timeout for a remote pane) could stall
+            // the event loop when leaving a multi-pane remote space.
+            self.client.notify(Request::Detach { pane: p });
         }
 
         for (pane, rect) in rects {
@@ -1247,7 +1250,9 @@ impl App {
                     v.rows = rows;
                     v.cols = cols;
                     v.parser.set_size(rows, cols);
-                    let _ = self.route(Request::Resize { pane, rows, cols }).await;
+                    // Fire-and-forget (reply unused) so resizing with remote panes
+                    // on-screen doesn't stall per pane.
+                    self.client.notify(Request::Resize { pane, rows, cols });
                 }
             }
         }

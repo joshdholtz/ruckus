@@ -183,6 +183,16 @@ impl Client {
         self.request_timeout(req, timeout).await
     }
 
+    /// Fire-and-forget: send a request without awaiting its reply (the reply, if
+    /// any, is dropped by the reader). For ops whose result the caller discards
+    /// — detach, resize — so a slow/remote-routed one never blocks the caller.
+    pub fn notify(&self, req: Request) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Ok(line) = serde_json::to_string(&ClientFrame { seq, req }) {
+            let _ = self.tx.send(line);
+        }
+    }
+
     pub async fn request_timeout(&self, req: Request, timeout: Duration) -> Result<ServerMsg> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
