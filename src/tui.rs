@@ -699,6 +699,9 @@ struct App {
     sidebar_scrollbars: Vec<(String, Rect, usize)>,
     /// Region whose scrollbar thumb is currently being dragged.
     sidebar_dragbar: Option<String>,
+    /// Last active space id — when it changes, sidebar scroll is reset so the
+    /// newly-active space is auto-revealed (then manual scroll takes over again).
+    last_active_space: u64,
     /// A floating command popup (display-popup style), if one is open.
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
@@ -3800,6 +3803,12 @@ impl App {
         self.sidebar_rows.clear();
         self.sidebar_buttons.clear();
         self.sidebar_scrollbars.clear();
+        // Switching spaces resets manual scroll so the new active space is
+        // auto-revealed; after that, wheel/drag offsets are honored again.
+        if self.snap.active_space != self.last_active_space {
+            self.last_active_space = self.snap.active_space;
+            self.sidebar_scroll.clear();
+        }
         if split <= 0.0 || sections.len() < 2 || area.height < 8 {
             self.draw_sidebar_region(f, area, &sections, true);
             return;
@@ -3839,10 +3848,15 @@ impl App {
         // bar never clips row text, never steals row clicks, and keeps a
         // sidebar-bg margin against the pane (preserving the contrast edge).
         let w = (inner.width as usize).saturating_sub(2);
+        let key = sections.first().cloned().unwrap_or_default();
+        let pre_off = self.sidebar_scroll.get(&key).copied().unwrap_or(0);
+        // Map the hovered screen row into build coordinates: rows below the pinned
+        // header are shifted up by the scroll offset, so add it back before
+        // comparing, or the highlight lands on the wrong row.
         let hover_row = self
             .hover
             .filter(|(c, _)| *c >= area.x && *c < area.x + area.width)
-            .map(|(_, r)| r);
+            .map(|(_, r)| r + pre_off as u16);
         let mut lines: Vec<Line> = Vec::new();
         let mut rows: Vec<(u16, Target)> = Vec::new();
         let mut buttons: Vec<(u16, std::ops::Range<u16>, SidebarBtn)> = Vec::new();
@@ -4194,42 +4208,59 @@ impl App {
             }
         }
 
-        // Scroll the region so the active space stays visible instead of being
-        // truncated off the bottom (matters once you have more spaces — local or
-        // remote — than fit). No overflow → no scroll → unchanged behaviour.
-        // Scroll: manual offset (wheel/drag) combined with active-row follow, plus
-        // a real scrollbar (visible thumb, mouse-wheel + draggable) on overflow.
+        // Keep the leading chrome (blank + section header) pinned, and scroll
+        // only the rows beneath it — so "SPACES"/"AGENTS" stays put while the list
+        // moves. `fixed_top` = index of the first clickable row (headers/blanks
+        // carry no Target, so they're never in `rows`).
         let h = inner.height as usize;
-        let key = sections.first().cloned().unwrap_or_default();
+        let fixed_top = rows
+            .first()
+            .map(|(y, _)| y.saturating_sub(inner.y) as usize)
+            .unwrap_or(0)
+            .min(h);
         let total = lines.len();
-        let mut scrollbar: Option<(usize, usize, usize)> = None; // (offset, total, max_off)
-        if total > h && h >= 1 {
-            let max_off = total - h;
-            let mut off = self.sidebar_scroll.get(&key).copied().unwrap_or(0).min(max_off);
-            // keep the active row on screen (jump to it if scrolled away)
-            if let Some(fi) = focus_idx {
-                if fi < off {
-                    off = fi;
-                } else if fi >= off + h {
-                    off = fi + 1 - h;
-                }
-            }
-            off = off.min(max_off);
+        let body_total = total.saturating_sub(fixed_top);
+        let body_h = h.saturating_sub(fixed_top);
+        let mut scrollbar: Option<(usize, usize, usize, usize)> = None; // off, body_total, max_off, fixed_top
+        if body_total > body_h && body_h >= 1 {
+            let max_off = body_total - body_h;
+            // Honor the manual (wheel/drag) offset. Only auto-follow the active row
+            // when there's no manual offset yet — it's cleared on active-space
+            // change (see draw_sidebar) — so following never fights your scroll.
+            let off = match self.sidebar_scroll.get(&key).copied() {
+                Some(o) => o.min(max_off),
+                None => focus_idx
+                    .filter(|fi| *fi >= fixed_top)
+                    .map(|fi| (fi - fixed_top).saturating_sub(body_h - 1))
+                    .unwrap_or(0)
+                    .min(max_off),
+            };
             self.sidebar_scroll.insert(key.clone(), off);
             if off > 0 {
                 let off_u = off as u16;
-                lines.drain(0..off);
-                rows.retain(|(ry, _)| *ry >= inner.y + off_u);
-                rows.iter_mut().for_each(|(ry, _)| *ry -= off_u);
-                buttons.retain(|(by, _, _)| *by >= inner.y + off_u);
-                buttons.iter_mut().for_each(|(by, _, _)| *by -= off_u);
+                let cut = inner.y + fixed_top as u16; // first body row
+                lines.drain(fixed_top..fixed_top + off);
+                rows.retain(|(ry, _)| *ry < cut || *ry >= cut + off_u);
+                rows.iter_mut().for_each(|(ry, _)| {
+                    if *ry >= cut {
+                        *ry -= off_u;
+                    }
+                });
+                buttons.retain(|(by, _, _)| *by < cut || *by >= cut + off_u);
+                buttons.iter_mut().for_each(|(by, _, _)| {
+                    if *by >= cut {
+                        *by -= off_u;
+                    }
+                });
             }
-            // Thumb lives in the reserved gutter one column in from the edge, so
-            // the last column stays sidebar-bg (gap before the pane).
+            // Scrollbar track spans the body only (below the pinned header), in the
+            // reserved gutter one column in from the edge.
             let bar_x = inner.x + inner.width.saturating_sub(2);
+            let bar_y = inner.y + fixed_top as u16;
+            let bar_h = inner.height.saturating_sub(fixed_top as u16);
             self.sidebar_scrollbars
-                .push((key.clone(), Rect::new(bar_x, inner.y, 1, inner.height), max_off));
-            scrollbar = Some((off, total, max_off));
+                .push((key.clone(), Rect::new(bar_x, bar_y, 1, bar_h), max_off));
+            scrollbar = Some((off, body_total, max_off, fixed_top));
         }
         lines.truncate(h);
         if append {
@@ -4245,22 +4276,21 @@ impl App {
         );
         // ratatui's built-in Scrollbar for the visual; mouse wheel/drag is wired
         // separately (the widget itself isn't interactive).
-        if let Some((off, total, max_off)) = scrollbar {
-            // ratatui maps position over content_length-1 (thumb hits bottom when
-            // the last line is at the *top* of the viewport). Our offset only
-            // reaches total-viewport, so scale it across the full range or the
-            // thumb tops out early and looks fixed.
+        if let Some((off, body_total, max_off, fixed_top)) = scrollbar {
+            // Scale the offset across the full range (ratatui maps position over
+            // content_length-1) so the thumb reaches the bottom at max scroll.
             let pos = if max_off > 0 {
-                off * (total - 1) / max_off
+                off * (body_total - 1) / max_off
             } else {
                 0
             };
-            let mut state = ScrollbarState::new(total)
-                .viewport_content_length(h)
+            let body_h = h.saturating_sub(fixed_top);
+            let mut state = ScrollbarState::new(body_total)
+                .viewport_content_length(body_h)
                 .position(pos);
-            // Bar lives in the gutter (inner.width-2) with a gap before the pane,
-            // so a subtle track is safe now and shows the full scroll range.
-            let bar_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
+            let bar_y = inner.y + fixed_top as u16;
+            let bar_h = inner.height.saturating_sub(fixed_top as u16);
+            let bar_area = Rect::new(inner.x, bar_y, inner.width.saturating_sub(1), bar_h);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
@@ -6073,6 +6103,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         sidebar_scroll: HashMap::new(),
         sidebar_scrollbars: Vec::new(),
         sidebar_dragbar: None,
+        last_active_space: 0,
         tab_hits: Vec::new(),
         tab_close_hits: Vec::new(),
         tab_drag: None,
