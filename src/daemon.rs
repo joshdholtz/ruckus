@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -15,8 +15,29 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
 use crate::protocol::*;
+use crate::remote::{self, Origin};
 
 type Tx = UnboundedSender<String>;
+
+/// How to reach a remote: ssh host + options + the client's live SSH env. Kept in
+/// `remote_specs` so a dropped connection can be auto-reconnected without a client.
+#[derive(Clone)]
+struct RemoteSpecEnv {
+    host: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+/// A LIVE mirrored remote daemon reached over `ssh … ruckus __proxy`. The daemon
+/// owns the SSH child (dropping this kills it) and a client to talk to the remote;
+/// the cached `snapshot` is origin-prefixed and merged into `State::snapshot`.
+struct RemoteConn {
+    host: String,
+    client: Arc<crate::client::Client>,
+    /// kill_on_drop child; kept alive so the SSH survives client disconnects.
+    _child: tokio::process::Child,
+    snapshot: Snapshot,
+}
 
 /// A pane's PTY, owned as a raw master fd + child pid so it can be handed off
 /// across a self-exec upgrade (portable-pty's handles can't survive exec, but a
@@ -558,6 +579,14 @@ struct State {
     agent_commands: Vec<String>,
     /// Listening socket fd, handed off (un-CLOEXEC'd) across a self-exec upgrade.
     listener_fd: RawFd,
+    /// Hybrid remote mirror: LIVE connections by origin; the known specs (persist
+    /// across a dropped link so it auto-reconnects); a stable host→origin map (a
+    /// reconnect reuses the same origin); and in-flight attempts.
+    remotes: BTreeMap<Origin, RemoteConn>,
+    remote_specs: BTreeMap<Origin, RemoteSpecEnv>,
+    remote_origins: BTreeMap<String, Origin>,
+    connecting: std::collections::HashSet<Origin>,
+    next_origin: Origin,
 }
 
 impl State {
@@ -568,7 +597,7 @@ impl State {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot {
+        let mut snap = Snapshot {
             spaces: self
                 .spaces
                 .iter()
@@ -599,7 +628,16 @@ impl State {
                     info
                 })
                 .collect(),
+            remote_hosts: BTreeMap::new(),
+        };
+        // Merge each mirrored remote (its cached snapshot is already
+        // origin-prefixed) and expose origin→host so clients tag remote rows.
+        for (origin, rc) in &self.remotes {
+            snap.spaces.extend(rc.snapshot.spaces.iter().cloned());
+            snap.panes.extend(rc.snapshot.panes.iter().cloned());
+            snap.remote_hosts.insert(*origin, rc.host.clone());
         }
+        snap
     }
 }
 
@@ -687,6 +725,11 @@ pub async fn run() -> Result<()> {
         detect_foreground: cfg.ui.detect_foreground,
         agent_commands: cfg.ui.agent_commands.clone(),
         listener_fd,
+        remotes: BTreeMap::new(),
+        remote_specs: BTreeMap::new(),
+        remote_origins: BTreeMap::new(),
+        connecting: std::collections::HashSet::new(),
+        next_origin: 0,
     }));
 
     {
@@ -701,6 +744,35 @@ pub async fn run() -> Result<()> {
         save_state(&st);
     }
     let _ = std::fs::remove_file(handoff_path());
+
+    // Remote reconnect ticker: re-dial any known remote whose link dropped. The
+    // spec (incl. the client's SSH env) is retained, so this works with no client
+    // attached — as long as those credentials are still valid.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let todo: Vec<(Origin, RemoteSpecEnv)> = {
+                    let mut st = state.lock().unwrap();
+                    let pending: Vec<(Origin, RemoteSpecEnv)> = st
+                        .remote_specs
+                        .iter()
+                        .filter(|(o, _)| !st.remotes.contains_key(o) && !st.connecting.contains(o))
+                        .map(|(o, s)| (*o, s.clone()))
+                        .collect();
+                    for (o, _) in &pending {
+                        st.connecting.insert(*o);
+                    }
+                    pending
+                };
+                for (origin, spec) in todo {
+                    spawn_remote_connect(state.clone(), origin, spec);
+                }
+            }
+        });
+    }
 
     // Activity ticker: demote panes from working -> waiting/idle once quiet.
     {
@@ -900,7 +972,35 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
             match serde_json::from_str::<ClientFrame>(&line) {
                 Ok(frame) => {
                     log_request(conn_id, &frame.req);
-                    let msg = handle_request(&state, conn_id, frame.req);
+                    let mut req = frame.req;
+                    // Route by the request's id origin: local ids (origin 0) are
+                    // handled here; remote ids are stripped to local and forwarded
+                    // to that daemon over its ssh pipe, then the reply re-prefixed.
+                    let origin = remote::route_request(&mut req);
+                    let msg = if origin == remote::LOCAL {
+                        handle_request(&state, conn_id, req)
+                    } else {
+                        let client = state
+                            .lock()
+                            .unwrap()
+                            .remotes
+                            .get(&origin)
+                            .map(|rc| rc.client.clone());
+                        match client {
+                            Some(c) => match c.request(req).await {
+                                Ok(mut m) => {
+                                    remote::prefix_servermsg(&mut m, origin);
+                                    m
+                                }
+                                Err(e) => ServerMsg::Error {
+                                    message: format!("remote {origin}: {e}"),
+                                },
+                            },
+                            None => ServerMsg::Error {
+                                message: format!("remote {origin} not connected"),
+                            },
+                        }
+                    };
                     send(&tx, Some(frame.seq), msg);
                 }
                 Err(e) => send(
@@ -1313,6 +1413,142 @@ fn handle_request(state: &Arc<Mutex<State>>, conn_id: u64, req: Request) -> Serv
                 Err(e) => err(format!("upgrade failed: {e}")),
             }
         }
+        Request::ConnectRemote { host, args, env } => {
+            let spec = RemoteSpecEnv {
+                host: host.clone(),
+                args,
+                env,
+            };
+            let mut st = state.lock().unwrap();
+            // Stable origin per host, so a reconnect reuses ids the client knows.
+            let origin = match st.remote_origins.get(&host) {
+                Some(o) => *o,
+                None => {
+                    st.next_origin += 1;
+                    let o = st.next_origin;
+                    st.remote_origins.insert(host.clone(), o);
+                    o
+                }
+            };
+            // Always refresh the spec (new SSH env may unstick a stale-cred reconnect).
+            st.remote_specs.insert(origin, spec.clone());
+            if st.remotes.contains_key(&origin) {
+                return ServerMsg::Done; // already mirrored
+            }
+            if st.connecting.insert(origin) {
+                spawn_remote_connect(state.clone(), origin, spec);
+            }
+            ServerMsg::Done
+        }
+        Request::DisconnectRemote { origin } => {
+            let mut st = state.lock().unwrap();
+            let host = st.remotes.get(&origin).map(|r| r.host.clone());
+            st.remotes.remove(&origin); // drop → kill_on_drop kills the ssh
+            st.remote_specs.remove(&origin); // forget → no auto-reconnect
+            st.connecting.remove(&origin);
+            if let Some(h) = host.or_else(|| {
+                st.remote_origins
+                    .iter()
+                    .find(|(_, o)| **o == origin)
+                    .map(|(h, _)| h.clone())
+            }) {
+                st.remote_origins.remove(&h);
+            }
+            broadcast_state(&st);
+            ServerMsg::Done
+        }
+    }
+}
+
+/// Connect (or reconnect) a remote in the background: spawn `ssh … ruckus
+/// __proxy` with the client's SSH env, fetch + origin-prefix its snapshot, merge
+/// it in, then pump its events until the link drops. Never stalls the main loop.
+fn spawn_remote_connect(state: Arc<Mutex<State>>, origin: Origin, spec: RemoteSpecEnv) {
+    tokio::spawn(async move {
+        let mut ssh_args = vec![
+            "-o".to_string(),
+            "ConnectTimeout=6".to_string(),
+            // Detached daemon can't answer a prompt — fail fast to agent/pubkey.
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+        ];
+        ssh_args.extend(spec.args.iter().cloned());
+        info!("connect remote {} (origin {origin})", spec.host);
+        let done = |state: &Arc<Mutex<State>>| {
+            state.lock().unwrap().connecting.remove(&origin);
+        };
+        let (client, events, child) =
+            match crate::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("connect remote {}: ssh failed: {e:#}", spec.host);
+                    return done(&state);
+                }
+            };
+        let client = Arc::new(client);
+        let mut snap = match client.snapshot().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("connect remote {}: snapshot failed: {e:#}", spec.host);
+                return done(&state);
+            }
+        };
+        remote::prefix_snapshot(&mut snap, origin);
+        {
+            let mut st = state.lock().unwrap();
+            st.connecting.remove(&origin);
+            // A concurrent disconnect may have forgotten this origin — respect it.
+            if !st.remote_specs.contains_key(&origin) {
+                return;
+            }
+            st.remotes.insert(
+                origin,
+                RemoteConn {
+                    host: spec.host.clone(),
+                    client: client.clone(),
+                    _child: child,
+                    snapshot: snap,
+                },
+            );
+            info!("remote {} mirrored (origin {origin})", spec.host);
+            broadcast_state(&st);
+        }
+        remote_event_loop(state, origin, events).await;
+    });
+}
+
+/// Pump one remote's event stream: origin-prefix each message, update the cached
+/// snapshot on State, and broadcast to local clients. On stream end drop the live
+/// conn (the reconnect ticker re-dials while its spec is still known).
+async fn remote_event_loop(
+    state: Arc<Mutex<State>>,
+    origin: Origin,
+    mut events: UnboundedReceiver<ServerMsg>,
+) {
+    while let Some(msg) = events.recv().await {
+        if !state.lock().unwrap().remotes.contains_key(&origin) {
+            return; // disconnected under us
+        }
+        match msg {
+            ServerMsg::State { mut snapshot } => {
+                remote::prefix_snapshot(&mut snapshot, origin);
+                let mut st = state.lock().unwrap();
+                if let Some(rc) = st.remotes.get_mut(&origin) {
+                    rc.snapshot = snapshot;
+                }
+                broadcast_state(&st);
+            }
+            mut other => {
+                remote::prefix_servermsg(&mut other, origin);
+                let st = state.lock().unwrap();
+                broadcast(&st, other);
+            }
+        }
+    }
+    let mut st = state.lock().unwrap();
+    if st.remotes.remove(&origin).is_some() {
+        info!("remote origin {origin} link dropped");
+        broadcast_state(&st);
     }
 }
 

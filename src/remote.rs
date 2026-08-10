@@ -139,7 +139,14 @@ pub fn route_request(req: &mut Request) -> Origin {
         Request::Resize { pane, .. } => strip1(pane),
         Request::ReportActivity { pane, .. } => strip1(pane),
         Request::ReportAgent { pane, .. } => strip1(pane),
-        Request::Snapshot | Request::NewSpace { .. } | Request::Reload | Request::Upgrade => LOCAL,
+        Request::Snapshot
+        | Request::NewSpace { .. }
+        | Request::Reload
+        | Request::Upgrade
+        // Remote lifecycle is acted on by the LOCAL daemon (it owns the mirror),
+        // never forwarded to the remote itself.
+        | Request::ConnectRemote { .. }
+        | Request::DisconnectRemote { .. } => LOCAL,
     }
 }
 
@@ -207,6 +214,7 @@ mod tests {
                 }],
             }],
             panes: vec![pane(10), pane(11)],
+            ..Default::default()
         }
     }
 
@@ -309,6 +317,7 @@ mod tests {
             active_space: 0,
             spaces: Vec::new(),
             panes: Vec::new(),
+            ..Default::default()
         };
         let mut local = fixture();
         prefix_snapshot(&mut local, 0);
@@ -332,6 +341,7 @@ mod tests {
                 tabs: vec![],
             }],
             panes: vec![],
+            ..Default::default()
         };
         prefix_snapshot(&mut remote2, 2);
         merge_snapshot(&mut dest, 2, &remote2);

@@ -111,7 +111,22 @@ pub async fn connect_remote(
     host: &str,
     args: &[String],
 ) -> Result<(Client, UnboundedReceiver<ServerMsg>, tokio::process::Child)> {
-    let mut cmd = tokio::process::Command::new("ssh");
+    connect_remote_env(host, args, &std::collections::BTreeMap::new()).await
+}
+
+/// Like `connect_remote`, but applies `env` to the ssh process. The hybrid model
+/// runs this in the *daemon*: the client hands over its live SSH env (chiefly
+/// `SSH_AUTH_SOCK`) so the detached daemon authenticates as the user — agent
+/// auth and hardware-key touch are agent-side, so they keep working.
+pub async fn connect_remote_env(
+    host: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<(Client, UnboundedReceiver<ServerMsg>, tokio::process::Child)> {
+    // Transport program is `ssh` by default; `RUCKUS_SSH` overrides it (a custom
+    // wrapper, or a test shim that speaks __proxy without a network).
+    let prog = std::env::var("RUCKUS_SSH").unwrap_or_else(|_| "ssh".into());
+    let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args)
         .arg(host)
         .arg("ruckus")
@@ -120,6 +135,9 @@ pub async fn connect_remote(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     tracing::info!(
         "connect_remote: spawning `ssh {} {host} ruckus __proxy`",
         args.join(" ")

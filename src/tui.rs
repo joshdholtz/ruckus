@@ -6260,6 +6260,7 @@ mod palette_tests {
             spaces: vec![s1, s2],
             active_space: 1,
             panes: vec![pane(10, "p10"), pane(20, "p20"), pane(30, "p30")],
+            ..Default::default()
         }
     }
 

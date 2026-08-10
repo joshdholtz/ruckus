@@ -28,14 +28,20 @@ impl Daemon {
     }
 
     fn start_in(dir: PathBuf) -> Daemon {
-        let child = Command::new(bin())
-            .arg("daemon")
+        Daemon::start_in_env(dir, &[])
+    }
+
+    fn start_in_env(dir: PathBuf, env: &[(&str, &str)]) -> Daemon {
+        let mut cmd = Command::new(bin());
+        cmd.arg("daemon")
             .env("RUCKUS_DIR", &dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().unwrap();
         let sock = dir.join("ruckus.sock");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -522,4 +528,124 @@ fn proxy_relays_read_and_write() {
         .any(|s| s["name"] == "viaproxy"));
 
     let _ = proxy.kill();
+}
+
+fn space_by_name<'a>(snap: &'a Value, name: &str) -> Option<&'a Value> {
+    snap["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+}
+
+/// End-to-end hybrid remote mirror: daemon A connects daemon B (via a RUCKUS_SSH
+/// shim that runs `ruckus __proxy` against B's dir — no real SSH), B's spaces
+/// mirror into A with origin-encoded ids, A can write through to B (create a tab
+/// on the remote space), and disconnect drops the mirror. This exercises the
+/// whole daemon-side hub: connect, prefix, merge, route, disconnect.
+#[test]
+fn daemon_mirrors_remote_read_write_disconnect() {
+    // B = the "remote" daemon, with a recognisable space.
+    let b = Daemon::start("hub-remote");
+    let bsnap = snapshot(&b.dir);
+    let bspace = bsnap["spaces"][0]["id"].as_u64().unwrap();
+    rpc(
+        &b.dir,
+        json!({"type": "rename_space", "space": bspace, "name": "remoteland"}),
+    );
+
+    // The transport shim: ignore all ssh args/host, just proxy B's socket.
+    let shim = b.dir.join("ssh-shim.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nexec env RUCKUS_DIR='{}' '{}' __proxy\n",
+            b.dir.display(),
+            bin()
+        ),
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&shim).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&shim, perm).unwrap();
+
+    // A = the local daemon, told to use the shim as its ssh transport.
+    let a = Daemon::start_in_env(
+        std::env::temp_dir().join(format!("ruckus-test-{}-hub-local", std::process::id())),
+        &[("RUCKUS_SSH", shim.to_str().unwrap())],
+    );
+
+    // Connect B into A.
+    let msg = rpc(
+        &a.dir,
+        json!({"type": "connect_remote", "host": "bee", "args": [], "env": {}}),
+    );
+    assert_eq!(msg["type"], "done", "{msg}");
+
+    // B's space mirrors into A with an origin-encoded id (id >> 48 != 0), and A
+    // reports the host label for that origin.
+    let snap = wait_for(
+        &a.dir,
+        |s| space_by_name(s, "remoteland").is_some(),
+        "remote space mirrored into A",
+    );
+    let rspace = space_by_name(&snap, "remoteland").unwrap();
+    let rid = rspace["id"].as_u64().unwrap();
+    let origin = rid >> 48;
+    assert_ne!(
+        origin, 0,
+        "mirrored space must carry a non-zero origin: {rid}"
+    );
+    assert_eq!(
+        snap["remote_hosts"][origin.to_string()],
+        "bee",
+        "A exposes origin→host: {}",
+        snap["remote_hosts"]
+    );
+
+    // Write through A to B: create a tab on the REMOTE space (origin-encoded id).
+    let msg = rpc(
+        &a.dir,
+        json!({"type": "new_tab", "space": rid, "name": "made-remotely",
+               "cmd": ["sleep", "300"], "cwd": null}),
+    );
+    assert_eq!(msg["type"], "created", "write-through failed: {msg}");
+    let rpane = msg["pane"].as_u64().unwrap();
+    assert_eq!(rpane >> 48, origin, "created pane keeps the remote origin");
+
+    // It shows up mirrored in A...
+    wait_for(
+        &a.dir,
+        |s| pane_by_id(s, rpane).is_some(),
+        "remotely-created pane mirrored into A",
+    );
+    // ...and actually landed on B (its local id is the low bits).
+    let blocal = rpane & 0x0000_FFFF_FFFF_FFFF;
+    wait_for(
+        &b.dir,
+        |s| pane_by_id(s, blocal).is_some(),
+        "the tab really exists on B",
+    );
+
+    // Disconnect drops the mirror from A (B keeps running).
+    let msg = rpc(
+        &a.dir,
+        json!({"type": "disconnect_remote", "origin": origin}),
+    );
+    assert_eq!(msg["type"], "done", "{msg}");
+    let snap = wait_for(
+        &a.dir,
+        |s| space_by_name(s, "remoteland").is_none(),
+        "remote space removed after disconnect",
+    );
+    assert!(
+        snap["remote_hosts"]
+            .as_object()
+            .map(|m| m.is_empty())
+            .unwrap_or(true),
+        "no remote hosts after disconnect: {}",
+        snap["remote_hosts"]
+    );
+    // B is unaffected.
+    assert!(space_by_name(&snapshot(&b.dir), "remoteland").is_some());
 }

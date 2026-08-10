@@ -118,6 +118,23 @@ pub enum Request {
     /// Zero-downtime upgrade: the daemon re-execs the current binary in place,
     /// keeping every pane's PTY + child process alive. Clients reconnect.
     Upgrade,
+    /// Hybrid remote mirror: ask THIS daemon to connect (or re-connect) a remote
+    /// ruckus over SSH and merge its spaces in. The client supplies its live SSH
+    /// env (`SSH_AUTH_SOCK`, …) so the detached daemon can authenticate as the
+    /// user (agent auth / hardware-key touch are agent-side). `args` are extra
+    /// ssh options. Deduped by host. Replies `Done`.
+    ConnectRemote {
+        host: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    /// Drop a connected remote by its origin: kill its SSH, forget it (no
+    /// auto-reconnect), remove its mirrored spaces. Replies `Done`.
+    DisconnectRemote {
+        origin: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,11 +375,15 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub spaces: Vec<SpaceInfo>,
     pub active_space: u64,
     pub panes: Vec<PaneInfo>,
+    /// origin → host label for mirrored remotes (origin 0 = local, never listed).
+    /// Lets the client tag + colour remote rows without its own connection state.
+    #[serde(default)]
+    pub remote_hosts: std::collections::BTreeMap<u16, String>,
 }
 
 impl Snapshot {
