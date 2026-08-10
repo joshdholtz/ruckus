@@ -1,0 +1,10 @@
+[plugin]
+name = "scratch"
+version = "0.1.0"
+description = "alt-BackQuote -> a throwaway shell in a floating popup"
+capabilities = ["run-commands"]
+
+[[bind]]
+key = "alt-`"
+run = "zsh"
+where = "popup"

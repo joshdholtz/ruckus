@@ -1170,30 +1170,45 @@ impl App {
     }
 
     /// If a link handler matches the text at pane cell (row,col), return the
-    /// matched text, the rule's command template, and its placement.
-    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, String, Option<Placement>)> {
+    /// matched text, the resolved argv, and its placement. `${url}`/`${match}`/
+    /// `${0}` are the whole match; `${1}`.. are regex capture groups — each
+    /// substituted as a SINGLE argv element (never shell-interpreted).
+    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, Vec<String>, Option<Placement>)> {
         let screen = self.views.get(&pane)?.parser.screen();
         let contents = screen.contents();
         let line = contents.lines().nth(row as usize)?;
         for rule in &self.cfg.links {
-            for m in rule.pattern.find_iter(line) {
+            for caps in rule.pattern.captures_iter(line) {
+                let Some(m) = caps.get(0) else { continue };
                 let start = line[..m.start()].chars().count();
                 let end = start + m.as_str().chars().count();
                 if (col as usize) >= start && (col as usize) < end {
-                    return Some((m.as_str().to_string(), rule.run.clone(), rule.placement));
+                    let full = m.as_str();
+                    let argv: Vec<String> = rule
+                        .run
+                        .split_whitespace()
+                        .map(|tok| {
+                            let mut t = tok
+                                .replace("${url}", full)
+                                .replace("${match}", full)
+                                .replace("${0}", full);
+                            for i in 1..caps.len() {
+                                if let Some(g) = caps.get(i) {
+                                    t = t.replace(&format!("${{{i}}}"), g.as_str());
+                                }
+                            }
+                            t
+                        })
+                        .collect();
+                    return Some((full.to_string(), argv, rule.placement));
                 }
             }
         }
         None
     }
 
-    /// Run a link handler. The matched text is substituted as a SINGLE argv
-    /// element (never through a shell), so pane content can't inject commands.
-    fn run_link(&mut self, run_template: &str, matched: &str) {
-        let argv: Vec<String> = run_template
-            .split_whitespace()
-            .map(|tok| tok.replace("${url}", matched).replace("${match}", matched))
-            .collect();
+    /// Run a link handler's resolved argv detached (e.g. `open <url>`).
+    fn run_link(&mut self, argv: &[String], matched: &str) {
         let Some((prog, args)) = argv.split_first() else { return };
         let _ = std::process::Command::new(prog)
             .args(args)
@@ -2662,22 +2677,15 @@ impl App {
                     };
                     if link_trigger {
                         if let Some((p, (r, c))) = self.cell_at(col, row) {
-                            if let Some((matched, run, placement)) = self.link_at(p, r, c) {
+                            if let Some((matched, argv, placement)) = self.link_at(p, r, c) {
                                 match placement {
                                     // Open the link's tool in a ruckus split/tab/popup.
                                     Some(pl) => {
-                                        let cmd: Vec<String> = run
-                                            .split_whitespace()
-                                            .map(|t| {
-                                                t.replace("${url}", &matched)
-                                                    .replace("${match}", &matched)
-                                            })
-                                            .collect();
                                         self.notify(format!("↗ {matched}"));
-                                        self.open_placement(cmd, pl).await;
+                                        self.open_placement(argv, pl).await;
                                     }
                                     // Detached (e.g. `open <url>`).
-                                    None => self.run_link(&run, &matched),
+                                    None => self.run_link(&argv, &matched),
                                 }
                                 return;
                             }

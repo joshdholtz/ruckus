@@ -453,17 +453,32 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
         }
         PluginCmd::Link { path } => {
             let src = std::fs::canonicalize(&path)?;
-            if !src.join("ruckus-plugin.toml").exists() {
-                anyhow::bail!("{}: no ruckus-plugin.toml", src.display());
+            // A single plugin, or a directory of them (link each subfolder).
+            let mut sources: Vec<std::path::PathBuf> = Vec::new();
+            if src.join("ruckus-plugin.toml").exists() {
+                sources.push(src.clone());
+            } else {
+                for e in std::fs::read_dir(&src)?.flatten() {
+                    if e.path().join("ruckus-plugin.toml").exists() {
+                        sources.push(e.path());
+                    }
+                }
+                if sources.is_empty() {
+                    anyhow::bail!("{}: no ruckus-plugin.toml (or plugin subdirs)", src.display());
+                }
             }
-            let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin");
-            let dst = dir.join(name);
-            if dst.exists() {
-                anyhow::bail!("{} already installed (ruckus plugin remove {name})", name);
+            sources.sort();
+            for s in sources {
+                let name = s.file_name().and_then(|n| n.to_str()).unwrap_or("plugin").to_string();
+                let dst = dir.join(&name);
+                if dst.symlink_metadata().is_ok() {
+                    println!("· {name} already installed");
+                    continue;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&s, &dst)?;
+                println!("linked {name}");
             }
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&src, &dst)?;
-            println!("linked {name} → {}", src.display());
             println!("run `ruckus reload` to pick it up");
         }
         PluginCmd::Install { repo } => {
@@ -492,7 +507,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             }
             let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
             let dst = dir.join(&name);
-            if dst.exists() {
+            if dst.symlink_metadata().is_ok() {
                 anyhow::bail!("{name} already installed (ruckus plugin remove {name})");
             }
             #[cfg(unix)]
@@ -503,7 +518,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
         PluginCmd::Update { name } => {
             use std::collections::HashSet;
             let targets: Vec<(String, std::path::PathBuf)> = match name {
-                Some(n) if dir.join(&n).exists() => vec![(n.clone(), dir.join(&n))],
+                Some(n) if dir.join(&n).symlink_metadata().is_ok() => vec![(n.clone(), dir.join(&n))],
                 Some(n) => match list_plugins().into_iter().find(|p| p.name == n) {
                     Some(p) => vec![(p.id, p.path)],
                     None => anyhow::bail!("no plugin {n}"),
@@ -538,7 +553,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
         }
         PluginCmd::Remove { name } => {
             // Accept the directory handle or the manifest name.
-            let target = if dir.join(&name).exists() {
+            let target = if dir.join(&name).symlink_metadata().is_ok() {
                 dir.join(&name)
             } else if let Some(p) = list_plugins().into_iter().find(|p| p.name == name) {
                 p.path
