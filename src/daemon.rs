@@ -44,6 +44,12 @@ impl StateHandle {
         }));
         rrx.await.expect("state actor stopped")
     }
+
+    /// Fire-and-forget mutation (no reply). Non-blocking — safe to call from a
+    /// plain OS thread (e.g. the liveness watchdog), unlike `with`.
+    fn tell(&self, f: impl FnOnce(&mut State) + Send + 'static) {
+        let _ = self.tx.send(Box::new(f));
+    }
 }
 
 /// The single owner of State. Runs jobs serially; when a job marks the tree
@@ -60,6 +66,42 @@ async fn state_actor(
             let _ = save_tx.send(());
         }
     }
+}
+
+/// Heartbeats processed by the actor (set by watchdog jobs). Diagnostic only.
+static ACTOR_BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Liveness watchdog on a dedicated OS thread: every second it enqueues a tiny
+/// job that stamps ACTOR_BEAT, then checks how far behind the actor has fallen.
+/// If the actor stops answering, it says so LOUDLY in daemon.log even when the
+/// whole runtime is starved — so a wedge is never invisible again, and we can
+/// tell instantly whether it's actor-side (this fires) or connection-side (it
+/// doesn't). Works from a std::thread because `tell` is a non-blocking send.
+fn spawn_actor_watchdog(handle: StateHandle) {
+    use std::sync::atomic::Ordering;
+    std::thread::Builder::new()
+        .name("ruckus-actor-watchdog".into())
+        .spawn(move || {
+            let mut sent = 0u64;
+            let mut warned = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                sent += 1;
+                let beat = sent;
+                handle.tell(move |_st| ACTOR_BEAT.store(beat, Ordering::Relaxed));
+                let done = ACTOR_BEAT.load(Ordering::Relaxed);
+                let behind = sent.saturating_sub(done);
+                // >3s behind = the actor is stuck (running a blocking job or dead).
+                if behind > 3 && sent != warned {
+                    warned = sent;
+                    error!(
+                        "⚠ STATE ACTOR unresponsive: {behind}s behind ({done}/{sent} heartbeats). \
+                         A job is blocking the actor (disk/subprocess/await) or it has died."
+                    );
+                }
+            }
+        })
+        .expect("spawn actor watchdog");
 }
 
 /// Debounced persistence: serialize + atomically write state.json whenever the
@@ -857,6 +899,7 @@ pub async fn run() -> Result<()> {
     // Hand State to the actor; start the debounced saver.
     tokio::spawn(state_actor(owned, job_rx, save_tx.clone()));
     tokio::spawn(state_saver(state.clone(), save_rx));
+    spawn_actor_watchdog(state.clone());
 
     // Remote reconnect ticker: re-dial any known remote whose link dropped. The
     // spec (incl. the client's SSH env) is retained, so this works with no client
@@ -1164,33 +1207,44 @@ async fn handle_conn(state: StateHandle, conn_id: u64, stream: UnixStream) -> Re
             match serde_json::from_str::<ClientFrame>(&line) {
                 Ok(frame) => {
                     log_request(conn_id, &frame.req);
+                    // Handle each request CONCURRENTLY (a task per request) so a
+                    // slow remote forward can't head-of-line-block the other
+                    // requests on this same connection — the TUI pipes local AND
+                    // remote requests down one connection. State access stays safe
+                    // (the actor serializes it); the client matches replies by seq,
+                    // so out-of-order responses are fine.
+                    let state = state.clone();
+                    let tx = tx.clone();
+                    let seq = frame.seq;
                     let mut req = frame.req;
-                    // Route by the request's id origin: local ids (origin 0) are
-                    // handled here; remote ids are stripped to local and forwarded
-                    // to that daemon over its ssh pipe, then the reply re-prefixed.
-                    let origin = remote::route_request(&mut req);
-                    let msg = if origin == remote::LOCAL {
-                        handle_request(&state, conn_id, req).await
-                    } else {
-                        let client = state
-                            .with(move |st| st.remotes.get(&origin).map(|rc| rc.client.clone()))
-                            .await;
-                        match client {
-                            Some(c) => match c.request(req).await {
-                                Ok(mut m) => {
-                                    remote::prefix_servermsg(&mut m, origin);
-                                    m
-                                }
-                                Err(e) => ServerMsg::Error {
-                                    message: format!("remote {origin}: {e}"),
+                    tokio::spawn(async move {
+                        // Route by the request's id origin: local ids (origin 0) are
+                        // handled here; remote ids are stripped to local and
+                        // forwarded over the ssh pipe, then the reply re-prefixed.
+                        let origin = remote::route_request(&mut req);
+                        let msg = if origin == remote::LOCAL {
+                            handle_request(&state, conn_id, req).await
+                        } else {
+                            let client = state
+                                .with(move |st| st.remotes.get(&origin).map(|rc| rc.client.clone()))
+                                .await;
+                            match client {
+                                Some(c) => match c.request(req).await {
+                                    Ok(mut m) => {
+                                        remote::prefix_servermsg(&mut m, origin);
+                                        m
+                                    }
+                                    Err(e) => ServerMsg::Error {
+                                        message: format!("remote {origin}: {e}"),
+                                    },
                                 },
-                            },
-                            None => ServerMsg::Error {
-                                message: format!("remote {origin} not connected"),
-                            },
-                        }
-                    };
-                    send(&tx, Some(frame.seq), msg);
+                                None => ServerMsg::Error {
+                                    message: format!("remote {origin} not connected"),
+                                },
+                            }
+                        };
+                        send(&tx, Some(seq), msg);
+                    });
                 }
                 Err(e) => send(
                     &tx,
