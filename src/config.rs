@@ -863,6 +863,43 @@ struct RawLink {
     place: Option<String>,
 }
 
+/// A plugin `[[status]]` segment: a command whose first line is shown in the
+/// status bar (refreshed like any `#(command)`), so calendars/monitors/etc. can
+/// live in the bar as an installable, shareable plugin instead of a one-off.
+#[derive(Debug, Deserialize)]
+struct RawStatus {
+    /// Shell command; runs with the plugin dir as cwd so bundled scripts resolve.
+    run: String,
+    /// "left" | "right" (default right).
+    #[serde(default)]
+    side: Option<String>,
+    /// Theme colour name (e.g. "idle", "accent"); default dim "status_fg".
+    #[serde(default)]
+    color: Option<String>,
+    /// Optional glyph shown before the output.
+    #[serde(default)]
+    glyph: Option<String>,
+}
+
+/// Single-quote a path for safe embedding in a `sh -c` command.
+fn sh_quote(p: &std::path::Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Compile a plugin `[[status]]` segment into a status-format fragment, reusing
+/// the existing `#(command)` + `#[color]` renderer. The command is run from the
+/// plugin dir so a bundled script (e.g. `bash next-event.sh`) just works.
+fn lower_status(s: &RawStatus, dir: &std::path::Path) -> (bool, String) {
+    let on_left = s.side.as_deref() == Some("left");
+    let color = s.color.as_deref().unwrap_or("status_fg");
+    let prefix = match s.glyph.as_deref() {
+        Some(g) if !g.is_empty() => format!("{g} "),
+        _ => String::new(),
+    };
+    let cmd = format!("cd {} && {}", sh_quote(dir), s.run);
+    (on_left, format!("#[{color}]{prefix}#({cmd})#[]"))
+}
+
 /// Map a `where` value to a placement (defaults to a right split).
 fn parse_placement(s: &str) -> Placement {
     match s.to_lowercase().as_str() {
@@ -919,6 +956,8 @@ struct RawManifest {
     bind: Vec<RawBind>,
     #[serde(default)]
     link: Vec<RawLink>,
+    #[serde(default)]
+    status: Vec<RawStatus>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1170,8 +1209,32 @@ impl Config {
     fn load_plugins(&mut self) {
         for dir in list_plugins().into_iter().map(|p| p.path) {
             if let Some(m) = read_manifest(&dir) {
-                self.commands.extend(lower_binds(&m.bind));
+                // Resolve any bundled-script tokens (e.g. `proc.sh`) to absolute
+                // paths so a popup/split bind finds them regardless of cwd.
+                let mut binds = lower_binds(&m.bind);
+                for b in &mut binds {
+                    for tok in &mut b.cmd {
+                        let p = dir.join(tok.as_str());
+                        if p.is_file() {
+                            *tok = p.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+                self.commands.extend(binds);
                 self.links.extend(lower_links(&m.link));
+                // Plugin status segments compile into the existing status format.
+                for s in &m.status {
+                    let (on_left, frag) = lower_status(s, &dir);
+                    let target = if on_left {
+                        &mut self.ui.status_left
+                    } else {
+                        &mut self.ui.status_right
+                    };
+                    if !target.is_empty() {
+                        target.push_str("  ");
+                    }
+                    target.push_str(&frag);
+                }
             }
         }
     }

@@ -1,0 +1,10 @@
+[plugin]
+name = "proc"
+version = "0.1.0"
+description = "alt-k → process killer popup: fuzzy-search by name or port, ENTER kill, CTRL-X force-kill"
+capabilities = ["run-commands"]
+
+[[bind]]
+key = "alt-k"
+run = "bash proc.sh"
+where = "popup"

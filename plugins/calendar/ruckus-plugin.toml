@@ -1,0 +1,13 @@
+[plugin]
+name = "calendar"
+version = "0.1.0"
+description = "next upcoming calendar event in the status bar (macOS Calendar via AppleScript)"
+capabilities = ["run-commands", "status"]
+
+# Status-bar segment. Runs from this plugin's dir, so the bundled script resolves.
+# Output is cached + refreshed in the background, so it never blocks the bar.
+[[status]]
+side = "left"
+run = "bash next-event.sh"
+color = "idle"
+glyph = "◷"

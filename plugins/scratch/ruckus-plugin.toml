@@ -1,9 +1,11 @@
 [plugin]
 name = "scratch"
 version = "0.1.0"
-description = "alt-BackQuote -> a throwaway shell in a floating popup"
+description = "alt-` → throwaway shell in a floating popup (closes on exit) — mirrors herdr's scratch popup"
 capabilities = ["run-commands"]
 
+# Direct chord (plugin binds can't be prefix-triggered yet). alt-` is the classic
+# drop-down/scratch key. Rebind by editing `key`.
 [[bind]]
 key = "alt-`"
 run = "zsh"
