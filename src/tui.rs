@@ -15,7 +15,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
@@ -689,6 +691,14 @@ struct App {
     sidebar_w: Option<u16>,
     /// True while dragging the sidebar's edge to resize it.
     sidebar_resizing: bool,
+    /// Manual scroll offset per sidebar region (keyed by the region's first
+    /// section), combined with active-row follow. Absent = top.
+    sidebar_scroll: HashMap<String, usize>,
+    /// Scrollbar tracks drawn this frame — (region key, track rect, max offset)
+    /// — for wheel + drag hit-testing.
+    sidebar_scrollbars: Vec<(String, Rect, usize)>,
+    /// Region whose scrollbar thumb is currently being dragged.
+    sidebar_dragbar: Option<String>,
     /// A floating command popup (display-popup style), if one is open.
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
@@ -2822,7 +2832,9 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.hover = Some((col, row));
-                if self.sidebar_resizing {
+                if self.sidebar_dragbar.is_some() {
+                    self.sidebar_scrollbar_drag(col, row, false);
+                } else if self.sidebar_resizing {
                     self.resize_sidebar(col).await;
                 } else if self.drag.is_some() {
                     self.apply_drag(col, row);
@@ -2876,6 +2888,7 @@ impl App {
                 self.tab_drag = None;
                 self.space_drag = None;
                 self.drag_target = None;
+                self.sidebar_dragbar = None;
                 if self.sidebar_resizing {
                     self.sidebar_resizing = false;
                     self.persist_sidebar_width(); // remember the new width next launch
@@ -2995,6 +3008,10 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Grabbing a sidebar scrollbar thumb starts a scroll-drag.
+                if self.sidebar_scrollbar_drag(col, row, true) {
+                    return;
+                }
                 // Any fresh left-press clears a prior selection.
                 self.select = None;
                 self.selecting = false;
@@ -3221,8 +3238,16 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp => self.pane_wheel(col, row, true).await,
-            MouseEventKind::ScrollDown => self.pane_wheel(col, row, false).await,
+            MouseEventKind::ScrollUp => {
+                if !self.sidebar_wheel(col, row, true) {
+                    self.pane_wheel(col, row, true).await;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if !self.sidebar_wheel(col, row, false) {
+                    self.pane_wheel(col, row, false).await;
+                }
+            }
             _ => {}
         }
     }
@@ -3710,11 +3735,71 @@ impl App {
 
     /// Split-aware sidebar: stacked (single region) or, when `sidebar_split > 0`,
     /// the last section pinned to a fixed bottom region (herdr-style).
+    /// Mouse-wheel inside a sidebar region → scroll that region. Returns true if
+    /// handled (so it doesn't also scroll a pane).
+    fn sidebar_wheel(&mut self, col: u16, row: u16, up: bool) -> bool {
+        let Some(sb) = self.frame.sidebar else {
+            return false;
+        };
+        if col < sb.x || col >= sb.x + sb.width {
+            return false;
+        }
+        let hit = self
+            .sidebar_scrollbars
+            .iter()
+            .find(|(_, t, _)| row >= t.y && row < t.y + t.height)
+            .map(|(k, _, m)| (k.clone(), *m));
+        if let Some((key, max_off)) = hit {
+            let cur = self.sidebar_scroll.get(&key).copied().unwrap_or(0);
+            let next = if up {
+                cur.saturating_sub(3)
+            } else {
+                (cur + 3).min(max_off)
+            };
+            self.sidebar_scroll.insert(key, next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Begin (start=true) or continue dragging a sidebar scrollbar thumb, mapping
+    /// the row to a scroll offset. Returns true if handled.
+    fn sidebar_scrollbar_drag(&mut self, col: u16, row: u16, start: bool) -> bool {
+        let entry = if start {
+            self.sidebar_scrollbars
+                .iter()
+                .find(|(_, t, _)| col == t.x && row >= t.y && row < t.y + t.height)
+                .cloned()
+        } else if let Some(key) = self.sidebar_dragbar.clone() {
+            self.sidebar_scrollbars
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .cloned()
+        } else {
+            None
+        };
+        let Some((key, track, max_off)) = entry else {
+            return false;
+        };
+        if max_off == 0 || track.height <= 1 {
+            return false;
+        }
+        let rel = row.saturating_sub(track.y).min(track.height - 1) as usize;
+        let off = (rel * max_off) / (track.height as usize - 1);
+        self.sidebar_scroll.insert(key.clone(), off.min(max_off));
+        if start {
+            self.sidebar_dragbar = Some(key);
+        }
+        true
+    }
+
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
         let sections = self.cfg.ui.sidebar_sections.clone();
         let split = self.cfg.ui.sidebar_split;
         self.sidebar_rows.clear();
         self.sidebar_buttons.clear();
+        self.sidebar_scrollbars.clear();
         if split <= 0.0 || sections.len() < 2 || area.height < 8 {
             self.draw_sidebar_region(f, area, &sections, true);
             return;
@@ -4109,12 +4194,25 @@ impl App {
         // Scroll the region so the active space stays visible instead of being
         // truncated off the bottom (matters once you have more spaces — local or
         // remote — than fit). No overflow → no scroll → unchanged behaviour.
+        // Scroll: manual offset (wheel/drag) combined with active-row follow, plus
+        // a real scrollbar (visible thumb, mouse-wheel + draggable) on overflow.
         let h = inner.height as usize;
-        if lines.len() > h && h >= 1 {
-            let off = focus_idx
-                .map(|fi| fi.saturating_sub(h - 1))
-                .unwrap_or(0)
-                .min(lines.len() - h);
+        let key = sections.first().cloned().unwrap_or_default();
+        let total = lines.len();
+        let mut scrollbar: Option<(usize, usize)> = None; // (offset, total)
+        if total > h && h >= 1 {
+            let max_off = total - h;
+            let mut off = self.sidebar_scroll.get(&key).copied().unwrap_or(0).min(max_off);
+            // keep the active row on screen (jump to it if scrolled away)
+            if let Some(fi) = focus_idx {
+                if fi < off {
+                    off = fi;
+                } else if fi >= off + h {
+                    off = fi + 1 - h;
+                }
+            }
+            off = off.min(max_off);
+            self.sidebar_scroll.insert(key.clone(), off);
             if off > 0 {
                 let off_u = off as u16;
                 lines.drain(0..off);
@@ -4123,26 +4221,10 @@ impl App {
                 buttons.retain(|(by, _, _)| *by >= inner.y + off_u);
                 buttons.iter_mut().for_each(|(by, _, _)| *by -= off_u);
             }
-            // Overflow affordance: show how many rows are hidden above/below so a
-            // space (e.g. a freshly-mirrored remote) can't hide silently.
-            let hidden_above = off;
-            let hidden_below = lines.len().saturating_sub(h);
-            let hint = |n: usize, arrow: &str| {
-                Line::from(Span::styled(
-                    format!("  {arrow} {n} more"),
-                    Style::default().fg(th.status_fg).add_modifier(Modifier::DIM),
-                ))
-            };
-            if hidden_above > 0 {
-                if let Some(first) = lines.first_mut() {
-                    *first = hint(hidden_above, "▴");
-                }
-            }
-            if hidden_below > 0 {
-                if let Some(last) = lines.get_mut(h - 1) {
-                    *last = hint(hidden_below, "▾");
-                }
-            }
+            let bar_x = inner.x + inner.width.saturating_sub(1);
+            self.sidebar_scrollbars
+                .push((key.clone(), Rect::new(bar_x, inner.y, 1, inner.height), max_off));
+            scrollbar = Some((off, total));
         }
         lines.truncate(h);
         if append {
@@ -4156,6 +4238,19 @@ impl App {
             Paragraph::new(lines).style(Style::default().bg(th.sidebar_bg)),
             inner,
         );
+        // ratatui's built-in Scrollbar for the visual; mouse wheel/drag is wired
+        // separately (the widget itself isn't interactive).
+        if let Some((off, total)) = scrollbar {
+            let mut state = ScrollbarState::new(total)
+                .viewport_content_length(h)
+                .position(off);
+            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(th.accent))
+                .track_style(Style::default().fg(th.idle));
+            f.render_stateful_widget(bar, inner, &mut state);
+        }
     }
 
     fn draw_tab_strip(&mut self, f: &mut Frame, area: Rect) {
@@ -5956,6 +6051,9 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         frame: FrameLayout::default(),
         sidebar_rows: Vec::new(),
         sidebar_buttons: Vec::new(),
+        sidebar_scroll: HashMap::new(),
+        sidebar_scrollbars: Vec::new(),
+        sidebar_dragbar: None,
         tab_hits: Vec::new(),
         tab_close_hits: Vec::new(),
         tab_drag: None,
