@@ -287,8 +287,10 @@ fn state_survives_daemon_restart() {
                "cmd": ["sleep", "300"], "cwd": null}),
     );
     let pane = msg["pane"].as_u64().unwrap();
-    // wait until state.json reflects the tab
+    // wait until the tab exists, then let the debounced saver flush it to disk
+    // (persistence is now eventual — within ~50ms — not synchronous-per-change).
     wait_for(&d.dir, |s| pane_by_id(s, pane).is_some(), "pane created");
+    std::thread::sleep(Duration::from_millis(300));
 
     let dir = d.dir.clone();
     d.kill();
