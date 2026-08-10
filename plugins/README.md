@@ -13,12 +13,11 @@ ruckus reload
 **Or install one from the repo (monorepo subpath):**
 
 ```sh
-ruckus plugin install joshdholtz/ruckus/plugins/github-links
+ruckus plugin install joshdholtz/ruckus/plugins/pr-review
 ```
 
 | plugin | needs | does |
 |---|---|---|
-| github-links | gh | ctrl-click `#123` / a commit SHA → open on GitHub |
 | pr-review | gh (or your reviewer) | ctrl-click a PR URL → review it in a split |
 | gh-dash | `gh extension install dlvhdr/gh-dash` | `alt-g` → gh-dash in a split |
 | scratch | — | ``alt-` `` → throwaway shell popup |
