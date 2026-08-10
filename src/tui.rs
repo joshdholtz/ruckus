@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use crate::client::{connect, ensure_daemon, resolve_pane, Client};
 use crate::config::{
     normalize_key, Action, BarPos, CommandBind, Config, FooterMode, LinkClick, Placement,
-    SidebarPos, ToastPos, WorkingStyle,
+    SidebarPos, Theme, ToastPos, WorkingStyle,
 };
 use crate::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
@@ -62,6 +62,7 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
         Action::DisconnectRemote,
         "disconnect remote (the space you're on)",
     ),
+    (Action::Theme, "change theme (pick + live preview)"),
     (Action::ToggleSidebar, "toggle sidebar"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
@@ -575,6 +576,14 @@ struct Prompt {
     buffer: String,
 }
 
+/// Modal theme picker: arrow/j-k through the list, live-previewing each theme on
+/// the whole UI; Enter persists (`[theme].preset`), Esc reverts to `original`.
+struct ThemePick {
+    names: Vec<String>,
+    sel: usize,
+    original: Theme,
+}
+
 /// Tap targets on the triage action bar (waiting / exited / narrow).
 #[derive(Clone)]
 enum ChipAction {
@@ -644,6 +653,8 @@ struct App {
     palette: Option<Palette>,
     /// Clickable palette rows: (rect, visible-row index).
     palette_hits: Vec<(Rect, usize)>,
+    /// Active theme picker modal (live preview + persist on Enter).
+    theme_pick: Option<ThemePick>,
     /// Touch-first deck view (big cards) — the mobile home screen. Gated by narrow().
     deck: bool,
     deck_scroll: usize,
@@ -1957,11 +1968,93 @@ impl App {
                     let _ = self.route(Request::DisconnectRemote { origin }).await;
                 }
             }
+            Action::Theme => self.open_theme_pick(),
         }
     }
 
     fn open_palette(&mut self) {
         self.palette = Some(Palette::new(&self.snap));
+    }
+
+    /// Open the theme picker: built-ins + user themes, cursor on the active theme,
+    /// remembering the live palette so Esc can revert.
+    fn open_theme_pick(&mut self) {
+        let mut names: Vec<String> = crate::config::THEME_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        names.extend(crate::config::list_user_themes());
+        // Current preset from config.toml so the cursor lands on the active theme.
+        let current = std::fs::read_to_string(crate::config::ensure_config_file())
+            .ok()
+            .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+            .and_then(|d| {
+                d.get("theme")
+                    .and_then(|t| t.get("preset"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        let sel = current
+            .and_then(|c| names.iter().position(|n| *n == c))
+            .unwrap_or(0);
+        self.theme_pick = Some(ThemePick {
+            names,
+            sel,
+            original: self.cfg.theme.clone(),
+        });
+        self.preview_theme();
+    }
+
+    /// Apply the highlighted theme to the live UI (preview only — not persisted).
+    fn preview_theme(&mut self) {
+        let Some(tp) = &self.theme_pick else { return };
+        if let Some(name) = tp.names.get(tp.sel) {
+            if let Some(t) = crate::config::resolve_theme(name) {
+                self.cfg.theme = t;
+            }
+        }
+    }
+
+    /// Move the picker cursor by `delta` (wrapping) and preview.
+    fn theme_pick_move(&mut self, delta: i32) {
+        if let Some(tp) = self.theme_pick.as_mut() {
+            let len = tp.names.len() as i32;
+            if len > 0 {
+                tp.sel = (((tp.sel as i32 + delta) % len + len) % len) as usize;
+            }
+        }
+        self.preview_theme();
+    }
+
+    /// Commit the highlighted theme: persist `[theme].preset`, keep it applied live.
+    fn theme_pick_commit(&mut self) {
+        let Some(tp) = self.theme_pick.take() else {
+            return;
+        };
+        let Some(name) = tp.names.get(tp.sel).cloned() else {
+            return;
+        };
+        if let Some(t) = crate::config::resolve_theme(&name) {
+            self.cfg.theme = t;
+        }
+        let path = crate::config::ensure_config_file();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() {
+                if !doc.contains_key("theme") {
+                    doc["theme"] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                doc["theme"]["preset"] = toml_edit::value(name.as_str());
+                let _ = std::fs::write(&path, doc.to_string());
+            }
+        }
+        self.toast(format!("theme: {name}"));
+    }
+
+    /// Close the picker, reverting the live preview to what it was before.
+    fn theme_pick_cancel(&mut self) {
+        if let Some(tp) = self.theme_pick.take() {
+            self.cfg.theme = tp.original;
+        }
     }
 
     /// Build the visible palette rows for the current query + fold state.
@@ -2291,6 +2384,21 @@ impl App {
                         self.do_action(a).await;
                     }
                 }
+            }
+            return;
+        }
+
+        // Theme picker: arrow / j-k preview the whole UI, Enter commits, Esc reverts.
+        if self.theme_pick.is_some() {
+            let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            match ev.code {
+                KeyCode::Esc => self.theme_pick_cancel(),
+                KeyCode::Enter => self.theme_pick_commit(),
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => self.theme_pick_move(-1),
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => self.theme_pick_move(1),
+                KeyCode::Char('p') if ctrl => self.theme_pick_move(-1),
+                KeyCode::Char('n') if ctrl => self.theme_pick_move(1),
+                _ => {}
             }
             return;
         }
@@ -5455,6 +5563,60 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// The theme picker popup: a bordered list with a live colour swatch per row.
+    /// Selection is a subtle `›` marker + bold name (no heavy highlight bar).
+    fn draw_theme_pick(&self, f: &mut Frame) {
+        let Some(tp) = &self.theme_pick else { return };
+        let th = &self.cfg.theme;
+        let w: u16 = 40;
+        let h: u16 = tp.names.len() as u16 + 4;
+        let x = self.size.0.saturating_sub(w) / 2;
+        let y = self.size.1.saturating_sub(h) / 3;
+        let r = Rect::new(x, y, w.min(self.size.0), h.min(self.size.1));
+        f.render_widget(Clear, r);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.accent))
+            .style(Style::default().bg(th.sidebar_bg))
+            .title(Line::from(Span::styled(
+                " theme ",
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, name) in tp.names.iter().enumerate() {
+            let selected = i == tp.sel;
+            let sw = crate::config::resolve_theme(name).unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(
+                    if selected { " › " } else { "   " },
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{name:<12} "),
+                    if selected {
+                        Style::default()
+                            .fg(th.bar_active_fg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.bar_fg)
+                    },
+                ),
+            ];
+            for c in [sw.accent, sw.working, sw.waiting, sw.done_ok, sw.done_err] {
+                spans.push(Span::styled("█", Style::default().fg(c)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  ↑/↓ preview · enter set · esc cancel",
+            Style::default().fg(th.status_fg),
+        )));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     /// Persistent badge at the top-right while the tmux prefix is armed.
     fn draw_prefix_indicator(&self, f: &mut Frame) {
         if !self.prefix_pending {
@@ -5587,6 +5749,7 @@ impl App {
             self.draw_menu(f);
             self.draw_palette(f);
             self.draw_prompt(f);
+            self.draw_theme_pick(f);
             self.draw_toast(f);
             self.draw_popup(f);
             return;
@@ -5653,6 +5816,7 @@ impl App {
         self.draw_help(f);
         self.draw_palette(f);
         self.draw_prompt(f);
+        self.draw_theme_pick(f);
         self.draw_prefix_indicator(f);
         self.draw_toast(f);
         self.draw_popup(f);
@@ -5725,6 +5889,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         search: None,
         palette: None,
         palette_hits: Vec::new(),
+        theme_pick: None,
         deck: deck_default,
         deck_scroll: 0,
         deck_sel: 0,

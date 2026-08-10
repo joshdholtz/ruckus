@@ -39,6 +39,8 @@ pub enum Action {
     ConnectRemote,
     /// Disconnect the remote whose space you're currently on.
     DisconnectRemote,
+    /// Open the theme picker (built-ins + ~/.ruckus/themes) with live preview.
+    Theme,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -67,6 +69,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::LastSpace, "last_space", &["alt-l"]),
     (Action::ConnectRemote, "connect_remote", &[]),
     (Action::DisconnectRemote, "disconnect_remote", &[]),
+    (Action::Theme, "theme", &[]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
