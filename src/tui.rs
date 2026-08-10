@@ -29,7 +29,7 @@ use crate::layout::{
 };
 use crate::protocol::*;
 use crate::remote;
-use crate::render::{encode_key, encode_mouse_wheel, screen_to_lines};
+use crate::render::{encode_key, encode_mouse_wheel, is_light, screen_to_lines};
 
 /// Below this width the footer switches to compact tap-first chips.
 const FOOTER_COMPACT: u16 = 70;
@@ -4568,7 +4568,15 @@ impl App {
                     f.set_cursor_position((cx, cy));
                     placed_real = true;
                 }
-                let mut lines = screen_to_lines(screen, live && !placed_real, dimmed || exited);
+                // On a light theme the pane surface is light, so terminal-default
+                // (light) text would be invisible — remap it to the theme's body fg.
+                let default_fg = if is_light(th.surface) {
+                    Some(th.bar_active_fg)
+                } else {
+                    None
+                };
+                let mut lines =
+                    screen_to_lines(screen, live && !placed_real, dimmed || exited, default_fg);
                 // Highlight scrollback-search matches on the focused pane: tint any
                 // visible row that contains the query.
                 if focused {
@@ -5683,7 +5691,12 @@ impl App {
         f.render_widget(block, r);
         let p = self.popup.as_ref().unwrap();
         let screen = p.parser.screen();
-        let lines = screen_to_lines(screen, true, false);
+        let default_fg = if is_light(th.surface) {
+            Some(th.bar_active_fg)
+        } else {
+            None
+        };
+        let lines = screen_to_lines(screen, true, false, default_fg);
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(th.surface)),
             inner,

@@ -10,9 +10,26 @@ fn conv_color(c: vt100::Color) -> Option<Color> {
     }
 }
 
+/// Perceived-luminance test (Rec. 601). Non-RGB colours count as dark, so dark
+/// themes keep terminal-native default text (no remap).
+pub fn is_light(c: Color) -> bool {
+    if let Color::Rgb(r, g, b) = c {
+        (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) > 140.0
+    } else {
+        false
+    }
+}
+
 /// Render a vt100 screen into ratatui lines. `cursor` draws the cursor cell
-/// inverted; `dim` renders everything dimmed (for unfocused panes).
-pub fn screen_to_lines(screen: &vt100::Screen, cursor: bool, dim: bool) -> Vec<Line<'static>> {
+/// inverted; `dim` renders everything dimmed (for unfocused panes). `default_fg`
+/// recolours cells that use the terminal's *default* foreground — needed so
+/// plain output stays readable on a light theme's surface (None = leave native).
+pub fn screen_to_lines(
+    screen: &vt100::Screen,
+    cursor: bool,
+    dim: bool,
+    default_fg: Option<Color>,
+) -> Vec<Line<'static>> {
     let (rows, cols) = screen.size();
     let cur = if cursor && !screen.hide_cursor() {
         Some(screen.cursor_position())
@@ -37,8 +54,13 @@ pub fn screen_to_lines(screen: &vt100::Screen, cursor: bool, dim: bool) -> Vec<L
                 text = " ".to_string();
             }
             let mut style = Style::default();
-            if let Some(fg) = conv_color(cell.fgcolor()) {
-                style = style.fg(fg);
+            match conv_color(cell.fgcolor()) {
+                Some(fg) => style = style.fg(fg),
+                None => {
+                    if let Some(dfg) = default_fg {
+                        style = style.fg(dfg);
+                    }
+                }
             }
             if let Some(bg) = conv_color(cell.bgcolor()) {
                 style = style.bg(bg);
