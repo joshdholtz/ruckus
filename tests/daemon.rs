@@ -470,3 +470,56 @@ fn multiple_requests_on_one_connection() {
     }
     assert_eq!(seen, [1, 2, 3].into_iter().collect());
 }
+
+/// Read frames from a proxy's stdout until one with `seq` arrives (skipping
+/// interleaved seqless event frames).
+fn read_seq<R: BufRead>(r: &mut R, seq: u64) -> Value {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(r.read_line(&mut line).unwrap() > 0, "proxy closed");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        if v.get("seq").and_then(Value::as_u64) == Some(seq) {
+            return v;
+        }
+    }
+}
+
+/// The SSH-mirror transport: `ruckus __proxy` relays the daemon socket over
+/// stdio, so a client can read AND write through it (no real SSH needed here).
+#[test]
+fn proxy_relays_read_and_write() {
+    let d = Daemon::start("proxy");
+    let mut proxy = Command::new(bin())
+        .arg("__proxy")
+        .env("RUCKUS_DIR", &d.dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut pin = proxy.stdin.take().unwrap();
+    let mut pout = BufReader::new(proxy.stdout.take().unwrap());
+
+    // read: snapshot through the proxy
+    pin.write_all(b"{\"seq\":1,\"req\":{\"type\":\"snapshot\"}}\n")
+        .unwrap();
+    assert_eq!(read_seq(&mut pout, 1)["msg"]["type"], "state");
+
+    // write: create a space through the proxy...
+    pin.write_all(
+        b"{\"seq\":2,\"req\":{\"type\":\"new_space\",\"name\":\"viaproxy\",\"cwd\":null}}\n",
+    )
+    .unwrap();
+    assert_eq!(read_seq(&mut pout, 2)["msg"]["type"], "created");
+
+    // ...and confirm it landed by hitting the daemon socket directly.
+    let direct = snapshot(&d.dir);
+    assert!(direct["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "viaproxy"));
+
+    let _ = proxy.kill();
+}

@@ -606,6 +606,16 @@ pub enum LinkClick {
     Plain,
 }
 
+/// A remote daemon to mirror into the sidebar (config `[[remote]]`), reached via
+/// `ssh [args] <host> ruckus __proxy`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteSpec {
+    pub host: String,
+    /// Extra ssh options (e.g. `["-p", "2222"]`).
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
@@ -621,6 +631,8 @@ pub struct Config {
     /// Declared plugin refs (`owner/repo[/subpath]`) — installed on startup so a
     /// copied config.toml reproduces your setup on a new machine.
     pub plugins: Vec<String>,
+    /// Remote daemons to mirror into the sidebar over SSH.
+    pub remotes: Vec<RemoteSpec>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -1002,6 +1014,9 @@ struct RawConfig {
     /// Declared plugin refs installed on startup.
     #[serde(default)]
     plugins: Vec<String>,
+    /// Remote daemons to mirror over SSH.
+    #[serde(default)]
+    remote: Vec<RemoteSpec>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -1298,6 +1313,7 @@ impl Config {
             commands,
             links,
             plugins: raw.plugins,
+            remotes: raw.remote,
             theme,
             ui,
             glyphs,
@@ -1374,6 +1390,12 @@ keymap = "tmux"
 #   "joshdholtz/ruckus/plugins/gh-dash",
 #   "joshdholtz/ruckus/plugins/pr-review",
 # ]
+
+# Remote daemons to mirror into your sidebar over SSH — their spaces show up
+# tagged by host and are fully read/write (needs `ruckus` on the remote's PATH).
+# [[remote]]
+# host = "workbox"           # anything `ssh` accepts (alias, user@host, …)
+# args = []                  # extra ssh options, e.g. ["-p", "2222"]
 
 [keys]
 quit = ["alt-q", "ctrl-q"]  # leave the TUI (everything keeps running in the daemon)

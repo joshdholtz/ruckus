@@ -34,9 +34,12 @@ use crate::render::{encode_key, encode_mouse_wheel, screen_to_lines};
 /// One connected daemon (local or a remote over SSH).
 struct Conn {
     client: Client,
-    /// Host label — empty for the local daemon. Shown in the sidebar (R4).
-    #[allow(dead_code)]
+    /// Host label — empty for the local daemon. Shown in the sidebar.
     host: String,
+    /// The `ssh … __proxy` child for a remote; kept alive so the pipe stays open
+    /// (kill_on_drop reaps it when the conn is removed). None for local.
+    #[allow(dead_code)]
+    child: Option<tokio::process::Child>,
 }
 
 /// Below this width the footer switches to compact tap-first chips.
@@ -1236,6 +1239,14 @@ impl App {
     /// Send a request to the daemon that owns its ids (routing by origin), and
     /// re-prefix the reply's ids back to global form. The client's single point
     /// of contact with all daemons.
+    /// The host label for an id's daemon ("" = local).
+    fn host_of(&self, id: u64) -> &str {
+        self.conns
+            .get(&remote::origin_of(id))
+            .map(|c| c.host.as_str())
+            .unwrap_or("")
+    }
+
     async fn route(&self, mut req: Request) -> anyhow::Result<ServerMsg> {
         let origin = remote::route_request(&mut req);
         let conn = self
@@ -3779,9 +3790,16 @@ impl App {
                         } else {
                             th.bar_active_fg
                         };
+                        // Tag remote spaces with their host (e.g. "workbox: api").
+                        let host = self.host_of(s.id);
+                        let disp = if host.is_empty() {
+                            s.name.clone()
+                        } else {
+                            format!("{host}: {}", s.name)
+                        };
                         let vars = vec![
-                            ("name", s.name.clone()),
-                            ("title", s.name.clone()),
+                            ("name", disp.clone()),
+                            ("title", disp),
                             ("id", s.id.to_string()),
                             ("tabs", s.tabs.len().to_string()),
                             (
@@ -5566,7 +5584,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         cfg = Config::load();
     }
     let (client, events) = connect().await?;
-    let snap = client.snapshot().await?;
+    let mut snap = client.snapshot().await?;
 
     let focused = snap
         .spaces
@@ -5597,8 +5615,32 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         Conn {
             client,
             host: String::new(),
+            child: None,
         },
     );
+    // Mirror configured remote daemons over SSH (best-effort — a host that's down
+    // just doesn't show). Origins are assigned 1.. in config order.
+    for (i, r) in cfg.remotes.iter().enumerate() {
+        let origin = (i as Origin) + 1;
+        match crate::client::connect_remote(&r.host, &r.args).await {
+            Ok((rc, rev, child)) => {
+                if let Ok(mut rsnap) = rc.snapshot().await {
+                    remote::prefix_snapshot(&mut rsnap, origin);
+                    remote::merge_snapshot(&mut snap, origin, &rsnap);
+                }
+                spawn_forwarder(origin, rev, mev_tx.clone());
+                conns.insert(
+                    origin,
+                    Conn {
+                        client: rc,
+                        host: r.host.clone(),
+                        child: Some(child),
+                    },
+                );
+            }
+            Err(e) => eprintln!("ruckus: remote {}: {e}", r.host),
+        }
+    }
     let mut app = App {
         cfg,
         conns,
@@ -5832,6 +5874,7 @@ async fn reconnect(
                         Conn {
                             client,
                             host: String::new(),
+                            child: None,
                         },
                     );
                     spawn_forwarder(remote::LOCAL, events, mev_tx.clone());

@@ -30,6 +30,9 @@ struct Cli {
 enum Cmd {
     /// Run the daemon in the foreground (normally started automatically)
     Daemon,
+    /// Internal: relay this box's daemon socket over stdio (used over SSH)
+    #[command(name = "__proxy", hide = true)]
+    Proxy,
     /// List spaces, tabs, and panes
     Ls,
     /// Create a new tab running CMD (defaults to your shell) and open the TUI on it
@@ -171,6 +174,7 @@ async fn main() -> Result<()> {
     match cli.cmd {
         None => tui::run(None).await,
         Some(Cmd::Daemon) => daemon::run().await,
+        Some(Cmd::Proxy) => client::proxy().await,
         Some(Cmd::Ls) => ls().await,
         Some(Cmd::New { name, detach, cmd }) => new_tab(name, detach, cmd).await,
         Some(Cmd::NewSpace { name }) => new_space(name).await,

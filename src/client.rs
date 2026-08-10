@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -18,19 +18,23 @@ pub struct Client {
     seq: AtomicU64,
 }
 
-pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
-    let stream = UnixStream::connect(socket_path()).await?;
-    let (read_half, mut write_half) = stream.into_split();
-
+/// Speak the JSON-RPC protocol over any framed reader + writer. Used for the
+/// local unix socket and for a remote daemon reached over an SSH stdio pipe.
+pub fn connect_io<R, W>(read: R, mut write: W) -> (Client, UnboundedReceiver<ServerMsg>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (out_tx, mut out_rx) = unbounded_channel::<String>();
     tokio::spawn(async move {
         while let Some(line) = out_rx.recv().await {
-            if write_half.write_all(line.as_bytes()).await.is_err() {
+            if write.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
-            if write_half.write_all(b"\n").await.is_err() {
+            if write.write_all(b"\n").await.is_err() {
                 break;
             }
+            let _ = write.flush().await;
         }
     });
 
@@ -39,7 +43,7 @@ pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
         Arc::new(Mutex::new(HashMap::new()));
     let p2 = pending.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(read_half).lines();
+        let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let frame = match serde_json::from_str::<ServerFrame>(&line) {
                 Ok(f) => f,
@@ -65,14 +69,58 @@ pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
         }
     });
 
-    Ok((
+    (
         Client {
             tx: out_tx,
             pending,
             seq: AtomicU64::new(1),
         },
         ev_rx,
-    ))
+    )
+}
+
+pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
+    let stream = UnixStream::connect(socket_path()).await?;
+    let (read_half, write_half) = stream.into_split();
+    Ok(connect_io(read_half, write_half))
+}
+
+/// Connect to a remote daemon over SSH: `ssh [args] <host> ruckus __proxy`
+/// relays the remote's unix socket over stdio. Returns the child so the caller
+/// can kill it on disconnect. Reuses SSH auth — no ports, no new protocol.
+pub async fn connect_remote(
+    host: &str,
+    args: &[String],
+) -> Result<(Client, UnboundedReceiver<ServerMsg>, tokio::process::Child)> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.args(args)
+        .arg(host)
+        .arg("ruckus")
+        .arg("__proxy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| anyhow!("ssh {host}: {e}"))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    let (client, ev) = connect_io(stdout, stdin);
+    Ok((client, ev, child))
+}
+
+/// The remote side of `connect_remote`: relay this box's daemon socket over
+/// stdin/stdout (invoked as `ruckus __proxy` over SSH). Starts the daemon first.
+pub async fn proxy() -> Result<()> {
+    ensure_daemon().await?;
+    let stream = UnixStream::connect(socket_path()).await?;
+    let (mut sr, mut sw) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    tokio::select! {
+        _ = tokio::io::copy(&mut stdin, &mut sw) => {}
+        _ = tokio::io::copy(&mut sr, &mut stdout) => {}
+    }
+    Ok(())
 }
 
 impl Client {
