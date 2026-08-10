@@ -35,6 +35,8 @@ pub enum Action {
     LastPane,
     /// Jump back to the previously-active space (tmux last-window).
     LastSpace,
+    /// Prompt for a host and mirror its ruckus over SSH (ephemeral).
+    ConnectRemote,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -61,6 +63,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::Deck, "deck", &["alt-d"]),
     (Action::LastPane, "last_pane", &["alt-;"]),
     (Action::LastSpace, "last_space", &["alt-l"]),
+    (Action::ConnectRemote, "connect_remote", &[]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of

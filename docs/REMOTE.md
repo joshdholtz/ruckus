@@ -5,13 +5,18 @@ remote box's spaces show in your sidebar and are **fully read/write** — view
 panes, send input, split, create, close — exactly like local ones.
 
 Status: **working (R0–R5 landed).** Remote spaces mirror into the sidebar and
-are fully read/write. Remaining polish: auto-reconnect a dropped remote (today
-it drops its spaces; `ruckus reload` re-mirrors it).
+are fully read/write. Connecting is in the background (a slow/dead SSH never
+stalls the UI) and dropped remotes **auto-reconnect**.
 
 ## Using it
 
-On the remote box: `ruckus` must be on `$PATH` (it starts its own daemon). Then
-in your **local** `~/.ruckus/config.toml`:
+The remote box just needs `ruckus` on `$PATH` (it starts its own daemon).
+
+**Runtime (the normal way — remotes are ephemeral):** run the **`connect remote`**
+action (command palette, or bind a key to it) → type an ssh host → it mirrors in.
+Gone on restart; auto-reconnects if the link drops while running.
+
+**Config (optional — for the ones you always want auto-connected):**
 
 ```toml
 [[remote]]
@@ -19,9 +24,12 @@ host = "workbox"        # anything ssh accepts (alias, user@host)
 args = []               # extra ssh opts, e.g. ["-p", "2222"]
 ```
 
-Launch (or `ruckus reload`) — `workbox`'s spaces appear in your sidebar tagged
-`workbox: …`, and you can view/type/split them like local ones. A down host is
-skipped; SSH handles auth (mosh is orthogonal — your link, not the mirror's).
+Either way, the host's spaces appear in your sidebar tagged `workbox: …` and are
+view/type/split like local ones. SSH handles auth (mosh is orthogonal — your
+link, not the mirror's).
+
+Follow-up: a runtime **disconnect** (today a runtime-added remote persists +
+auto-reconnects until you quit; config-removed ones stay until restart).
 
 ## Core decision: origin-encoded `u64` ids
 

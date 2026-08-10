@@ -65,6 +65,10 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
     (Action::PrevSpace, "previous space"),
     (Action::LastPane, "last pane (jump back)"),
     (Action::LastSpace, "last space (jump back)"),
+    (
+        Action::ConnectRemote,
+        "connect remote (mirror a box over SSH)",
+    ),
     (Action::ToggleSidebar, "toggle sidebar"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
@@ -567,6 +571,8 @@ enum PromptKind {
     Search,
     /// Free-text reply into the focused pane (mobile triage / soft keyboard).
     Reply,
+    /// Host to mirror over SSH (runtime `connect remote`).
+    ConnectRemote,
 }
 
 /// A modal single-line text input (naming a new/renamed space or tab).
@@ -681,8 +687,15 @@ struct App {
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
     popup_tx: UnboundedSender<Vec<u8>>,
-    /// Merged daemon-event channel — lets the app (re)connect remotes on reload.
+    /// Merged daemon-event channel — background connectors forward through it.
     mev_tx: UnboundedSender<(Origin, Option<ServerMsg>)>,
+    /// Known remotes (origin → host/args), whether or not currently connected.
+    /// Populated from config + runtime `connect remote`; drives auto-reconnect.
+    remotes: std::collections::BTreeMap<Origin, crate::config::RemoteSpec>,
+    /// Where a background connector reports a (re)established remote.
+    conn_tx: UnboundedSender<ConnUp>,
+    /// Remotes with an in-flight connect attempt (dedups retries).
+    connecting: HashSet<Origin>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     /// Triage chips: (action, row, col range).
     action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
@@ -1241,39 +1254,49 @@ impl App {
     /// Send a request to the daemon that owns its ids (routing by origin), and
     /// re-prefix the reply's ids back to global form. The client's single point
     /// of contact with all daemons.
-    /// Connect any configured remote daemons that aren't connected yet (startup
-    /// or after `ruckus reload`). Origins are stable by config order, so a host
-    /// keeps the same origin across reconnects. Best-effort — a down host is
-    /// skipped. A short ConnectTimeout keeps a dead host from hanging the UI.
-    async fn connect_remotes(&mut self) {
-        for i in 0..self.cfg.remotes.len() {
-            let origin = (i as Origin) + 1;
-            if self.conns.contains_key(&origin) {
-                continue;
-            }
-            let r = self.cfg.remotes[i].clone();
-            let mut args = vec!["-o".to_string(), "ConnectTimeout=6".to_string()];
-            args.extend(r.args.clone());
-            match crate::client::connect_remote(&r.host, &args).await {
-                Ok((rc, rev, child)) => {
-                    if let Ok(mut rsnap) = rc.snapshot().await {
-                        remote::prefix_snapshot(&mut rsnap, origin);
-                        remote::merge_snapshot(&mut self.snap, origin, &rsnap);
-                    }
-                    spawn_forwarder(origin, rev, self.mev_tx.clone());
-                    self.conns.insert(
-                        origin,
-                        Conn {
-                            client: rc,
-                            host: r.host.clone(),
-                            child: Some(child),
-                        },
-                    );
-                    self.notify(format!("mirrored {}", r.host));
-                }
-                Err(e) => self.toast(e.to_string()),
-            }
+    /// Kick off a background connect for every known remote that isn't connected
+    /// (and isn't already being attempted). Non-blocking — a dead host can't stall
+    /// the UI. Called on startup, on reload, and on a slow retry ticker.
+    fn retry_remotes(&mut self) {
+        let todo: Vec<(Origin, crate::config::RemoteSpec)> = self
+            .remotes
+            .iter()
+            .filter(|(o, _)| !self.conns.contains_key(o) && !self.connecting.contains(o))
+            .map(|(o, s)| (*o, s.clone()))
+            .collect();
+        for (o, s) in todo {
+            self.connecting.insert(o);
+            spawn_connect(o, s, self.conn_tx.clone());
         }
+    }
+
+    /// Register a remote (config or runtime `connect remote`) under a stable
+    /// origin (deduped by host) and start connecting it.
+    fn add_remote(&mut self, spec: crate::config::RemoteSpec) {
+        if self.remotes.values().any(|r| r.host == spec.host) {
+            self.retry_remotes(); // known already — just (re)connect it
+            return;
+        }
+        let origin = self.remotes.keys().last().copied().unwrap_or(0) + 1;
+        self.remotes.insert(origin, spec);
+        self.retry_remotes();
+    }
+
+    /// A background connector established a remote — merge it into the view.
+    fn on_conn_up(&mut self, mut up: ConnUp) {
+        self.connecting.remove(&up.origin);
+        remote::prefix_snapshot(&mut up.snapshot, up.origin);
+        remote::merge_snapshot(&mut self.snap, up.origin, &up.snapshot);
+        spawn_forwarder(up.origin, up.events, self.mev_tx.clone());
+        self.conns.insert(
+            up.origin,
+            Conn {
+                client: up.client,
+                host: up.host.clone(),
+                child: Some(up.child),
+            },
+        );
+        self.notify(format!("mirrored {}", up.host));
     }
 
     /// The host label for an id's daemon ("" = local).
@@ -1688,6 +1711,7 @@ impl App {
                     .unwrap_or_default(),
             ),
             PromptKind::Search => ("search scrollback", String::new()),
+            PromptKind::ConnectRemote => ("mirror host (ssh alias / user@host)", String::new()),
         };
         self.prompt = Some(Prompt {
             kind,
@@ -1783,6 +1807,15 @@ impl App {
                     let mut bytes = name.into_bytes();
                     bytes.push(b'\n');
                     self.send_bytes(&bytes).await;
+                }
+            }
+            PromptKind::ConnectRemote => {
+                if !name.is_empty() {
+                    self.notify(format!("connecting {name}…"));
+                    self.add_remote(crate::config::RemoteSpec {
+                        host: name,
+                        args: Vec::new(),
+                    });
                 }
             }
         }
@@ -1947,6 +1980,7 @@ impl App {
                     }
                 }
             }
+            Action::ConnectRemote => self.open_prompt(PromptKind::ConnectRemote),
         }
     }
 
@@ -3257,7 +3291,12 @@ impl App {
                 let _ = crossterm::execute!(out, DisableMouseCapture);
             }
         }
-        self.connect_remotes().await; // pick up newly-declared / dropped remotes
+        // Pick up newly config-declared remotes, then (re)connect anything missing.
+        let specs: Vec<crate::config::RemoteSpec> = self.cfg.remotes.clone();
+        for spec in specs {
+            self.add_remote(spec);
+        }
+        self.retry_remotes();
         self.sync().await;
         self.toast("config reloaded");
     }
@@ -5646,6 +5685,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     // All daemons' events fan into one channel tagged by origin; a `None` payload
     // means that daemon dropped (triggering a reconnect for that origin).
     let (mev_tx, mut mev_rx) = unbounded_channel::<(Origin, Option<ServerMsg>)>();
+    let (conn_tx, mut conn_rx) = unbounded_channel::<ConnUp>();
     spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
     let mut conns = std::collections::BTreeMap::new();
     conns.insert(
@@ -5656,10 +5696,21 @@ pub async fn run(initial: Option<String>) -> Result<()> {
             child: None,
         },
     );
+    // Config-declared remotes are known from the start (origins 1..); runtime
+    // `connect remote` adds more. Connecting happens in the background.
+    let remotes: std::collections::BTreeMap<Origin, crate::config::RemoteSpec> = cfg
+        .remotes
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((i as Origin) + 1, r.clone()))
+        .collect();
     let mut app = App {
         cfg,
         conns,
         mev_tx: mev_tx.clone(),
+        remotes,
+        conn_tx,
+        connecting: HashSet::new(),
         snap,
         views: HashMap::new(),
         focused,
@@ -5753,7 +5804,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         hook(info);
     }));
 
-    app.connect_remotes().await; // mirror configured remotes (best-effort)
+    app.retry_remotes(); // start connecting configured remotes in the background
     app.sync().await;
 
     let (in_tx, mut in_rx) = unbounded_channel::<Event>();
@@ -5778,6 +5829,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_millis(spinner_ms));
     let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
+    let mut remote_ticker = tokio::time::interval(Duration::from_secs(5)); // auto-reconnect
     app.refresh_status_cmds().await; // populate #(command) segments up front
     while app.running {
         terminal.draw(|f| app.draw(f))?;
@@ -5799,8 +5851,12 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                     }
                 }
                 Some((origin, None)) => {
-                    // A remote daemon dropped — drop its spaces; R4 will reconnect.
-                    app.conns.remove(&origin);
+                    // A remote dropped — drop its spaces but keep it known, so the
+                    // retry ticker reconnects it in the background.
+                    if let Some(c) = app.conns.remove(&origin) {
+                        app.toast(format!("{} disconnected", c.host));
+                    }
+                    app.connecting.remove(&origin);
                     app.snap.spaces.retain(|s| remote::origin_of(s.id) != origin);
                     app.snap.panes.retain(|p| remote::origin_of(p.id) != origin);
                 }
@@ -5815,6 +5871,13 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 }
                 None => {}
             },
+            up = conn_rx.recv() => {
+                if let Some(up) = up {
+                    app.on_conn_up(up);
+                    app.sync().await;
+                }
+            },
+            _ = remote_ticker.tick() => app.retry_remotes(),
             _ = ticker.tick() => app.on_tick(),
             _ = status_ticker.tick() => app.refresh_status_cmds().await,
         }
@@ -5844,6 +5907,39 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// A remote (re)connected — reported by a background connector to the loop.
+struct ConnUp {
+    origin: Origin,
+    host: String,
+    client: Client,
+    events: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+    child: tokio::process::Child,
+    snapshot: Snapshot,
+}
+
+/// Connect a remote in the background (so a hung/slow SSH never stalls the UI)
+/// and report success back through `tx`. A short ConnectTimeout bounds a dead
+/// host; on failure nothing is sent and the retry ticker tries again.
+fn spawn_connect(origin: Origin, spec: crate::config::RemoteSpec, tx: UnboundedSender<ConnUp>) {
+    tokio::spawn(async move {
+        let mut args = vec!["-o".to_string(), "ConnectTimeout=6".to_string()];
+        args.extend(spec.args.clone());
+        if let Ok((client, events, child)) = crate::client::connect_remote(&spec.host, &args).await
+        {
+            if let Ok(snapshot) = client.snapshot().await {
+                let _ = tx.send(ConnUp {
+                    origin,
+                    host: spec.host,
+                    client,
+                    events,
+                    child,
+                    snapshot,
+                });
+            }
+        }
+    });
 }
 
 /// Forward one daemon's event stream into the merged channel, tagged by origin.
