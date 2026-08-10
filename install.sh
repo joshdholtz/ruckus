@@ -46,12 +46,20 @@ asset="ruckus-${VERSION}-${target}.tar.gz"
 url="https://github.com/$REPO/releases/download/${VERSION}/${asset}"
 
 # --- choose install dir ---
+# Prefer a home bin dir that's ALREADY on PATH (no profile edit, no symlink
+# needed); only fall back to ~/.local/bin (which ensure_path will wire up).
+pick_home_dir() {
+  for d in "$HOME/.local/bin" "$HOME/bin"; do
+    case ":$PATH:" in *":$d:"*) printf '%s' "$d"; return 0 ;; esac
+  done
+  printf '%s' "$HOME/.local/bin"
+}
 if [ -n "${RUCKUS_INSTALL_DIR:-}" ]; then
   dir="$RUCKUS_INSTALL_DIR"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
   dir="/usr/local/bin"
 else
-  dir="$HOME/.local/bin"
+  dir="$(pick_home_dir)"
 fi
 mkdir -p "$dir"
 
