@@ -4,8 +4,24 @@
 remote box's spaces show in your sidebar and are **fully read/write** — view
 panes, send input, split, create, close — exactly like local ones.
 
-Status: building, test-first. Phases below land green (with their tests) one at
-a time.
+Status: **working (R0–R5 landed).** Remote spaces mirror into the sidebar and
+are fully read/write. Remaining polish: auto-reconnect a dropped remote (today
+it drops its spaces; `ruckus reload` re-mirrors it).
+
+## Using it
+
+On the remote box: `ruckus` must be on `$PATH` (it starts its own daemon). Then
+in your **local** `~/.ruckus/config.toml`:
+
+```toml
+[[remote]]
+host = "workbox"        # anything ssh accepts (alias, user@host)
+args = []               # extra ssh opts, e.g. ["-p", "2222"]
+```
+
+Launch (or `ruckus reload`) — `workbox`'s spaces appear in your sidebar tagged
+`workbox: …`, and you can view/type/split them like local ones. A down host is
+skipped; SSH handles auth (mosh is orthogonal — your link, not the mirror's).
 
 ## Core decision: origin-encoded `u64` ids
 
@@ -74,7 +90,10 @@ byte-for-byte unchanged** — that's what keeps this safe.
 | **R2** | multi-stream loop; merge snapshots by origin | two local daemons merged, ids don't collide |
 | **R3** | `ruckus __proxy` + spawn transport | full **read/write** over a local byte-copy proxy to a 2nd `RUCKUS_DIR` (SSH substitute): attach, send input, split remote |
 | **R4** | `[[remote]]` config, sidebar host tags, per-conn reconnect | connect/merge/disconnect lifecycle |
-| **R5** | polish: per-host status, latency/drop handling | reconnect + partial failure |
+| **R5** | connect_remotes on startup + `ruckus reload`; ConnectTimeout; host-stable origins | (manual reconnect via reload) |
+
+All landed. Follow-up: auto-reconnect a dropped remote in the background
+(needs a non-blocking per-conn retry task so a hung SSH can't stall the UI).
 
 ## Test harness
 

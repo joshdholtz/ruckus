@@ -175,6 +175,7 @@ Capabilities are declared in the manifest and surfaced by `ruckus plugin list`, 
 - [x] JSON-RPC socket + lifecycle **event stream** + `RUCKUS_*` context env
 - [x] plugin system: `ruckus plugin install/link/sync`, manifests, config-declared portable setup
 - [x] agent CLI (status/send/split/config/events…), cwd-aware splits, bracketed paste, mouse forwarding
+- [x] remote mirror: `[[remote]]` daemons over SSH, merged into the sidebar, full read/write (docs/REMOTE.md)
 - [ ] `[[event]]` handlers (run a command on an event) + capability enforcement
 - [ ] plugin-rendered pane UI / native widgets
-- [ ] remote transport (TCP + auth) → native phone / web clients
+- [ ] auto-reconnect dropped remotes; native phone / web clients

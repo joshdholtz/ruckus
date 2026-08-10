@@ -681,6 +681,8 @@ struct App {
     popup: Option<Popup>,
     /// Channel a popup's reader thread pushes output to.
     popup_tx: UnboundedSender<Vec<u8>>,
+    /// Merged daemon-event channel — lets the app (re)connect remotes on reload.
+    mev_tx: UnboundedSender<(Origin, Option<ServerMsg>)>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
     /// Triage chips: (action, row, col range).
     action_hits: Vec<(ChipAction, u16, std::ops::Range<u16>)>,
@@ -1239,6 +1241,41 @@ impl App {
     /// Send a request to the daemon that owns its ids (routing by origin), and
     /// re-prefix the reply's ids back to global form. The client's single point
     /// of contact with all daemons.
+    /// Connect any configured remote daemons that aren't connected yet (startup
+    /// or after `ruckus reload`). Origins are stable by config order, so a host
+    /// keeps the same origin across reconnects. Best-effort — a down host is
+    /// skipped. A short ConnectTimeout keeps a dead host from hanging the UI.
+    async fn connect_remotes(&mut self) {
+        for i in 0..self.cfg.remotes.len() {
+            let origin = (i as Origin) + 1;
+            if self.conns.contains_key(&origin) {
+                continue;
+            }
+            let r = self.cfg.remotes[i].clone();
+            let mut args = vec!["-o".to_string(), "ConnectTimeout=6".to_string()];
+            args.extend(r.args.clone());
+            match crate::client::connect_remote(&r.host, &args).await {
+                Ok((rc, rev, child)) => {
+                    if let Ok(mut rsnap) = rc.snapshot().await {
+                        remote::prefix_snapshot(&mut rsnap, origin);
+                        remote::merge_snapshot(&mut self.snap, origin, &rsnap);
+                    }
+                    spawn_forwarder(origin, rev, self.mev_tx.clone());
+                    self.conns.insert(
+                        origin,
+                        Conn {
+                            client: rc,
+                            host: r.host.clone(),
+                            child: Some(child),
+                        },
+                    );
+                    self.notify(format!("mirrored {}", r.host));
+                }
+                Err(e) => self.toast(e.to_string()),
+            }
+        }
+    }
+
     /// The host label for an id's daemon ("" = local).
     fn host_of(&self, id: u64) -> &str {
         self.conns
@@ -3220,6 +3257,7 @@ impl App {
                 let _ = crossterm::execute!(out, DisableMouseCapture);
             }
         }
+        self.connect_remotes().await; // pick up newly-declared / dropped remotes
         self.sync().await;
         self.toast("config reloaded");
     }
@@ -5584,7 +5622,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         cfg = Config::load();
     }
     let (client, events) = connect().await?;
-    let mut snap = client.snapshot().await?;
+    let snap = client.snapshot().await?;
 
     let focused = snap
         .spaces
@@ -5618,32 +5656,10 @@ pub async fn run(initial: Option<String>) -> Result<()> {
             child: None,
         },
     );
-    // Mirror configured remote daemons over SSH (best-effort — a host that's down
-    // just doesn't show). Origins are assigned 1.. in config order.
-    for (i, r) in cfg.remotes.iter().enumerate() {
-        let origin = (i as Origin) + 1;
-        match crate::client::connect_remote(&r.host, &r.args).await {
-            Ok((rc, rev, child)) => {
-                if let Ok(mut rsnap) = rc.snapshot().await {
-                    remote::prefix_snapshot(&mut rsnap, origin);
-                    remote::merge_snapshot(&mut snap, origin, &rsnap);
-                }
-                spawn_forwarder(origin, rev, mev_tx.clone());
-                conns.insert(
-                    origin,
-                    Conn {
-                        client: rc,
-                        host: r.host.clone(),
-                        child: Some(child),
-                    },
-                );
-            }
-            Err(e) => eprintln!("ruckus: remote {}: {e}", r.host),
-        }
-    }
     let mut app = App {
         cfg,
         conns,
+        mev_tx: mev_tx.clone(),
         snap,
         views: HashMap::new(),
         focused,
@@ -5737,6 +5753,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         hook(info);
     }));
 
+    app.connect_remotes().await; // mirror configured remotes (best-effort)
     app.sync().await;
 
     let (in_tx, mut in_rx) = unbounded_channel::<Event>();
