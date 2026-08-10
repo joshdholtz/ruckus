@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod layout;
 mod protocol;
+mod remote;
 mod render;
 mod tui;
 
