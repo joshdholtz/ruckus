@@ -696,8 +696,8 @@ struct App {
     /// Known remotes (origin → host/args), whether or not currently connected.
     /// Populated from config + runtime `connect remote`; drives auto-reconnect.
     remotes: std::collections::BTreeMap<Origin, crate::config::RemoteSpec>,
-    /// Where a background connector reports a (re)established remote.
-    conn_tx: UnboundedSender<ConnUp>,
+    /// Where a background connector reports a remote connect outcome.
+    conn_tx: UnboundedSender<ConnMsg>,
     /// Remotes with an in-flight connect attempt (dedups retries).
     connecting: HashSet<Origin>,
     footer_hits: Vec<(Action, std::ops::Range<u16>)>,
@@ -5707,6 +5707,8 @@ impl App {
 }
 
 pub async fn run(initial: Option<String>) -> Result<()> {
+    crate::client::init_client_log();
+    tracing::info!("ruckus tui starting");
     ensure_daemon().await?;
     let mut cfg = Config::load();
     // Install any config-declared plugins that aren't present yet (fresh machine),
@@ -5739,7 +5741,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     // All daemons' events fan into one channel tagged by origin; a `None` payload
     // means that daemon dropped (triggering a reconnect for that origin).
     let (mev_tx, mut mev_rx) = unbounded_channel::<(Origin, Option<ServerMsg>)>();
-    let (conn_tx, mut conn_rx) = unbounded_channel::<ConnUp>();
+    let (conn_tx, mut conn_rx) = unbounded_channel::<ConnMsg>();
     spawn_forwarder(remote::LOCAL, events, mev_tx.clone());
     let mut conns = std::collections::BTreeMap::new();
     conns.insert(
@@ -5925,11 +5927,18 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                 }
                 None => {}
             },
-            up = conn_rx.recv() => {
-                if let Some(up) = up {
-                    app.on_conn_up(up);
+            up = conn_rx.recv() => match up {
+                Some(ConnMsg::Up(up)) => {
+                    let host = up.host.clone();
+                    app.on_conn_up(*up);
                     app.sync().await;
+                    app.notify(format!("mirrored {host}"));
                 }
+                Some(ConnMsg::Failed { origin, host, error }) => {
+                    app.connecting.remove(&origin);
+                    app.notify(format!("connect {host} failed — {error} (see ~/.ruckus/client.log)"));
+                }
+                None => {}
             },
             _ = remote_ticker.tick() => app.retry_remotes(),
             _ = ticker.tick() => app.on_tick(),
@@ -5973,25 +5982,54 @@ struct ConnUp {
     snapshot: Snapshot,
 }
 
+/// Outcome of a background connect attempt. `Up` boxed because it's large.
+enum ConnMsg {
+    Up(Box<ConnUp>),
+    Failed {
+        origin: Origin,
+        host: String,
+        error: String,
+    },
+}
+
 /// Connect a remote in the background (so a hung/slow SSH never stalls the UI)
-/// and report success back through `tx`. A short ConnectTimeout bounds a dead
-/// host; on failure nothing is sent and the retry ticker tries again.
-fn spawn_connect(origin: Origin, spec: crate::config::RemoteSpec, tx: UnboundedSender<ConnUp>) {
+/// and report the outcome back through `tx`. A short ConnectTimeout bounds a
+/// dead host; every failure is logged (client.log) AND surfaced as a toast so
+/// `connect remote` can never silently do nothing.
+fn spawn_connect(origin: Origin, spec: crate::config::RemoteSpec, tx: UnboundedSender<ConnMsg>) {
     tokio::spawn(async move {
         let mut args = vec!["-o".to_string(), "ConnectTimeout=6".to_string()];
         args.extend(spec.args.clone());
-        if let Ok((client, events, child)) = crate::client::connect_remote(&spec.host, &args).await
-        {
-            if let Ok(snapshot) = client.snapshot().await {
-                let _ = tx.send(ConnUp {
-                    origin,
-                    host: spec.host,
-                    client,
-                    events,
-                    child,
-                    snapshot,
-                });
-            }
+        tracing::info!(origin, "connect remote: starting {}", spec.host);
+        let fail = |tx: &UnboundedSender<ConnMsg>, error: String| {
+            tracing::warn!(origin, "connect remote {} failed: {error}", spec.host);
+            let _ = tx.send(ConnMsg::Failed {
+                origin,
+                host: spec.host.clone(),
+                error,
+            });
+        };
+        match crate::client::connect_remote(&spec.host, &args).await {
+            Ok((client, events, child)) => match client.snapshot().await {
+                Ok(snapshot) => {
+                    tracing::info!(
+                        origin,
+                        spaces = snapshot.spaces.len(),
+                        "connect remote: {} mirrored",
+                        spec.host
+                    );
+                    let _ = tx.send(ConnMsg::Up(Box::new(ConnUp {
+                        origin,
+                        host: spec.host,
+                        client,
+                        events,
+                        child,
+                        snapshot,
+                    })));
+                }
+                Err(e) => fail(&tx, format!("snapshot: {e:#}")),
+            },
+            Err(e) => fail(&tx, format!("ssh: {e:#}")),
         }
     });
 }

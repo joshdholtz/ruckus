@@ -85,6 +85,25 @@ pub async fn connect() -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
     Ok(connect_io(read_half, write_half))
 }
 
+/// Initialise client-side logging to `~/.ruckus/client.log`. The TUI otherwise
+/// logs nowhere, so the connect/remote path was invisible. Idempotent (safe if
+/// a subscriber is already installed). Level via `RUCKUS_LOG` (default info).
+pub fn init_client_log() {
+    let dir = crate::protocol::ruckus_dir();
+    if let Ok(logfile) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("client.log"))
+    {
+        let level = std::env::var("RUCKUS_LOG").unwrap_or_else(|_| "info".into());
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(level.parse().unwrap_or(tracing::Level::INFO))
+            .with_writer(Mutex::new(logfile))
+            .try_init();
+    }
+}
+
 /// Connect to a remote daemon over SSH: `ssh [args] <host> ruckus __proxy`
 /// relays the remote's unix socket over stdio. Returns the child so the caller
 /// can kill it on disconnect. Reuses SSH auth — no ports, no new protocol.
@@ -99,11 +118,31 @@ pub async fn connect_remote(
         .arg("__proxy")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
+    tracing::info!(
+        "connect_remote: spawning `ssh {} {host} ruckus __proxy`",
+        args.join(" ")
+    );
     let mut child = cmd.spawn().map_err(|e| anyhow!("ssh {host}: {e}"))?;
+    tracing::info!(
+        pid = child.id().unwrap_or(0),
+        "connect_remote: ssh spawned for {host}"
+    );
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    // Drain ssh stderr into the log. Without this a swallowed auth / host-key /
+    // PATH / "ruckus: command not found" error is invisible — the child just
+    // dies within ~1s and nothing explains why.
+    if let Some(stderr) = child.stderr.take() {
+        let host = host.to_string();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!("ssh[{host}] stderr: {line}");
+            }
+        });
+    }
     let (client, ev) = connect_io(stdout, stdin);
     Ok((client, ev, child))
 }
