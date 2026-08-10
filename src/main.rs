@@ -106,6 +106,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Manage plugins (a folder with a ruckus-plugin.toml adding binds/links)
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
     /// List built-in themes, or switch to one: `ruckus theme nord`
     Theme { name: Option<String> },
     /// Show or switch the base keymap: `ruckus keymap tmux` (or alt / both)
@@ -128,6 +133,20 @@ enum ConfigCmd {
     /// Delete a key (falls back to the built-in default)
     Unset { key: String },
     /// Print the config file path
+    Path,
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// List installed plugins
+    List,
+    /// Symlink a local plugin directory into the plugins folder (dev)
+    Link { path: String },
+    /// Install a plugin from a GitHub repo: `ruckus plugin install owner/repo`
+    Install { repo: String },
+    /// Remove an installed plugin by name
+    Remove { name: String },
+    /// Print the plugins directory path
     Path,
 }
 
@@ -173,6 +192,7 @@ async fn main() -> Result<()> {
             simple_req(Request::ReportAgent { pane, name }, "reported").await
         }
         Some(Cmd::Config { cmd }) => config_cmd(cmd).await,
+        Some(Cmd::Plugin { cmd }) => plugin_cmd(cmd).await,
         Some(Cmd::Theme { name }) => theme_cmd(name).await,
         Some(Cmd::Keymap { name }) => keymap_cmd(name).await,
         Some(Cmd::Reload) => reload().await,
@@ -373,6 +393,93 @@ async fn restart(target: String) -> Result<()> {
     let pane = resolve_pane(&snap, &target)?;
     client.request(Request::Restart { pane: pane.id }).await?;
     println!("pane {} restarted", pane.id);
+    Ok(())
+}
+
+async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
+    use config::{list_plugins, plugins_dir};
+    let dir = plugins_dir();
+    std::fs::create_dir_all(&dir).ok();
+    match cmd {
+        PluginCmd::Path => println!("{}", dir.display()),
+        PluginCmd::List => {
+            let plugins = list_plugins();
+            if plugins.is_empty() {
+                println!("no plugins installed ({}) ", dir.display());
+                println!("install one: ruckus plugin install owner/repo");
+            }
+            for p in plugins {
+                let caps = if p.capabilities.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", p.capabilities.join(", "))
+                };
+                let ver = if p.version.is_empty() { String::new() } else { format!(" v{}", p.version) };
+                let alias = if p.name != p.id { format!(" ({})", p.name) } else { String::new() };
+                println!("• {}{alias}{ver}  — {} binds, {} links{caps}", p.id, p.binds, p.links);
+                if !p.description.is_empty() {
+                    println!("    {}", p.description);
+                }
+            }
+        }
+        PluginCmd::Link { path } => {
+            let src = std::fs::canonicalize(&path)?;
+            if !src.join("ruckus-plugin.toml").exists() {
+                anyhow::bail!("{}: no ruckus-plugin.toml", src.display());
+            }
+            let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin");
+            let dst = dir.join(name);
+            if dst.exists() {
+                anyhow::bail!("{} already installed (ruckus plugin remove {name})", name);
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&src, &dst)?;
+            println!("linked {name} → {}", src.display());
+            println!("run `ruckus reload` to pick it up");
+        }
+        PluginCmd::Install { repo } => {
+            let name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+            let dst = dir.join(&name);
+            if dst.exists() {
+                anyhow::bail!("{name} already installed (ruckus plugin remove {name})");
+            }
+            let url = if repo.starts_with("http") || repo.contains("://") {
+                repo.clone()
+            } else {
+                format!("https://github.com/{repo}")
+            };
+            let status = std::process::Command::new("git")
+                .args(["clone", "--depth", "1", &url])
+                .arg(&dst)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("git clone failed");
+            }
+            if !dst.join("ruckus-plugin.toml").exists() {
+                std::fs::remove_dir_all(&dst).ok();
+                anyhow::bail!("{name}: no ruckus-plugin.toml — not a ruckus plugin");
+            }
+            println!("installed {name}");
+            println!("run `ruckus reload` to pick it up");
+        }
+        PluginCmd::Remove { name } => {
+            // Accept the directory handle or the manifest name.
+            let target = if dir.join(&name).exists() {
+                dir.join(&name)
+            } else if let Some(p) = list_plugins().into_iter().find(|p| p.name == name) {
+                p.path
+            } else {
+                anyhow::bail!("no plugin {name}");
+            };
+            // symlink (dev link) vs real dir (installed)
+            if target.symlink_metadata()?.file_type().is_symlink() {
+                std::fs::remove_file(&target)?;
+            } else {
+                std::fs::remove_dir_all(&target)?;
+            }
+            println!("removed {name}");
+        }
+    }
     Ok(())
 }
 

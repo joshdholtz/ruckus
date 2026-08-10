@@ -657,6 +657,111 @@ struct RawLink {
     run: String,
 }
 
+/// Lower `[[bind]]` entries (config or plugin manifest) into command shortcuts.
+fn lower_binds(raw: &[RawBind]) -> Vec<CommandBind> {
+    raw.iter()
+        .filter_map(|b| {
+            let binding = parse_binding(&b.key).ok()?;
+            let cmd: Vec<String> = b.run.split_whitespace().map(String::from).collect();
+            if cmd.is_empty() {
+                return None;
+            }
+            let placement = match b.place.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("down") | Some("split-down") | Some("v") => Placement::SplitDown,
+                Some("tab") | Some("window") => Placement::Tab,
+                Some("popup") | Some("float") => Placement::Popup,
+                _ => Placement::SplitRight,
+            };
+            Some(CommandBind { binding, cmd, placement })
+        })
+        .collect()
+}
+
+/// Lower `[[link]]` entries (config or plugin manifest) into link handlers.
+fn lower_links(raw: &[RawLink]) -> Vec<LinkRule> {
+    raw.iter()
+        .filter_map(|l| {
+            let pattern = regex::Regex::new(&l.pattern).ok()?;
+            Some(LinkRule { pattern, run: l.run.clone() })
+        })
+        .collect()
+}
+
+/// A plugin manifest (`ruckus-plugin.toml`). Reuses the `[[bind]]` / `[[link]]`
+/// shapes so a plugin adds command shortcuts and link handlers.
+#[derive(Debug, Default, Deserialize)]
+struct RawManifest {
+    plugin: Option<RawPluginMeta>,
+    #[serde(default)]
+    bind: Vec<RawBind>,
+    #[serde(default)]
+    link: Vec<RawLink>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPluginMeta {
+    name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    /// Declared capability scopes (surfaced by `ruckus plugin list`; not yet
+    /// enforced — binds/links are user-installed).
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// An installed plugin, summarized for `ruckus plugin list`.
+#[derive(Debug, Clone)]
+pub struct PluginInfo {
+    /// On-disk directory name — the handle for `remove`.
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub path: std::path::PathBuf,
+    pub binds: usize,
+    pub links: usize,
+}
+
+/// Directory holding installed plugins (one subdirectory each).
+pub fn plugins_dir() -> std::path::PathBuf {
+    ruckus_dir().join("plugins")
+}
+
+/// Read + parse a plugin's manifest, if the directory has one.
+fn read_manifest(dir: &std::path::Path) -> Option<RawManifest> {
+    let text = std::fs::read_to_string(dir.join("ruckus-plugin.toml")).ok()?;
+    toml::from_str(&text).ok()
+}
+
+/// Enumerate installed plugins (each subdir of the plugins dir with a manifest).
+pub fn list_plugins() -> Vec<PluginInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(plugins_dir()) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(m) = read_manifest(&path) else { continue };
+        let meta = m.plugin.unwrap_or_default();
+        let id = path.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+        let name = meta.name.unwrap_or_else(|| id.clone());
+        out.push(PluginInfo {
+            id,
+            name,
+            version: meta.version.unwrap_or_default(),
+            description: meta.description.unwrap_or_default(),
+            capabilities: meta.capabilities,
+            path,
+            binds: m.bind.len(),
+            links: m.link.len(),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     /// Base keymap preset: "tmux" | "alt" | "both".
@@ -715,7 +820,20 @@ pub fn ensure_config_file() -> std::path::PathBuf {
 impl Config {
     pub fn load() -> Config {
         let path = ensure_config_file();
-        Self::from_toml_str(&std::fs::read_to_string(&path).unwrap_or_default())
+        let mut cfg = Self::from_toml_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        cfg.load_plugins();
+        cfg
+    }
+
+    /// Merge installed plugins' `[[bind]]` / `[[link]]` into the config. User
+    /// config takes precedence (it's lowered first, and lookups are first-match).
+    fn load_plugins(&mut self) {
+        for dir in list_plugins().into_iter().map(|p| p.path) {
+            if let Some(m) = read_manifest(&dir) {
+                self.commands.extend(lower_binds(&m.bind));
+                self.links.extend(lower_links(&m.link));
+            }
+        }
     }
 
     pub fn from_toml_str(s: &str) -> Config {
@@ -752,35 +870,9 @@ impl Config {
             None if keymap == Keymap::Alt => None,
             None => parse_binding("ctrl-b").ok(),
         };
-        // User command shortcuts: key → run a command in a split/tab.
-        let commands: Vec<CommandBind> = raw
-            .bind
-            .iter()
-            .filter_map(|b| {
-                let binding = parse_binding(&b.key).ok()?;
-                let cmd: Vec<String> = b.run.split_whitespace().map(String::from).collect();
-                if cmd.is_empty() {
-                    return None;
-                }
-                let placement = match b.place.as_deref().map(|s| s.to_lowercase()).as_deref() {
-                    Some("down") | Some("split-down") | Some("v") => Placement::SplitDown,
-                    Some("tab") | Some("window") => Placement::Tab,
-                    Some("popup") | Some("float") => Placement::Popup,
-                    _ => Placement::SplitRight,
-                };
-                Some(CommandBind { binding, cmd, placement })
-            })
-            .collect();
-
-        // Link handlers: user rules, or a built-in "open URLs" default.
-        let mut links: Vec<LinkRule> = raw
-            .link
-            .iter()
-            .filter_map(|l| {
-                let pattern = regex::Regex::new(&l.pattern).ok()?;
-                Some(LinkRule { pattern, run: l.run.clone() })
-            })
-            .collect();
+        // Command shortcuts + link handlers (shared with plugin manifests).
+        let commands = lower_binds(&raw.bind);
+        let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
                 links.push(LinkRule { pattern, run: "open ${url}".to_string() });
@@ -1246,6 +1338,35 @@ run = "open https://linear.app/issue/${match}"
         let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
         assert_eq!(m.as_str(), "FIS-42");
         assert_eq!(cfg.ui.link_click, LinkClick::Plain);
+    }
+
+    #[test]
+    fn plugin_manifest_lowers_binds_and_links() {
+        let m: RawManifest = toml::from_str(
+            r#"
+[plugin]
+name = "lazygit"
+version = "0.1.0"
+capabilities = ["run-commands"]
+
+[[bind]]
+key = "alt-g"
+run = "lazygit"
+where = "popup"
+
+[[link]]
+pattern = 'https?://\S+'
+run = "open ${url}"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.plugin.as_ref().unwrap().name.as_deref(), Some("lazygit"));
+        let binds = lower_binds(&m.bind);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].placement, Placement::Popup);
+        let links = lower_links(&m.link);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].pattern.is_match("go https://x.dev now"));
     }
 
     #[test]
