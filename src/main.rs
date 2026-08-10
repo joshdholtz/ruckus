@@ -349,20 +349,27 @@ async fn theme_cmd(name: Option<String>) -> Result<()> {
             .unwrap_or("macchiato")
             .to_string()
     };
+    let user = config::list_user_themes();
     let Some(name) = name else {
         println!("themes:");
         for n in config::THEME_NAMES {
             let mark = if *n == current { "●" } else { " " };
             println!("  {mark} {n}");
         }
+        if !user.is_empty() {
+            println!("\ncustom (~/.ruckus/themes):");
+            for n in &user {
+                let mark = if *n == current { "●" } else { " " };
+                println!("  {mark} {n}");
+            }
+        }
         println!("\nswitch with: ruckus theme <name>");
         return Ok(());
     };
-    if config::theme_preset(&name).is_none() {
-        anyhow::bail!(
-            "unknown theme '{name}' — try: {}",
-            config::THEME_NAMES.join(", ")
-        );
+    if config::resolve_theme(&name).is_none() {
+        let mut all: Vec<String> = config::THEME_NAMES.iter().map(|s| s.to_string()).collect();
+        all.extend(user);
+        anyhow::bail!("unknown theme '{name}' — try: {}", all.join(", "));
     }
     let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?.parse()?;
     if doc.get("theme").is_none() {

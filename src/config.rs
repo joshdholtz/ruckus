@@ -341,6 +341,82 @@ pub fn theme_preset(name: &str) -> Option<Theme> {
     )
 }
 
+/// Directory holding user-defined theme files (`~/.ruckus/themes/<name>.toml`).
+pub fn themes_dir() -> std::path::PathBuf {
+    ruckus_dir().join("themes")
+}
+
+/// Overlay hex-string colour keys from a flat map onto `theme`. Recognised keys
+/// match the `[theme]` block: accent, border, bg, surface, bar_bg, bar_fg,
+/// bar_active_fg, status_fg, sidebar_bg, select_bg, working, waiting, idle,
+/// done_ok, done_err, and the optional remote.
+fn apply_theme_map(theme: &mut Theme, map: &HashMap<String, String>) {
+    fn hex(map: &HashMap<String, String>, k: &str) -> Option<Color> {
+        map.get(k).and_then(|s| parse_hex(s))
+    }
+    if let Some(c) = hex(map, "accent") { theme.accent = c; }
+    if let Some(c) = hex(map, "border") { theme.border = c; }
+    if let Some(c) = hex(map, "bg") { theme.bg = c; }
+    if let Some(c) = hex(map, "surface") { theme.surface = c; }
+    if let Some(c) = hex(map, "bar_bg") { theme.bar_bg = c; }
+    if let Some(c) = hex(map, "bar_fg") { theme.bar_fg = c; }
+    if let Some(c) = hex(map, "bar_active_fg") { theme.bar_active_fg = c; }
+    if let Some(c) = hex(map, "status_fg") { theme.status_fg = c; }
+    if let Some(c) = hex(map, "sidebar_bg") { theme.sidebar_bg = c; }
+    if let Some(c) = hex(map, "select_bg") { theme.select_bg = c; }
+    if let Some(c) = hex(map, "working") { theme.working = c; }
+    if let Some(c) = hex(map, "waiting") { theme.waiting = c; }
+    if let Some(c) = hex(map, "idle") { theme.idle = c; }
+    if let Some(c) = hex(map, "done_ok") { theme.done_ok = c; }
+    if let Some(c) = hex(map, "done_err") { theme.done_err = c; }
+    if let Some(c) = hex(map, "remote") { theme.remote = Some(c); }
+}
+
+/// Resolve a theme by name: a built-in preset first, otherwise a user theme file
+/// at `~/.ruckus/themes/<name>.toml`. User files are a flat list of `key = "#hex"`
+/// lines and may set `extends = "<builtin>"` (alias `preset`) to inherit a base
+/// palette, then override individual colours.
+pub fn resolve_theme(name: &str) -> Option<Theme> {
+    if let Some(t) = theme_preset(name) {
+        return Some(t);
+    }
+    load_user_theme(name)
+}
+
+fn load_user_theme(name: &str) -> Option<Theme> {
+    // Bare file name only — no path traversal.
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    let text = std::fs::read_to_string(themes_dir().join(format!("{name}.toml"))).ok()?;
+    let map: HashMap<String, String> = toml::from_str(&text).ok()?;
+    // Base palette: `extends`/`preset` names a built-in; macchiato default otherwise.
+    let mut theme = map
+        .get("extends")
+        .or_else(|| map.get("preset"))
+        .and_then(|b| theme_preset(b))
+        .unwrap_or_default();
+    apply_theme_map(&mut theme, &map);
+    Some(theme)
+}
+
+/// User theme names (file stems) found in `~/.ruckus/themes`, sorted.
+pub fn list_user_themes() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(themes_dir()) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("toml") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPos {
     Left,
@@ -1161,37 +1237,14 @@ impl Config {
             }
         }
 
-        // Start from a named preset if given, then layer individual overrides on top.
+        // Base palette: `preset` names a built-in OR a user theme
+        // (~/.ruckus/themes/<name>.toml); then layer any [theme] overrides on top.
         let mut theme = raw
             .theme
             .get("preset")
-            .and_then(|n| theme_preset(n))
+            .and_then(|n| resolve_theme(n))
             .unwrap_or_default();
-        let t = &raw.theme;
-        let set = |field: &mut Color, name: &str| {
-            if let Some(c) = t.get(name).and_then(|s| parse_hex(s)) {
-                *field = c;
-            }
-        };
-        set(&mut theme.accent, "accent");
-        set(&mut theme.border, "border");
-        set(&mut theme.bg, "bg");
-        set(&mut theme.surface, "surface");
-        set(&mut theme.bar_bg, "bar_bg");
-        set(&mut theme.bar_fg, "bar_fg");
-        set(&mut theme.bar_active_fg, "bar_active_fg");
-        set(&mut theme.status_fg, "status_fg");
-        set(&mut theme.sidebar_bg, "sidebar_bg");
-        set(&mut theme.select_bg, "select_bg");
-        set(&mut theme.working, "working");
-        set(&mut theme.waiting, "waiting");
-        set(&mut theme.idle, "idle");
-        set(&mut theme.done_ok, "done_ok");
-        set(&mut theme.done_err, "done_err");
-        // Optional (Option<Color>): only set when present in config.
-        if let Some(c) = t.get("remote").and_then(|s| parse_hex(s)) {
-            theme.remote = Some(c);
-        }
+        apply_theme_map(&mut theme, &raw.theme);
 
         let d = UiConfig::default();
         let sidebar_raw = raw.ui.sidebar.as_deref().map(|s| s.to_lowercase());
