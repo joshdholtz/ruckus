@@ -1,0 +1,108 @@
+name: release
+
+# Builds macOS (universal + per-arch) and Linux (x86_64 + aarch64) binaries and
+# attaches them to the GitHub Release whenever a v* tag is pushed.
+#   git tag -a v0.2.0 -m "ruckus 0.2.0" && git push origin v0.2.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build & release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos, os: macos-14, kind: mac }
+          - { name: linux-x86_64, os: ubuntu-latest, kind: linux, target: x86_64-unknown-linux-gnu }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, kind: linux, target: aarch64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      # --- macOS: build both arches, lipo a universal, tar all three ---
+      - name: Build (macOS)
+        if: matrix.kind == 'mac'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist stage
+          lipo -create -output stage/ruckus-universal \
+            target/aarch64-apple-darwin/release/ruckus \
+            target/x86_64-apple-darwin/release/ruckus
+          V="${{ steps.v.outputs.tag }}"
+          pack() { cp "$1" stage/ruckus; tar -C stage -czf "dist/ruckus-$V-$2.tar.gz" ruckus; rm stage/ruckus; }
+          pack target/aarch64-apple-darwin/release/ruckus aarch64-apple-darwin
+          pack target/x86_64-apple-darwin/release/ruckus  x86_64-apple-darwin
+          pack stage/ruckus-universal                     universal-apple-darwin
+
+      # --- Linux: native runner per arch ---
+      - name: Build (Linux)
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+          mkdir -p dist stage
+          V="${{ steps.v.outputs.tag }}"
+          cp "target/${{ matrix.target }}/release/ruckus" stage/ruckus
+          tar -C stage -czf "dist/ruckus-$V-${{ matrix.target }}.tar.gz" ruckus
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: v
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz | tee SHA256SUMS.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.tag }}"
+          if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$V" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$V" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "ruckus ${V#v}" --generate-notes
+          fi
