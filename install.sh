@@ -75,9 +75,36 @@ fi
 
 say ""
 say "✓ installed: $("$dir/ruckus" --version 2>/dev/null || echo "$dir/ruckus")"
-case ":$PATH:" in
-  *":$dir:"*) : ;;
-  *) say ""; say "⚠ $dir is not on your PATH. Add it:"; say "    export PATH=\"$dir:\$PATH\"" ;;
-esac
+
+# --- PATH: add $dir if it isn't reachable (idempotent; opt out with RUCKUS_NO_MODIFY_PATH=1) ---
+ensure_path() {
+  case ":$PATH:" in *":$dir:"*) return 0 ;; esac   # already reachable
+
+  line="export PATH=\"$dir:\$PATH\""
+  if [ "${RUCKUS_NO_MODIFY_PATH:-0}" = "1" ]; then
+    say ""; say "⚠ $dir is not on your PATH. Add it yourself:"; say "    $line"
+    return 0
+  fi
+
+  case "$(basename "${SHELL:-sh}")" in
+    zsh)  prof="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) [ -f "$HOME/.bashrc" ] && prof="$HOME/.bashrc" || prof="$HOME/.bash_profile" ;;
+    fish) prof="$HOME/.config/fish/config.fish"; line="fish_add_path $dir" ;;
+    *)    prof="$HOME/.profile" ;;
+  esac
+
+  # idempotent: skip if this dir is already wired into the profile
+  if [ -f "$prof" ] && grep -qF "$dir" "$prof" 2>/dev/null; then
+    say ""; say "⚠ $dir not on PATH, but already referenced in $prof — restart your shell."
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$prof")"
+  { printf '\n# added by ruckus installer\n%s\n' "$line" >> "$prof"; } 2>/dev/null \
+    && { say ""; say "→ added $dir to PATH in $prof"; say "  restart your shell (or: source $prof)"; } \
+    || { say ""; say "⚠ couldn't edit $prof. Add it yourself:"; say "    $line"; }
+}
+ensure_path
+
 say ""
 say "Run:  ruckus"

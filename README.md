@@ -16,7 +16,7 @@ Usable, still pre-1.0. Working: the daemon + spaces/tabs/panes, live split rende
 curl -fsSL https://raw.githubusercontent.com/joshdholtz/ruckus/main/install.sh | sh
 ```
 
-Detects your OS/arch, grabs the matching binary from the [latest release](https://github.com/joshdholtz/ruckus/releases/latest), and installs to `/usr/local/bin` (or `~/.local/bin`). Pin with `RUCKUS_VERSION=v0.1.0`, redirect with `RUCKUS_INSTALL_DIR=…`.
+Detects your OS/arch, grabs the matching binary from the [latest release](https://github.com/joshdholtz/ruckus/releases/latest), and installs to `/usr/local/bin` (or `~/.local/bin`, adding it to your PATH if needed). Pin with `RUCKUS_VERSION=v0.1.0`, redirect with `RUCKUS_INSTALL_DIR=…`, skip the PATH edit with `RUCKUS_NO_MODIFY_PATH=1`.
 
 **From source** (needs Rust):
 
