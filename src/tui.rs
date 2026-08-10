@@ -1285,7 +1285,14 @@ impl App {
     /// routes remote ones to the owning daemon and re-prefixes the reply, so the
     /// client neither strips nor re-tags anything.
     async fn route(&self, req: Request) -> anyhow::Result<ServerMsg> {
-        self.client.request(req).await
+        // Bound every request so a remote-routed op (split/close/etc. forwarded to
+        // a mirrored box) that never replies can't freeze the TUI's event loop —
+        // it degrades to an error toast instead of a locked, un-typeable UI.
+        // Local ops return in well under this.
+        match tokio::time::timeout(Duration::from_secs(6), self.client.request(req)).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow::anyhow!("request timed out (remote unreachable?)")),
+        }
     }
 
     /// The client's live SSH env, handed to the daemon so its detached `ssh` can
