@@ -69,6 +69,10 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
         Action::ConnectRemote,
         "connect remote (mirror a box over SSH)",
     ),
+    (
+        Action::DisconnectRemote,
+        "disconnect remote (the space you're on)",
+    ),
     (Action::ToggleSidebar, "toggle sidebar"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
@@ -1981,7 +1985,57 @@ impl App {
                 }
             }
             Action::ConnectRemote => self.open_prompt(PromptKind::ConnectRemote),
+            Action::DisconnectRemote => {
+                self.disconnect_remote(remote::origin_of(self.snap.active_space))
+                    .await;
+            }
         }
+    }
+
+    /// Drop a remote for good: kill its SSH, forget it (no auto-reconnect), remove
+    /// its spaces/panes, and refocus locally if we were on it.
+    async fn disconnect_remote(&mut self, origin: Origin) {
+        if origin == remote::LOCAL {
+            self.toast("that's the local daemon");
+            return;
+        }
+        let host = self
+            .conns
+            .get(&origin)
+            .map(|c| c.host.clone())
+            .unwrap_or_default();
+        self.remotes.remove(&origin); // forget → the retry ticker won't bring it back
+        self.conns.remove(&origin); // drop Conn → kill_on_drop reaps the ssh child
+        self.connecting.remove(&origin);
+        self.snap
+            .spaces
+            .retain(|s| remote::origin_of(s.id) != origin);
+        self.snap
+            .panes
+            .retain(|p| remote::origin_of(p.id) != origin);
+        self.views.retain(|id, _| remote::origin_of(*id) != origin);
+        // If we were viewing this remote, jump back to a local space.
+        if remote::origin_of(self.snap.active_space) == origin
+            || remote::origin_of(self.focused) == origin
+        {
+            let local = self
+                .snap
+                .spaces
+                .iter()
+                .find(|s| remote::origin_of(s.id) == remote::LOCAL)
+                .and_then(|s| {
+                    s.tabs
+                        .iter()
+                        .find(|t| t.id == s.active_tab)
+                        .or_else(|| s.tabs.first())
+                        .map(|t| (s.id, t.id, t.active_pane))
+                });
+            if let Some((s, t, p)) = local {
+                self.set_active(s, t, p).await;
+            }
+        }
+        self.notify(format!("disconnected {host}"));
+        self.sync().await;
     }
 
     fn open_palette(&mut self) {

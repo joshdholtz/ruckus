@@ -37,6 +37,8 @@ pub enum Action {
     LastSpace,
     /// Prompt for a host and mirror its ruckus over SSH (ephemeral).
     ConnectRemote,
+    /// Disconnect the remote whose space you're currently on.
+    DisconnectRemote,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -64,6 +66,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::LastPane, "last_pane", &["alt-;"]),
     (Action::LastSpace, "last_space", &["alt-l"]),
     (Action::ConnectRemote, "connect_remote", &[]),
+    (Action::DisconnectRemote, "disconnect_remote", &[]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of

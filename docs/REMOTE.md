@@ -28,8 +28,9 @@ Either way, the host's spaces appear in your sidebar tagged `workbox: …` and a
 view/type/split like local ones. SSH handles auth (mosh is orthogonal — your
 link, not the mirror's).
 
-Follow-up: a runtime **disconnect** (today a runtime-added remote persists +
-auto-reconnects until you quit; config-removed ones stay until restart).
+**Disconnect:** the `disconnect remote` action drops the remote whose space
+you're currently on — kills its SSH, forgets it (no auto-reconnect), removes its
+spaces, and jumps you back to a local space.
 
 ## Core decision: origin-encoded `u64` ids
 
