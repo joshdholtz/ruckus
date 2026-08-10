@@ -501,11 +501,13 @@ pub struct CommandBind {
 
 /// A link handler (config `[[link]]`): text matching `pattern` becomes clickable
 /// and runs `run` (argv; `${url}` / `${match}` are replaced with the matched
-/// text as a single argument — never shell-interpreted). Plugin-extensible.
+/// text as a single argument — never shell-interpreted). `placement` = None runs
+/// it detached (e.g. `open`); Some opens it in a ruckus split/tab/popup.
 #[derive(Debug, Clone)]
 pub struct LinkRule {
     pub pattern: regex::Regex,
     pub run: String,
+    pub placement: Option<Placement>,
 }
 
 /// What click opens a link. `Plain` = any click; else a held modifier is required.
@@ -655,6 +657,18 @@ struct RawBind {
 struct RawLink {
     pattern: String,
     run: String,
+    #[serde(rename = "where")]
+    place: Option<String>,
+}
+
+/// Map a `where` value to a placement (defaults to a right split).
+fn parse_placement(s: &str) -> Placement {
+    match s.to_lowercase().as_str() {
+        "down" | "split-down" | "v" => Placement::SplitDown,
+        "tab" | "window" => Placement::Tab,
+        "popup" | "float" => Placement::Popup,
+        _ => Placement::SplitRight,
+    }
 }
 
 /// Lower `[[bind]]` entries (config or plugin manifest) into command shortcuts.
@@ -666,12 +680,7 @@ fn lower_binds(raw: &[RawBind]) -> Vec<CommandBind> {
             if cmd.is_empty() {
                 return None;
             }
-            let placement = match b.place.as_deref().map(|s| s.to_lowercase()).as_deref() {
-                Some("down") | Some("split-down") | Some("v") => Placement::SplitDown,
-                Some("tab") | Some("window") => Placement::Tab,
-                Some("popup") | Some("float") => Placement::Popup,
-                _ => Placement::SplitRight,
-            };
+            let placement = b.place.as_deref().map(parse_placement).unwrap_or(Placement::SplitRight);
             Some(CommandBind { binding, cmd, placement })
         })
         .collect()
@@ -682,7 +691,11 @@ fn lower_links(raw: &[RawLink]) -> Vec<LinkRule> {
     raw.iter()
         .filter_map(|l| {
             let pattern = regex::Regex::new(&l.pattern).ok()?;
-            Some(LinkRule { pattern, run: l.run.clone() })
+            Some(LinkRule {
+                pattern,
+                run: l.run.clone(),
+                placement: l.place.as_deref().map(parse_placement),
+            })
         })
         .collect()
 }
@@ -875,7 +888,7 @@ impl Config {
         let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
-                links.push(LinkRule { pattern, run: "open ${url}".to_string() });
+                links.push(LinkRule { pattern, run: "open ${url}".to_string(), placement: None });
             }
         }
 
@@ -1130,13 +1143,16 @@ palette = "alt-p"         # command palette: fuzzy-search every action
 # runs `run` — ${url}/${match} are replaced with the matched text as ONE
 # argument (never shell-interpreted). Defaults to opening URLs if none set.
 # link_click below picks the trigger: ctrl | shift | plain.
+# Optional `where` opens the tool in a ruckus pane (right|down|tab|popup)
+# instead of running it detached — great for opening a reviewer on a PR link.
 # [[link]]
 # pattern = 'https?://\S+'
-# run = "open ${url}"
+# run = "open ${url}"          # no `where` = run detached
 #
-# [[link]]                       # e.g. jump Linear IDs to the browser
-# pattern = '[A-Z]{2,}-[0-9]+'
-# run = "open https://linear.app/issue/${match}"
+# [[link]]                       # ctrl-click a PR URL → review it in a split
+# pattern = 'https://github.com/[^/]+/[^/]+/pull/[0-9]+'
+# run = "gh pr view ${url}"
+# where = "right"
 
 [ui]
 link_click = "ctrl"          # ctrl | shift | plain — how a click fires a link

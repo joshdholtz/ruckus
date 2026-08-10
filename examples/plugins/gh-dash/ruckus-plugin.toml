@@ -1,0 +1,11 @@
+[plugin]
+name = "gh-dash"
+version = "0.1.0"
+description = "alt-g → gh-dash (GitHub PR/issue dashboard) in a right split, for the repo you're in"
+capabilities = ["run-commands"]
+
+# Needs the gh extension:  gh extension install dlvhdr/gh-dash
+[[bind]]
+key = "alt-g"
+run = "gh dash"
+where = "right"

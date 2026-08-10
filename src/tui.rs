@@ -1170,8 +1170,8 @@ impl App {
     }
 
     /// If a link handler matches the text at pane cell (row,col), return the
-    /// matched text and the rule's command template.
-    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, String)> {
+    /// matched text, the rule's command template, and its placement.
+    fn link_at(&self, pane: u64, row: u16, col: u16) -> Option<(String, String, Option<Placement>)> {
         let screen = self.views.get(&pane)?.parser.screen();
         let contents = screen.contents();
         let line = contents.lines().nth(row as usize)?;
@@ -1180,7 +1180,7 @@ impl App {
                 let start = line[..m.start()].chars().count();
                 let end = start + m.as_str().chars().count();
                 if (col as usize) >= start && (col as usize) < end {
-                    return Some((m.as_str().to_string(), rule.run.clone()));
+                    return Some((m.as_str().to_string(), rule.run.clone(), rule.placement));
                 }
             }
         }
@@ -1197,6 +1197,7 @@ impl App {
         let Some((prog, args)) = argv.split_first() else { return };
         let _ = std::process::Command::new(prog)
             .args(args)
+            .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1204,24 +1205,23 @@ impl App {
         self.notify(format!("↗ {matched}"));
     }
 
-    /// Run a user command shortcut: open its command in a split or new tab,
-    /// seeded with the focused pane's cwd.
     async fn run_command_bind(&mut self, cb: CommandBind) {
-        if cb.placement == Placement::Popup {
-            self.open_popup(cb.cmd);
+        self.open_placement(cb.cmd, cb.placement).await;
+    }
+
+    /// Open `cmd` in a split / tab / popup, seeded with the focused pane's cwd.
+    async fn open_placement(&mut self, cmd: Vec<String>, placement: Placement) {
+        if placement == Placement::Popup {
+            self.open_popup(cmd);
             return;
         }
         let cwd = Some(self.seed_cwd(self.focused));
-        let req = match cb.placement {
-            Placement::SplitRight => {
-                Request::Split { pane: self.focused, dir: Dir::Right, cmd: cb.cmd, cwd }
-            }
-            Placement::SplitDown => {
-                Request::Split { pane: self.focused, dir: Dir::Down, cmd: cb.cmd, cwd }
-            }
+        let req = match placement {
+            Placement::SplitRight => Request::Split { pane: self.focused, dir: Dir::Right, cmd, cwd },
+            Placement::SplitDown => Request::Split { pane: self.focused, dir: Dir::Down, cmd, cwd },
             Placement::Tab => {
                 let Some(space) = self.active_space().map(|s| s.id) else { return };
-                Request::NewTab { space, name: None, cmd: cb.cmd, cwd }
+                Request::NewTab { space, name: None, cmd, cwd }
             }
             Placement::Popup => return, // handled above
         };
@@ -2662,8 +2662,23 @@ impl App {
                     };
                     if link_trigger {
                         if let Some((p, (r, c))) = self.cell_at(col, row) {
-                            if let Some((matched, run)) = self.link_at(p, r, c) {
-                                self.run_link(&run, &matched);
+                            if let Some((matched, run, placement)) = self.link_at(p, r, c) {
+                                match placement {
+                                    // Open the link's tool in a ruckus split/tab/popup.
+                                    Some(pl) => {
+                                        let cmd: Vec<String> = run
+                                            .split_whitespace()
+                                            .map(|t| {
+                                                t.replace("${url}", &matched)
+                                                    .replace("${match}", &matched)
+                                            })
+                                            .collect();
+                                        self.notify(format!("↗ {matched}"));
+                                        self.open_placement(cmd, pl).await;
+                                    }
+                                    // Detached (e.g. `open <url>`).
+                                    None => self.run_link(&run, &matched),
+                                }
                                 return;
                             }
                         }
