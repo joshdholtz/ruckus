@@ -3835,7 +3835,10 @@ impl App {
             area,
         );
 
-        let w = inner.width as usize;
+        // Reserve a 2-col gutter on the right: a scrollbar column + a gap, so the
+        // bar never clips row text, never steals row clicks, and keeps a
+        // sidebar-bg margin against the pane (preserving the contrast edge).
+        let w = (inner.width as usize).saturating_sub(2);
         let hover_row = self
             .hover
             .filter(|(c, _)| *c >= area.x && *c < area.x + area.width)
@@ -4221,7 +4224,9 @@ impl App {
                 buttons.retain(|(by, _, _)| *by >= inner.y + off_u);
                 buttons.iter_mut().for_each(|(by, _, _)| *by -= off_u);
             }
-            let bar_x = inner.x + inner.width.saturating_sub(1);
+            // Thumb lives in the reserved gutter one column in from the edge, so
+            // the last column stays sidebar-bg (gap before the pane).
+            let bar_x = inner.x + inner.width.saturating_sub(2);
             self.sidebar_scrollbars
                 .push((key.clone(), Rect::new(bar_x, inner.y, 1, inner.height), max_off));
             scrollbar = Some((off, total));
@@ -4244,12 +4249,16 @@ impl App {
             let mut state = ScrollbarState::new(total)
                 .viewport_content_length(h)
                 .position(off);
+            // No track line (it broke the sidebar↔pane contrast edge) — just a
+            // thumb. Render one column in from the edge (inner.width-2).
+            let bar_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
-                .thumb_style(Style::default().fg(th.accent))
-                .track_style(Style::default().fg(th.idle));
-            f.render_stateful_widget(bar, inner, &mut state);
+                .track_symbol(None)
+                .thumb_symbol("▐")
+                .thumb_style(Style::default().fg(th.accent));
+            f.render_stateful_widget(bar, bar_area, &mut state);
         }
     }
 
