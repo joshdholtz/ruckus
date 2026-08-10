@@ -93,7 +93,8 @@ The default keymap is **`tmux`** — a `⌃b` prefix (`⌃b c` new tab, `⌃b z`
 | alt+x | close pane | alt+1..9 | jump to tab |
 | alt+o / alt+i | next / prev pane | alt+n | new space |
 | alt+pgup / alt+pgdn | scroll history | alt+. / alt+, | next / prev space |
-| alt+a | jump to next pane that needs you | alt+b | toggle sidebar |
+| alt+; / alt+l | last pane / last space (jump back) | alt+b | toggle sidebar |
+| alt+a | jump to next pane that needs you | | |
 | alt+p | palette (jump to any space/tab/pane · `>` for commands) | alt+f | search scrollback (n/N cycle) |
 | alt+z | zoom focused pane | alt+d | deck (mobile card view) |
 | alt+/ | key reference + your plugin binds | alt+q / ctrl+q | quit TUI (daemon keeps running) |

@@ -51,6 +51,8 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
     (Action::PrevTab, "previous tab"),
     (Action::NextSpace, "next space"),
     (Action::PrevSpace, "previous space"),
+    (Action::LastPane, "last pane (jump back)"),
+    (Action::LastSpace, "last space (jump back)"),
     (Action::ToggleSidebar, "toggle sidebar"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
@@ -601,6 +603,9 @@ struct App {
     snap: Snapshot,
     views: HashMap<u64, PaneView>,
     focused: u64,
+    /// Previously-focused pane / previously-active space, for "jump back".
+    last_pane: Option<u64>,
+    last_space: Option<u64>,
     seen: HashSet<u64>,
     /// Panes that changed to a notable state (finished / needs input) while
     /// unfocused. Cleared when you view the pane. Drives the "unread" badge.
@@ -1226,6 +1231,13 @@ impl App {
     }
 
     async fn set_active(&mut self, space: u64, tab: u64, pane: u64) {
+        // Remember where we were so "last pane / last space" can jump back.
+        if pane != self.focused {
+            self.last_pane = Some(self.focused);
+        }
+        if space != self.snap.active_space {
+            self.last_space = Some(self.snap.active_space);
+        }
         self.snap.active_space = space;
         if let Some(s) = self.snap.spaces.iter_mut().find(|s| s.id == space) {
             s.active_tab = tab;
@@ -1855,6 +1867,27 @@ impl App {
                     self.sync_deck_sel();
                 }
                 self.sync().await;
+            }
+            Action::LastPane => {
+                if let Some(p) = self.last_pane {
+                    if self.snap.pane(p).is_some() {
+                        self.goto_pane(p).await;
+                    }
+                }
+            }
+            Action::LastSpace => {
+                if let Some(sid) = self.last_space {
+                    let target = self.snap.spaces.iter().find(|s| s.id == sid).and_then(|s| {
+                        s.tabs
+                            .iter()
+                            .find(|t| t.id == s.active_tab)
+                            .or_else(|| s.tabs.first())
+                            .map(|t| (s.id, t.id, t.active_pane))
+                    });
+                    if let Some((s, t, p)) = target {
+                        self.set_active(s, t, p).await;
+                    }
+                }
             }
         }
     }
@@ -5159,6 +5192,8 @@ impl App {
             (self.cfg.hint(Action::NewSpace), "new space"),
             (self.cfg.hint(Action::NextSpace), "next space"),
             (self.cfg.hint(Action::PrevSpace), "previous space"),
+            (self.cfg.hint(Action::LastPane), "last pane (jump back)"),
+            (self.cfg.hint(Action::LastSpace), "last space (jump back)"),
             (self.cfg.hint(Action::ScrollUp), "scroll history up"),
             (self.cfg.hint(Action::ScrollDown), "scroll history down"),
             (self.cfg.hint(Action::ToggleSidebar), "toggle sidebar"),
@@ -5515,6 +5550,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         snap,
         views: HashMap::new(),
         focused,
+        last_pane: None,
+        last_space: None,
         seen: HashSet::new(),
         unread: HashSet::new(),
         flash: HashMap::new(),

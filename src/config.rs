@@ -31,6 +31,10 @@ pub enum Action {
     Search,
     Palette,
     Deck,
+    /// Jump back to the previously-focused pane (tmux `prefix ;`).
+    LastPane,
+    /// Jump back to the previously-active space (tmux last-window).
+    LastSpace,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -55,6 +59,8 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::Search, "search", &["alt-f"]),
     (Action::Palette, "palette", &["alt-p"]),
     (Action::Deck, "deck", &["alt-d"]),
+    (Action::LastPane, "last_pane", &["alt-;"]),
+    (Action::LastSpace, "last_space", &["alt-l"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
@@ -643,6 +649,8 @@ pub const PREFIX_DEFAULTS: &[(Action, &str)] = &[
     (Action::Search, "/"),
     // Deck / overview — like tmux's prefix+w window tree.
     (Action::Deck, "w"),
+    (Action::LastPane, ";"),
+    (Action::LastSpace, "l"),
     (Action::ShowHelp, "?"),
     (Action::Quit, "d"),
 ];
@@ -1388,6 +1396,8 @@ show_help = "alt-/"       # keybinding overlay
 zoom = "alt-z"            # focused pane fills the whole area (toggle)
 search = "alt-f"          # search the focused pane's scrollback (n/N to cycle)
 palette = "alt-p"         # command palette: fuzzy-search every action
+last_pane = "alt-;"       # jump back to the previously-focused pane
+last_space = "alt-l"      # jump back to the previously-active space
 
 # alt-1 .. alt-9 jump straight to a tab (not yet rebindable)
 
