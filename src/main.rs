@@ -144,6 +144,8 @@ enum PluginCmd {
     Link { path: String },
     /// Install a plugin from a GitHub repo: `ruckus plugin install owner/repo`
     Install { repo: String },
+    /// Update installed plugins (git pull); NAME updates just one
+    Update { name: Option<String> },
     /// Remove an installed plugin by name
     Remove { name: String },
     /// Print the plugins directory path
@@ -461,6 +463,33 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             }
             println!("installed {name}");
             println!("run `ruckus reload` to pick it up");
+        }
+        PluginCmd::Update { name } => {
+            let targets: Vec<std::path::PathBuf> = match name {
+                Some(n) if dir.join(&n).exists() => vec![dir.join(&n)],
+                Some(n) => match list_plugins().into_iter().find(|p| p.name == n) {
+                    Some(p) => vec![p.path],
+                    None => anyhow::bail!("no plugin {n}"),
+                },
+                None => list_plugins().into_iter().map(|p| p.path).collect(),
+            };
+            for d in targets {
+                let handle = d.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+                // Dev symlinks have no git repo of their own — edit the source.
+                if d.symlink_metadata()?.file_type().is_symlink() {
+                    println!("· {handle} (dev link — edit its source dir)");
+                    continue;
+                }
+                let ok = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&d)
+                    .args(["pull", "--ff-only"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                println!("{} {handle}", if ok { "✓" } else { "✗" });
+            }
+            println!("run `ruckus reload` to apply");
         }
         PluginCmd::Remove { name } => {
             // Accept the directory handle or the manifest name.
