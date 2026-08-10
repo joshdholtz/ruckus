@@ -188,6 +188,8 @@ fn spawn_popup(
     let mut builder = portable_pty::CommandBuilder::new(&cmdline[0]);
     builder.args(&cmdline[1..]);
     builder.env("TERM", "xterm-256color");
+    builder.env("RUCKUS_SOCK", crate::protocol::socket_path().display().to_string());
+    builder.env("RUCKUS_DIR", crate::protocol::ruckus_dir().display().to_string());
     builder.cwd(&cwd);
     let child = pair.slave.spawn_command(builder).map_err(|e| anyhow!("spawn: {e}"))?;
     drop(pair.slave);
@@ -1213,6 +1215,9 @@ impl App {
         let _ = std::process::Command::new(prog)
             .args(args)
             .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
+            .env("RUCKUS_SOCK", crate::protocol::socket_path())
+            .env("RUCKUS_DIR", crate::protocol::ruckus_dir())
+            .env("RUCKUS_MATCH", matched)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

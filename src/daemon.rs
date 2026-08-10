@@ -1299,6 +1299,11 @@ fn spawn_pane_with_id(
     let mut builder = CommandBuilder::new(&cmdline[0]);
     builder.args(&cmdline[1..]);
     builder.env("TERM", "xterm-256color");
+    // Context contract: anything running in a pane can drive ruckus back through
+    // the socket (`ruckus …` / the JSON API) and knows which pane it is.
+    builder.env("RUCKUS_SOCK", socket_path().display().to_string());
+    builder.env("RUCKUS_DIR", ruckus_dir().display().to_string());
+    builder.env("RUCKUS_PANE", id.to_string());
     builder.cwd(&cwd);
     let child = pair
         .slave

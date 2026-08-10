@@ -24,8 +24,27 @@ pattern = '#([0-9]+)'     # Rust regex
 run = "open https://github.com/owner/repo/issues/${match}"
 ```
 
-`${url}` / `${match}` are substituted with the matched text as a **single
-argument** — never through a shell, so pane output can't inject commands.
+`${url}` / `${match}` (and regex captures `${1}`..) are substituted with the
+matched text as a **single argument** — never through a shell, so pane output
+can't inject commands.
+
+## Context contract (drive ruckus from inside a pane)
+
+Every command ruckus spawns — a pane, a split, a popup, a link handler — gets
+these env vars, so a plugin tool knows its context and can call back through the
+socket / the `ruckus` CLI:
+
+| var | meaning |
+|---|---|
+| `RUCKUS_SOCK` | path to the JSON-RPC socket |
+| `RUCKUS_DIR` | ruckus dir (the `ruckus` CLI honors it, so it targets this daemon) |
+| `RUCKUS_PANE` | the pane's own id (daemon-spawned panes) |
+| `RUCKUS_MATCH` | the matched text, for detached link handlers |
+
+So a plugin can be a normal TUI you launch in a split/popup that talks back:
+subscribe to `ruckus events`, `ruckus status --json`, `ruckus split/send/focus`,
+or speak the socket directly — that's how a reviewer / dashboard / picker plugin
+works without ruckus needing to render it.
 
 ## CLI
 
