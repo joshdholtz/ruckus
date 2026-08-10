@@ -19,14 +19,27 @@ use crate::remote::{self, Origin};
 
 type Tx = UnboundedSender<String>;
 
-// --- state-lock watchdog -------------------------------------------------
-// Every acquisition of the State mutex goes through `lock_state`, which records
-// where and when it was taken; a background task logs a loud warning if the lock
-// stays held too long. This turns an otherwise-invisible "the daemon wedged"
-// into a precise `src/daemon.rs:NNN held 5123ms` line in daemon.log.
-static LOCK_SINCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// --- state-lock instrumentation ------------------------------------------
+// Every acquisition of the State mutex goes through `lock_state`, which (1)
+// detects a same-thread re-entrant lock — the non-reentrant std::Mutex would
+// otherwise self-deadlock silently — and turns it into a logged backtrace while
+// keeping the daemon alive, and (2) records where/when the lock was taken so a
+// dedicated OS-thread watchdog can name the holder even when the async runtime
+// is fully starved.
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static LOCK_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static LOCK_LOC: std::sync::atomic::AtomicPtr<std::panic::Location<'static>> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// Unique id of the thread currently holding the State lock (0 = free).
+static LOCK_OWNER: AtomicU64 = AtomicU64::new(0);
+static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static MY_TID: u64 = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+}
+fn my_tid() -> u64 {
+    MY_TID.with(|t| *t)
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -35,7 +48,17 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// RAII guard around `MutexGuard<State>` that clears the watchdog on drop.
+fn held_loc() -> String {
+    let loc = LOCK_LOC.load(Ordering::Relaxed);
+    if loc.is_null() {
+        "?".to_string()
+    } else {
+        // Safe: the pointer is always a &'static Location.
+        unsafe { format!("{}", *loc) }
+    }
+}
+
+/// RAII guard around `MutexGuard<State>` that clears the watchdog + owner on drop.
 struct StateGuard<'a>(std::sync::MutexGuard<'a, State>);
 impl std::ops::Deref for StateGuard<'_> {
     type Target = State;
@@ -50,51 +73,62 @@ impl std::ops::DerefMut for StateGuard<'_> {
 }
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
-        LOCK_SINCE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Clear owner BEFORE the inner MutexGuard releases the mutex.
+        LOCK_OWNER.store(0, Ordering::Release);
+        LOCK_SINCE_MS.store(0, Ordering::Relaxed);
     }
 }
 
-/// Acquire the State lock, recording the call site + acquire time for the
-/// watchdog. Recovers from poisoning rather than propagating a panic.
+/// Acquire the State lock. Panics (with a logged backtrace) instead of
+/// dead-locking if this thread already holds it — a re-entrant lock on the
+/// non-reentrant std::Mutex is a bug, and unwinding drops the outer guard so the
+/// daemon survives to report it rather than freezing forever.
 #[track_caller]
 fn lock_state(state: &Arc<Mutex<State>>) -> StateGuard<'_> {
     let loc = std::panic::Location::caller();
+    let me = my_tid();
+    if LOCK_OWNER.load(Ordering::Acquire) == me {
+        let bt = std::backtrace::Backtrace::force_capture();
+        error!(
+            "🔒 RE-ENTRANT state lock at {loc} — this thread already holds it (taken at {}). \
+             This is the deadlock. Aborting this operation.\nbacktrace:\n{bt}",
+            held_loc()
+        );
+        panic!("re-entrant state lock at {loc} (held at {})", held_loc());
+    }
     let g = state.lock().unwrap_or_else(|e| e.into_inner());
-    LOCK_LOC.store(
-        loc as *const _ as *mut _,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    LOCK_SINCE_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    LOCK_OWNER.store(me, Ordering::Release);
+    LOCK_LOC.store(loc as *const _ as *mut _, Ordering::Relaxed);
+    LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
     StateGuard(g)
 }
 
-/// Background watchdog: warn loudly if the State lock is ever held > threshold.
+/// Watchdog on a dedicated OS thread (NOT a tokio task) so it keeps logging even
+/// when every runtime worker is parked on the State mutex.
 fn spawn_lock_watchdog() {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        let mut warned_at = 0u64;
-        loop {
-            tick.tick().await;
-            let since = LOCK_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed);
-            if since == 0 {
-                warned_at = 0;
-                continue;
+    std::thread::Builder::new()
+        .name("ruckus-lock-watchdog".into())
+        .spawn(|| {
+            let mut warned_at = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let since = LOCK_SINCE_MS.load(Ordering::Relaxed);
+                if since == 0 {
+                    warned_at = 0;
+                    continue;
+                }
+                let held = now_ms().saturating_sub(since);
+                if held > 500 && (since != warned_at || held % 2000 < 250) {
+                    warned_at = since;
+                    error!(
+                        "⚠ state lock held {held}ms at {} (owner tid {}) — daemon may be wedged",
+                        held_loc(),
+                        LOCK_OWNER.load(Ordering::Relaxed)
+                    );
+                }
             }
-            let held = now_ms().saturating_sub(since);
-            // Warn once per stuck episode, then again every ~2s while still stuck.
-            if held > 300 && (warned_at == 0 || since != warned_at || held % 2000 < 250) {
-                warned_at = since;
-                let loc = LOCK_LOC.load(std::sync::atomic::Ordering::Relaxed);
-                let where_ = if loc.is_null() {
-                    "?".to_string()
-                } else {
-                    // Safe: the pointer is a &'static Location.
-                    unsafe { format!("{}", *loc) }
-                };
-                error!("⚠ state lock held {held}ms at {where_} — daemon may be wedged");
-            }
-        }
-    });
+        })
+        .expect("spawn lock watchdog");
 }
 
 /// How to reach a remote: ssh host + options + the client's live SSH env. Kept in
@@ -878,44 +912,84 @@ pub async fn run() -> Result<()> {
             loop {
                 tick.tick().await;
                 n += 1;
-                let mut st = lock_state(&state);
-                let quiet_after = st.quiet_after;
-                let mut changes = Vec::new();
-                for (id, p) in st.panes.iter_mut() {
-                    if p.reported.is_none()
-                        && p.info.status == PaneStatus::Running
-                        && p.info.activity == Activity::Working
-                        && p.last_output.elapsed() >= quiet_after
-                    {
-                        let next = classify_quiet(p);
-                        if next != p.info.activity {
-                            p.info.activity = next;
-                            p.info.activity_since = unix_now();
-                            changes.push((*id, next));
-                        }
-                    }
-                }
-                for (pane, activity) in &changes {
-                    broadcast(
-                        &st,
-                        ServerMsg::Activity {
-                            pane: *pane,
-                            activity: *activity,
-                        },
-                    );
-                }
-                for (pane, activity) in changes {
-                    if activity == Activity::Waiting && st.notify_waiting {
-                        if let Some(p) = st.panes.get(&pane) {
-                            if p.subs.is_empty() {
-                                notify_system("ruckus", &format!("🐏 {} needs you", p.info.title));
+                // Do the state mutation under the lock, but collect the I/O work
+                // (broadcast frames, desktop notifications, scrollback writes) and
+                // run it AFTER releasing — holding the mutex across a subprocess
+                // spawn or 38 disk writes is what made the contention window huge.
+                let (frames, txs, notify_titles, flushes) = {
+                    let mut st = lock_state(&state);
+                    let quiet_after = st.quiet_after;
+                    let notify_waiting = st.notify_waiting;
+                    let mut changes = Vec::new();
+                    for (id, p) in st.panes.iter_mut() {
+                        if p.reported.is_none()
+                            && p.info.status == PaneStatus::Running
+                            && p.info.activity == Activity::Working
+                            && p.last_output.elapsed() >= quiet_after
+                        {
+                            let next = classify_quiet(p);
+                            if next != p.info.activity {
+                                p.info.activity = next;
+                                p.info.activity_since = unix_now();
+                                changes.push((*id, next));
                             }
                         }
                     }
+                    let frames: Vec<String> = changes
+                        .iter()
+                        .filter_map(|(pane, activity)| {
+                            serde_json::to_string(&ServerFrame {
+                                seq: None,
+                                msg: ServerMsg::Activity {
+                                    pane: *pane,
+                                    activity: *activity,
+                                },
+                            })
+                            .ok()
+                        })
+                        .collect();
+                    let txs: Vec<Tx> = if frames.is_empty() {
+                        Vec::new()
+                    } else {
+                        st.conns.values().cloned().collect()
+                    };
+                    let notify_titles: Vec<String> = changes
+                        .iter()
+                        .filter(|(_, a)| *a == Activity::Waiting && notify_waiting)
+                        .filter_map(|(pane, _)| {
+                            st.panes
+                                .get(pane)
+                                .filter(|p| p.subs.is_empty())
+                                .map(|p| p.info.title.clone())
+                        })
+                        .collect();
+                    // ~ every 5s (ticker runs at 250ms): snapshot dirty scrollbacks
+                    // to write off-lock.
+                    let flushes: Vec<(u64, Vec<u8>)> = if n.is_multiple_of(20) {
+                        st.panes
+                            .iter_mut()
+                            .filter(|(_, p)| p.dirty)
+                            .map(|(id, p)| {
+                                p.dirty = false;
+                                (*id, p.scrollback.iter().copied().collect())
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (frames, txs, notify_titles, flushes)
+                }; // lock released before any I/O below
+
+                for f in &frames {
+                    for tx in &txs {
+                        let _ = tx.send(f.clone());
+                    }
                 }
-                // ~ every 5s (ticker runs at 250ms)
-                if n.is_multiple_of(20) {
-                    flush_scrollbacks(&mut st);
+                for title in notify_titles {
+                    notify_system("ruckus", &format!("🐏 {title} needs you"));
+                }
+                for (id, bytes) in flushes {
+                    let _ = std::fs::write(scrollback_path(id), &bytes);
                 }
             }
         });
@@ -1091,9 +1165,7 @@ async fn handle_conn(state: Arc<Mutex<State>>, conn_id: u64, stream: UnixStream)
                     let msg = if origin == remote::LOCAL {
                         handle_request(&state, conn_id, req)
                     } else {
-                        let client = state
-                            .lock()
-                            .unwrap()
+                        let client = lock_state(&state)
                             .remotes
                             .get(&origin)
                             .map(|rc| rc.client.clone());
@@ -2162,32 +2234,34 @@ async fn pump(state: Arc<Mutex<State>>, id: u64, mut rx: UnboundedReceiver<Sessi
                 }
             }
             SessionEvent::Exited(code) => {
-                let mut st = lock_state(&state);
-                let known = if let Some(p) = st.panes.get_mut(&id) {
-                    p.info.status = PaneStatus::Exited { code };
-                    p.info.activity = Activity::Done;
-                    p.info.activity_since = unix_now();
-                    true
-                } else {
-                    false
-                };
-                if known {
-                    broadcast(&st, ServerMsg::Exited { pane: id, code });
-                    broadcast_state(&st);
-                    if st.notify_done {
-                        if let Some(p) = st.panes.get(&id) {
-                            if p.subs.is_empty() {
-                                notify_system(
-                                    "ruckus",
-                                    &if code == 0 {
-                                        format!("✓ {} finished", p.info.title)
-                                    } else {
-                                        format!("✗ {} exited ({code})", p.info.title)
-                                    },
-                                );
+                let notify = {
+                    let mut st = lock_state(&state);
+                    let notify_done = st.notify_done;
+                    // Decide the notification under the lock; fire it after unlock
+                    // (notify_system spawns a subprocess — never under the mutex).
+                    let notify = match st.panes.get_mut(&id) {
+                        None => break,
+                        Some(p) => {
+                            p.info.status = PaneStatus::Exited { code };
+                            p.info.activity = Activity::Done;
+                            p.info.activity_since = unix_now();
+                            if notify_done && p.subs.is_empty() {
+                                Some(if code == 0 {
+                                    format!("✓ {} finished", p.info.title)
+                                } else {
+                                    format!("✗ {} exited ({code})", p.info.title)
+                                })
+                            } else {
+                                None
                             }
                         }
-                    }
+                    };
+                    broadcast(&st, ServerMsg::Exited { pane: id, code });
+                    broadcast_state(&st);
+                    notify
+                };
+                if let Some(msg) = notify {
+                    notify_system("ruckus", &msg);
                 }
                 break;
             }
