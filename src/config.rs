@@ -1222,18 +1222,39 @@ impl Config {
                 }
                 self.commands.extend(binds);
                 self.links.extend(lower_links(&m.link));
-                // Plugin status segments compile into the existing status format.
+                // Plugin status segments. Each is a named token `#{<plugin>}` you
+                // place anywhere in status_left/right — the template stays the
+                // single source of truth for layout. If you haven't placed the
+                // token, it falls back to auto-inject (append left / prepend right)
+                // so a freshly-installed plugin still shows up.
+                let pname = m
+                    .plugin
+                    .as_ref()
+                    .and_then(|p| p.name.clone())
+                    .unwrap_or_else(|| {
+                        dir.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
                 for s in &m.status {
                     let (on_left, frag) = lower_status(s, &dir);
-                    let target = if on_left {
-                        &mut self.ui.status_left
+                    let token = format!("#{{{pname}}}");
+                    if self.ui.status_left.contains(&token)
+                        || self.ui.status_right.contains(&token)
+                    {
+                        self.ui.status_left = self.ui.status_left.replace(&token, &frag);
+                        self.ui.status_right = self.ui.status_right.replace(&token, &frag);
+                    } else if on_left {
+                        let t = &mut self.ui.status_left;
+                        if !t.is_empty() {
+                            t.push_str("  ");
+                        }
+                        t.push_str(&frag);
                     } else {
-                        &mut self.ui.status_right
-                    };
-                    if !target.is_empty() {
-                        target.push_str("  ");
+                        let t = &mut self.ui.status_right;
+                        let sep = if t.is_empty() { "" } else { "  " };
+                        *t = format!("{frag}{sep}{t}");
                     }
-                    target.push_str(&frag);
                 }
             }
         }

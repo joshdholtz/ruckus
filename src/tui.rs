@@ -4364,7 +4364,26 @@ impl App {
                     }
                     token.push(c);
                 }
-                buf.push_str(&val(&token));
+                match token.split(':').next().unwrap_or(&token) {
+                    // Themed divider: `{|}` → a dim │ with a space each side.
+                    // `{|:accent}` recolours it.
+                    "|" => {
+                        let c = token
+                            .split_once(':')
+                            .map(|x| resolve_color(x.1))
+                            .unwrap_or(th.status_fg);
+                        spans.push(Span::styled(" │ ".to_string(), Style::default().fg(c)));
+                    }
+                    // Fixed-width spacer: `{sp}` = 2 cols, `{sp:8}` = 8.
+                    "sp" | "gap" => {
+                        let n = token
+                            .split_once(':')
+                            .and_then(|x| x.1.parse::<usize>().ok())
+                            .unwrap_or(2);
+                        buf.push_str(&" ".repeat(n));
+                    }
+                    _ => buf.push_str(&val(&token)),
+                }
             } else {
                 buf.push(ch);
             }
