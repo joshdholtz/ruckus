@@ -3453,6 +3453,23 @@ impl App {
             p.buffer.push_str(&text.replace(['\r', '\n'], " "));
             return;
         }
+        // A popup (scratch shell / tool) owns input while open — paste into it.
+        if let Some(p) = self.popup.as_mut() {
+            use std::io::Write;
+            let bracketed = p.parser.screen().bracketed_paste();
+            let body = text.replace("\r\n", "\r").replace('\n', "\r");
+            let mut data = Vec::new();
+            if bracketed {
+                data.extend_from_slice(b"\x1b[200~");
+            }
+            data.extend_from_slice(body.as_bytes());
+            if bracketed {
+                data.extend_from_slice(b"\x1b[201~");
+            }
+            let _ = p.writer.write_all(&data);
+            let _ = p.writer.flush();
+            return;
+        }
         let pane = self.focused;
         let bracketed = self
             .views
@@ -6180,7 +6197,14 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        // Restore ALL modes we set (incl. bracketed paste) so a crash never leaves
+        // the terminal unable to paste/select/click.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         hook(info);
     }));
 
