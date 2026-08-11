@@ -668,6 +668,9 @@ struct App {
     drag: Option<Drag>,
     select: Option<Sel>,
     selecting: bool,
+    /// Drag-to-select-and-copy inside an open popup (the `pane` field is unused).
+    popup_sel: Option<Sel>,
+    popup_selecting: bool,
     /// When the last selection was copied — flashes the selection green briefly
     /// as confirmation (toasts are gone), then clears it.
     copied_at: Option<Instant>,
@@ -1153,6 +1156,43 @@ impl App {
     }
 
     /// Extract the current selection's text and put it on the clipboard.
+    /// Screen (col,row) → (row,col) cell inside the popup's content area, if any.
+    fn popup_cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let r = self.popup_rect();
+        let (ix, iy) = (r.x + 1, r.y + 1); // inside the 1-cell border
+        let (cols, rows) = (r.width.saturating_sub(2), r.height.saturating_sub(2));
+        if col < ix || row < iy {
+            return None;
+        }
+        let (cx, cy) = (col - ix, row - iy);
+        (cx < cols && cy < rows).then_some((cy, cx))
+    }
+
+    /// Copy the popup's current text selection to the clipboard.
+    fn copy_popup_selection(&mut self) {
+        let Some(sel) = self.popup_sel else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let Some(p) = self.popup.as_ref() else { return };
+        let screen = p.parser.screen();
+        let (rows, cols) = screen.size();
+        let ((sr, sc), (er, ec)) = sel.ordered();
+        let last_row = rows.saturating_sub(1);
+        let (sr, er) = (sr.min(last_row), er.min(last_row));
+        let sc = sc.min(cols);
+        let ec2 = ec.saturating_add(1).min(cols).max(sc);
+        let text = screen.contents_between(sr, sc, er, ec2);
+        let text = text.trim_end().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let n = text.chars().count();
+        copy_to_clipboard(&text);
+        self.notify(format!("copied {n} chars"));
+        self.copied_at = Some(Instant::now());
+    }
+
     fn copy_selection(&mut self) {
         let Some(sel) = self.select else { return };
         if sel.is_empty() {
@@ -1641,6 +1681,8 @@ impl App {
     }
 
     fn close_popup(&mut self) {
+        self.popup_sel = None;
+        self.popup_selecting = false;
         if let Some(mut p) = self.popup.take() {
             let _ = p.child.kill();
             let _ = p.child.wait();
@@ -2749,8 +2791,39 @@ impl App {
     async fn on_mouse(&mut self, ev: MouseEvent) {
         let (col, row) = (ev.column, ev.row);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
-        // A popup owns the screen — ignore mouse on the panes behind it.
+        // A popup owns the screen — no pane interaction behind it, but you can
+        // still drag-select its text and copy on release.
         if self.popup.is_some() {
+            match ev.kind {
+                MouseEventKind::Moved => self.hover = Some((col, row)),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.cfg.ui.mouse_select {
+                        if let Some(cell) = self.popup_cell_at(col, row) {
+                            self.popup_sel = Some(Sel {
+                                pane: 0,
+                                anchor: cell,
+                                head: cell,
+                            });
+                            self.popup_selecting = true;
+                        }
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.popup_selecting => {
+                    if let Some(cell) = self.popup_cell_at(col, row) {
+                        if let Some(s) = self.popup_sel.as_mut() {
+                            s.head = cell;
+                        }
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) if self.popup_selecting => {
+                    self.popup_selecting = false;
+                    match self.popup_sel {
+                        Some(sel) if !sel.is_empty() => self.copy_popup_selection(),
+                        _ => self.popup_sel = None,
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         // Palette overlay owns the mouse while open: wheel moves the cursor, a
@@ -5925,6 +5998,31 @@ impl App {
             Paragraph::new(lines).style(Style::default().bg(th.surface)),
             inner,
         );
+        // Highlight the active text selection over the rendered content.
+        if let Some(sel) = self.popup_sel.filter(|s| !s.is_empty() || self.popup_selecting) {
+            let ((sr, sc), (er, ec)) = sel.ordered();
+            let buf = f.buffer_mut();
+            for gy in sr..=er {
+                let (c0, c1) = if sr == er {
+                    (sc, ec)
+                } else if gy == sr {
+                    (sc, inner.width.saturating_sub(1))
+                } else if gy == er {
+                    (0, ec)
+                } else {
+                    (0, inner.width.saturating_sub(1))
+                };
+                for gx in c0..=c1 {
+                    let x = inner.x + gx;
+                    let y = inner.y + gy;
+                    if x < inner.x + inner.width && y < inner.y + inner.height {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_bg(th.select_bg);
+                        }
+                    }
+                }
+            }
+        }
         if !screen.hide_cursor() {
             let (crow, ccol) = screen.cursor_position();
             let cx = inner.x + ccol.min(inner.width.saturating_sub(1));
@@ -6134,6 +6232,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         drag: None,
         select: None,
         selecting: false,
+        popup_sel: None,
+        popup_selecting: false,
         copied_at: None,
         hover: None,
         tick: 0,
