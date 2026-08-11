@@ -1,0 +1,6 @@
+# Calendars the "next event" status widget watches — one name per line.
+# Empty file (all comments) = all calendars. Names must match:
+#   icalBuddy -nc calendars
+# Example:
+# josh@work.com
+# Personal
