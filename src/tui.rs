@@ -721,6 +721,10 @@ struct App {
     /// Cached output of per-pane `#(command)` segments (keyed by pane id + the
     /// command), run in each pane's cwd for the per-pane status bar.
     pane_status_cmds: HashMap<(u64, String), String>,
+    /// Cwd a pane's commands were last run in (to detect `cd`).
+    pane_cwd_seen: HashMap<u64, String>,
+    /// When a pane's commands last ran (rate-limit after cd + idle re-poll).
+    pane_refreshed_at: HashMap<u64, Instant>,
 }
 
 /// Extract `#(command)` segments from a status format string.
@@ -4562,15 +4566,22 @@ impl App {
         }
     }
 
-    /// Re-run each per-pane `#(command)` from the pane_status template, once per
-    /// *visible* pane, in that pane's cwd (so git/gh reflect the pane's repo).
-    /// Runs on a slower ticker than the global status — `gh` isn't free.
+    /// Refresh per-pane `#(command)` output for *visible* panes, in each pane's
+    /// cwd. A pane refreshes when: it's new, its cwd changed (a `cd`) — rate-
+    /// limited to ~once/3s so rapid cds coalesce — or it's been parked longer
+    /// than `pane_status_poll` (0 disables idle re-polls). Called on a short
+    /// ticker; only actually spawns processes for panes that are *due*.
     async fn refresh_pane_status_cmds(&mut self) {
         let cmds = extract_commands(&self.cfg.ui.pane_status);
         if cmds.is_empty() {
             self.pane_status_cmds.clear();
+            self.pane_cwd_seen.clear();
+            self.pane_refreshed_at.clear();
             return;
         }
+        const CD_RATE: Duration = Duration::from_secs(3); // min gap between cd-triggered refreshes
+        let poll = self.cfg.ui.pane_status_poll;
+        let now = Instant::now();
         let panes: Vec<(u64, String)> = self
             .pane_rects
             .iter()
@@ -4578,7 +4589,20 @@ impl App {
             .collect();
         let visible: std::collections::HashSet<u64> = panes.iter().map(|(id, _)| *id).collect();
         self.pane_status_cmds.retain(|(id, _), _| visible.contains(id));
+        self.pane_cwd_seen.retain(|id, _| visible.contains(id));
+        self.pane_refreshed_at.retain(|id, _| visible.contains(id));
         for (id, cwd) in panes {
+            let last = self.pane_refreshed_at.get(&id).copied();
+            let elapsed = last.map(|t| now.duration_since(t));
+            let cwd_changed = self.pane_cwd_seen.get(&id).map(|s| s != &cwd).unwrap_or(true);
+            let due = match elapsed {
+                None => true,                                   // never run yet
+                Some(e) if cwd_changed => e >= CD_RATE,         // cd: refresh, rate-limited
+                Some(e) => poll > 0 && e >= Duration::from_secs(poll), // parked: idle re-poll
+            };
+            if !due {
+                continue;
+            }
             let cd = cwd.replace('\'', "'\\''");
             for c in &cmds {
                 let full = format!("cd '{cd}' 2>/dev/null && {c}");
@@ -4598,6 +4622,8 @@ impl App {
                 };
                 self.pane_status_cmds.insert((id, c.clone()), val);
             }
+            self.pane_cwd_seen.insert(id, cwd);
+            self.pane_refreshed_at.insert(id, now);
         }
     }
 
@@ -6380,6 +6406,8 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         pane_rects: Vec::new(),
         status_cmds: HashMap::new(),
         pane_status_cmds: HashMap::new(),
+        pane_cwd_seen: HashMap::new(),
+        pane_refreshed_at: HashMap::new(),
     };
     // Start zoomed on phones / narrow terminals.
     if app.narrow() {
@@ -6457,8 +6485,9 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_millis(spinner_ms));
     let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
-    // Per-pane #(cmd)s (git/gh) are heavier — refresh them less often.
-    let mut pane_status_ticker = tokio::time::interval(Duration::from_secs(15));
+    // Short decision tick: cheap (only spawns for panes whose cwd changed or
+    // whose idle-poll window elapsed — see refresh_pane_status_cmds).
+    let mut pane_status_ticker = tokio::time::interval(Duration::from_secs(2));
     app.refresh_status_cmds().await; // populate #(command) segments up front
     app.refresh_pane_status_cmds().await;
     while app.running {

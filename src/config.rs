@@ -540,6 +540,11 @@ pub struct UiConfig {
     /// the pane's own cwd (so git/gh reflect that repo). A `\n` splits it into
     /// multiple rows (each reserves a pane row).
     pub pane_status: String,
+    /// Seconds between idle re-polls of a pane's `#(cmd)` segments while parked
+    /// in one directory (0 = only refresh on cd). A cd always triggers a
+    /// refresh, rate-limited to at most once per few seconds. Keep this high if
+    /// your commands hit a rate-limited API (e.g. `gh`).
+    pub pane_status_poll: u64,
     /// Sidebar auto-collapses below this width; 0 = never.
     pub narrow_below: u16,
     pub spinner_ms: u64,
@@ -617,6 +622,7 @@ impl Default for UiConfig {
             pane_padding: 0,
             pane_titles: true,
             pane_status: String::new(),
+            pane_status_poll: 60,
             narrow_below: 70,
             spinner_ms: 120,
             toast_pos: ToastPos::BottomRight,
@@ -818,6 +824,7 @@ struct RawUi {
     pane_padding: Option<u16>,
     pane_titles: Option<bool>,
     pane_status: Option<String>,
+    pane_status_poll: Option<u64>,
     narrow_below: Option<u16>,
     spinner_ms: Option<u64>,
     toast: Option<RawToast>,
@@ -1397,6 +1404,7 @@ impl Config {
             pane_padding: raw.ui.pane_padding.unwrap_or(d.pane_padding).min(4),
             pane_titles: raw.ui.pane_titles.unwrap_or(d.pane_titles),
             pane_status: raw.ui.pane_status.unwrap_or(d.pane_status),
+            pane_status_poll: raw.ui.pane_status_poll.unwrap_or(d.pane_status_poll),
             narrow_below: raw.ui.narrow_below.unwrap_or(d.narrow_below),
             spinner_ms: raw.ui.spinner_ms.unwrap_or(d.spinner_ms).clamp(30, 2000),
             toast_pos: match raw
@@ -1638,6 +1646,7 @@ pane_titles = true          # false = pure grid, no per-pane title bars
 # Example (branch · repo · PR when in one):
 # pane_status = "#[accent]{branch}#[]  #[status_fg]#(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)#[]  #[waiting]#(gh pr view --json number -q .number 2>/dev/null | sed 's/^/PR #/')#[]"
 pane_status = ""
+pane_status_poll = 60       # secs between idle re-polls of pane #(cmd)s (0 = only on cd); raise for rate-limited APIs like gh
 narrow_below = 70           # sidebar auto-collapses under this width; 0 = never
 deck = true                 # touch-first card view when narrow (alt-d toggles); false = panes
 spinner_ms = 120            # working-spinner speed
