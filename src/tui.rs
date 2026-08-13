@@ -718,6 +718,9 @@ struct App {
     pane_rects: Vec<(u64, Rect)>,
     /// Cached output of `#(command)` status segments, refreshed on an interval.
     status_cmds: HashMap<String, String>,
+    /// Cached output of per-pane `#(command)` segments (keyed by pane id + the
+    /// command), run in each pane's cwd for the per-pane status bar.
+    pane_status_cmds: HashMap<(u64, String), String>,
 }
 
 /// Extract `#(command)` segments from a status format string.
@@ -1113,9 +1116,21 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// Rows the per-pane top bar occupies: the pane_status template's line count
+    /// if set, else 1 when pane_titles is on, else 0.
+    fn pane_bar_h(&self) -> u16 {
+        if self.mobile_focus() {
+            0 // the mobile header names the pane; no per-pane bar
+        } else if self.cfg.ui.pane_status.is_empty() {
+            self.cfg.ui.pane_titles as u16
+        } else {
+            self.cfg.ui.pane_status.lines().count().max(1) as u16
+        }
+    }
+
     /// The content sub-rect of a pane rect (inside title bar + padding).
     fn pane_content_rect(&self, rect: Rect) -> Rect {
-        let title = self.cfg.ui.pane_titles as u16;
+        let title = self.pane_bar_h();
         let pad = self.cfg.ui.pane_padding;
         Rect::new(
             rect.x + pad,
@@ -1228,7 +1243,7 @@ impl App {
     }
 
     fn pane_size(&self, rect: Rect) -> (u16, u16) {
-        let title: u16 = self.cfg.ui.pane_titles as u16;
+        let title: u16 = self.pane_bar_h();
         let pad = self.cfg.ui.pane_padding;
         let rows = rect.height.saturating_sub(title + 2 * pad).max(1);
         let cols = rect.width.saturating_sub(2 * pad).max(1);
@@ -4547,9 +4562,123 @@ impl App {
         }
     }
 
+    /// Re-run each per-pane `#(command)` from the pane_status template, once per
+    /// *visible* pane, in that pane's cwd (so git/gh reflect the pane's repo).
+    /// Runs on a slower ticker than the global status — `gh` isn't free.
+    async fn refresh_pane_status_cmds(&mut self) {
+        let cmds = extract_commands(&self.cfg.ui.pane_status);
+        if cmds.is_empty() {
+            self.pane_status_cmds.clear();
+            return;
+        }
+        let panes: Vec<(u64, String)> = self
+            .pane_rects
+            .iter()
+            .filter_map(|(id, _)| self.snap.pane(*id).map(|p| (*id, p.cwd.clone())))
+            .collect();
+        let visible: std::collections::HashSet<u64> = panes.iter().map(|(id, _)| *id).collect();
+        self.pane_status_cmds.retain(|(id, _), _| visible.contains(id));
+        for (id, cwd) in panes {
+            let cd = cwd.replace('\'', "'\\''");
+            for c in &cmds {
+                let full = format!("cd '{cd}' 2>/dev/null && {c}");
+                let out = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    tokio::process::Command::new("sh").arg("-c").arg(&full).output(),
+                )
+                .await;
+                let val = match out {
+                    Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    _ => String::new(),
+                };
+                self.pane_status_cmds.insert((id, c.clone()), val);
+            }
+        }
+    }
+
     /// Render a status format string (`status_left`/`status_right`) into spans,
     /// expanding {tokens}, `#(command)` output, and `#[color]` markup.
     fn render_status(&self, template: &str) -> Vec<Span<'static>> {
+        let val = |token: &str| -> String {
+            let space = self.active_space();
+            let tab = self.active_tab();
+            let pane = self.snap.pane(self.focused);
+            match token.split(':').next().unwrap_or(token) {
+                "space" => space.map(|s| s.name).unwrap_or_default(),
+                "tab" => tab.map(|t| t.name).unwrap_or_default(),
+                "spaces" => self.snap.spaces.len().to_string(),
+                "tabs" => space.map(|s| s.tabs.len()).unwrap_or(0).to_string(),
+                "panes" => self.snap.panes.len().to_string(),
+                "agents" => self.agent_rows().len().to_string(),
+                "needs" => self.attention().len().to_string(),
+                "host" => hostname(),
+                "cwd" => pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
+                "clock" => {
+                    let fmt = token.split_once(':').map(|x| x.1).unwrap_or("%H:%M");
+                    chrono::Local::now().format(fmt).to_string()
+                }
+                _ => String::new(),
+            }
+        };
+        let cmd = |c: &str| -> String { self.status_cmds.get(c).cloned().unwrap_or_default() };
+        self.render_template(template, &val, &cmd)
+    }
+
+    /// Resolve a per-pane status token for `pane_id`.
+    fn pane_token(&self, pane_id: u64, token: &str) -> String {
+        let p = self.snap.pane(pane_id);
+        match token.split(':').next().unwrap_or(token) {
+            "title" | "name" => p.map(|p| p.title.clone()).unwrap_or_default(),
+            "cmd" => p.map(|p| p.cmd.join(" ")).unwrap_or_default(),
+            "cwd" => p.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
+            "id" => pane_id.to_string(),
+            "branch" => p.map(|p| p.git_branch.clone()).unwrap_or_default(),
+            "agent" => p.and_then(|p| p.agent.clone()).unwrap_or_default(),
+            "activity" => p
+                .map(|p| {
+                    match p.activity {
+                        Activity::Working => "working",
+                        Activity::Waiting => "waiting",
+                        Activity::Idle => "idle",
+                        Activity::Done => "done",
+                    }
+                    .to_string()
+                })
+                .unwrap_or_default(),
+            "host" => hostname(),
+            "clock" => {
+                let fmt = token.split_once(':').map(|x| x.1).unwrap_or("%H:%M");
+                chrono::Local::now().format(fmt).to_string()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Render one line of a pane's status template.
+    fn render_pane_status(&self, pane_id: u64, template: &str) -> Vec<Span<'static>> {
+        let val = |token: &str| -> String { self.pane_token(pane_id, token) };
+        let cmd = |c: &str| -> String {
+            self.pane_status_cmds
+                .get(&(pane_id, c.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        self.render_template(template, &val, &cmd)
+    }
+
+    /// Shared parser for status templates: `{tokens}` via `val`, `#(cmd)` output
+    /// via `cmd`, plus `#[color]` markup, `{|}` dividers and `{sp:N}` spacers.
+    fn render_template(
+        &self,
+        template: &str,
+        val: &dyn Fn(&str) -> String,
+        cmd: &dyn Fn(&str) -> String,
+    ) -> Vec<Span<'static>> {
         let th = &self.cfg.theme;
         let resolve_color = |name: &str| -> Color {
             if let Some(hex) = name.strip_prefix('#').filter(|h| h.len() == 6) {
@@ -4573,27 +4702,6 @@ impl App {
                 "done_err" => th.done_err,
                 "select_bg" => th.select_bg,
                 _ => th.status_fg,
-            }
-        };
-        let val = |token: &str| -> String {
-            let space = self.active_space();
-            let tab = self.active_tab();
-            let pane = self.snap.pane(self.focused);
-            match token.split(':').next().unwrap_or(token) {
-                "space" => space.map(|s| s.name).unwrap_or_default(),
-                "tab" => tab.map(|t| t.name).unwrap_or_default(),
-                "spaces" => self.snap.spaces.len().to_string(),
-                "tabs" => space.map(|s| s.tabs.len()).unwrap_or(0).to_string(),
-                "panes" => self.snap.panes.len().to_string(),
-                "agents" => self.agent_rows().len().to_string(),
-                "needs" => self.attention().len().to_string(),
-                "host" => hostname(),
-                "cwd" => pane.map(|p| home_relative(&p.cwd)).unwrap_or_default(),
-                "clock" => {
-                    let fmt = token.split_once(':').map(|x| x.1).unwrap_or("%H:%M");
-                    chrono::Local::now().format(fmt).to_string()
-                }
-                _ => String::new(),
             }
         };
         let mut spans: Vec<Span> = Vec::new();
@@ -4623,16 +4731,14 @@ impl App {
                 };
             } else if ch == '#' && chars.peek() == Some(&'(') {
                 chars.next(); // consume '('
-                let mut cmd = String::new();
+                let mut cmdstr = String::new();
                 for c in chars.by_ref() {
                     if c == ')' {
                         break;
                     }
-                    cmd.push(c);
+                    cmdstr.push(c);
                 }
-                if let Some(v) = self.status_cmds.get(&cmd) {
-                    buf.push_str(v);
-                }
+                buf.push_str(&cmd(&cmdstr));
             } else if ch == '{' {
                 flush(&mut spans, &mut buf, fg);
                 let mut token = String::new();
@@ -4790,7 +4896,20 @@ impl App {
 
             let mut content_y = rect.y;
             let mut content_h = rect.height;
-            if titles {
+            let bar_h = self.pane_bar_h();
+            if !self.cfg.ui.pane_status.is_empty() && !self.mobile_focus() {
+                // Configurable per-pane bar (one row per template line).
+                let bar_bg = self.flash_bg(*pane, if focused { th.select_bg } else { th.bar_bg });
+                for (i, tpl) in self.cfg.ui.pane_status.lines().enumerate() {
+                    let spans = self.render_pane_status(*pane, tpl);
+                    f.render_widget(
+                        Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg)),
+                        Rect::new(rect.x, rect.y + i as u16, rect.width, 1),
+                    );
+                }
+                content_y += bar_h;
+                content_h = content_h.saturating_sub(bar_h);
+            } else if titles {
                 let bar_bg = self.flash_bg(*pane, if focused { th.select_bg } else { th.bar_bg });
                 let mut title_spans = vec![
                     Span::styled(
@@ -6260,6 +6379,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
         action_hits: Vec::new(),
         pane_rects: Vec::new(),
         status_cmds: HashMap::new(),
+        pane_status_cmds: HashMap::new(),
     };
     // Start zoomed on phones / narrow terminals.
     if app.narrow() {
@@ -6337,7 +6457,10 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_millis(spinner_ms));
     let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
+    // Per-pane #(cmd)s (git/gh) are heavier — refresh them less often.
+    let mut pane_status_ticker = tokio::time::interval(Duration::from_secs(15));
     app.refresh_status_cmds().await; // populate #(command) segments up front
+    app.refresh_pane_status_cmds().await;
     while app.running {
         terminal.draw(|f| app.draw(f))?;
         tokio::select! {
@@ -6370,6 +6493,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
             },
             _ = ticker.tick() => app.on_tick(),
             _ = status_ticker.tick() => app.refresh_status_cmds().await,
+            _ = pane_status_ticker.tick() => app.refresh_pane_status_cmds().await,
         }
         while let Ok(b) = popup_rx.try_recv() {
             if b.is_empty() {
