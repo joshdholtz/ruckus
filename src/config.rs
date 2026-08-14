@@ -654,6 +654,9 @@ pub struct NotifyConfig {
     pub system: bool,
     /// Which transitions notify: "waiting", "done".
     pub events: Vec<String>,
+    /// Minimum seconds between notifications for the *same* pane, so a pane that
+    /// flaps working↔waiting (an animating agent, a spinner) can't spam you.
+    pub cooldown: u64,
 }
 
 impl Default for NotifyConfig {
@@ -661,6 +664,7 @@ impl Default for NotifyConfig {
         NotifyConfig {
             system: true,
             events: vec!["waiting".to_string()],
+            cooldown: 120,
         }
     }
 }
@@ -860,6 +864,7 @@ struct RawGlyphs {
 struct RawNotify {
     system: Option<bool>,
     events: Option<Vec<String>>,
+    cooldown: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1482,6 +1487,7 @@ impl Config {
 
         let dn = NotifyConfig::default();
         let notify = NotifyConfig {
+            cooldown: raw.notify.cooldown.unwrap_or(dn.cooldown),
             system: raw.notify.system.unwrap_or(dn.system),
             events: raw.notify.events.unwrap_or(dn.events),
         };
@@ -1667,6 +1673,7 @@ remote_label = "☁ {host}: {name}"
 [notify]
 system = true               # macOS notification when a pane needs you and nobody's watching
 events = ["waiting"]        # add "done" to also notify on finished panes
+cooldown = 120              # min secs between notifications for the SAME pane (anti-spam for flapping panes)
 
 [glyphs]
 waiting = "◉"

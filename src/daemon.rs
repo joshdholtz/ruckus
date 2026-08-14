@@ -703,6 +703,10 @@ struct State {
     next_id: u64,
     notify_waiting: bool,
     notify_done: bool,
+    /// Min seconds between notifications for the same pane (anti-spam).
+    notify_cooldown: u64,
+    /// Pane id → unix secs of its last notification (cooldown bookkeeping).
+    last_notified: HashMap<u64, u64>,
     quiet_after: std::time::Duration,
     detect_osc133: bool,
     detect_foreground: bool,
@@ -863,6 +867,8 @@ pub async fn run() -> Result<()> {
         next_id: 1,
         notify_waiting: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting"),
         notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
+        notify_cooldown: cfg.notify.cooldown,
+        last_notified: HashMap::new(),
         quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
@@ -984,16 +990,31 @@ pub async fn run() -> Result<()> {
                         } else {
                             st.conns.values().cloned().collect()
                         };
-                        let notify_titles: Vec<String> = changes
-                            .iter()
-                            .filter(|(_, a)| *a == Activity::Waiting && notify_waiting)
-                            .filter_map(|(pane, _)| {
-                                st.panes
+                        let notify_titles: Vec<String> = {
+                            let now = unix_now();
+                            let cooldown = st.notify_cooldown;
+                            let mut out = Vec::new();
+                            for (pane, a) in &changes {
+                                if *a != Activity::Waiting || !notify_waiting {
+                                    continue;
+                                }
+                                let title = match st.panes.get(pane) {
+                                    Some(p) if p.subs.is_empty() => p.info.title.clone(),
+                                    _ => continue,
+                                };
+                                // Anti-spam: skip if this pane notified within the cooldown.
+                                if st
+                                    .last_notified
                                     .get(pane)
-                                    .filter(|p| p.subs.is_empty())
-                                    .map(|p| p.info.title.clone())
-                            })
-                            .collect();
+                                    .is_some_and(|t| now.saturating_sub(*t) < cooldown)
+                                {
+                                    continue;
+                                }
+                                st.last_notified.insert(*pane, now);
+                                out.push(title);
+                            }
+                            out
+                        };
                         // ~ every 5s (ticker runs at 250ms): snapshot dirty scrollbacks
                         // to write off-lock.
                         let flushes: Vec<(u64, Vec<u8>)> = if n.is_multiple_of(20) {
@@ -1701,6 +1722,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                         cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
                     st.notify_done =
                         cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done");
+                    st.notify_cooldown = cfg.notify.cooldown;
                     st.quiet_after = std::time::Duration::from_millis(cfg.ui.activity_quiet_ms);
                     st.detect_osc133 = cfg.ui.detect_osc133;
                     st.detect_foreground = cfg.ui.detect_foreground;
@@ -2301,7 +2323,7 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                     .with(move |st| {
                         let notify_waiting = st.notify_waiting;
                         let detect_osc = st.detect_osc133;
-                        let (changed, notify_title, sub_txs) = {
+                        let (changed, notify_candidate, sub_txs) = {
                             let p = st.panes.get_mut(&id)?;
                             p.scrollback.extend(bytes.iter().copied());
                             while p.scrollback.len() > SCROLLBACK_MAX {
@@ -2343,15 +2365,33 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                                 }
                                 _ => None,
                             };
-                            let notify_title = match changed {
+                            let notify_candidate = match changed {
                                 Some(Activity::Waiting) if notify_waiting && p.subs.is_empty() => {
                                     Some(p.info.title.clone())
                                 }
                                 _ => None,
                             };
                             let sub_txs: Vec<Tx> = p.subs.values().map(|s| s.tx.clone()).collect();
-                            (changed, notify_title, sub_txs)
+                            (changed, notify_candidate, sub_txs)
                         }; // p borrow ends here
+                        // Anti-spam cooldown: a pane that flaps working↔waiting (an
+                        // animating agent) must not notify more than once per window.
+                        let notify_title = match notify_candidate {
+                            Some(title) => {
+                                let now = unix_now();
+                                if st
+                                    .last_notified
+                                    .get(&id)
+                                    .is_some_and(|t| now.saturating_sub(*t) < st.notify_cooldown)
+                                {
+                                    None
+                                } else {
+                                    st.last_notified.insert(id, now);
+                                    Some(title)
+                                }
+                            }
+                            None => None,
+                        };
                         let osc_change = if detect_osc {
                             scan_osc133(&bytes).and_then(|s| {
                                 st.panes.get_mut(&id).and_then(|p| apply_report(p, s))
