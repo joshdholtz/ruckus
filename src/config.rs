@@ -494,6 +494,8 @@ pub struct UiConfig {
     pub sidebar_pos: SidebarPos,
     pub sidebar_start_visible: bool,
     pub sidebar_width: u16,
+    /// Sidebar sections, top-to-bottom. Default ["spaces"]; add "needs_you"
+    /// for a pinned attention list of panes waiting on you.
     pub sidebar_sections: Vec<String>,
     /// 0 = sections stacked top-to-bottom. >0 splits the sidebar: the last
     /// section is pinned to the bottom `sidebar_split` fraction of the height,
@@ -505,7 +507,8 @@ pub struct UiConfig {
     pub sidebar_marker: bool,
     /// Show 1-based jump numbers (alt+1..9) on tabs — in the strip and sidebar.
     pub tab_numbers: bool,
-    /// List each space's tabs under it in the sidebar (false = spaces only).
+    /// List each space's tabs under it in the sidebar (default false, since the
+    /// tab strip already shows them). true = tabs nested under every space.
     pub sidebar_tabs: bool,
     /// How a working pane is shown: spinner | pulse | dot.
     pub working_style: WorkingStyle,
@@ -586,12 +589,12 @@ impl Default for UiConfig {
             sidebar_pos: SidebarPos::Left,
             sidebar_start_visible: true,
             sidebar_width: 26,
-            sidebar_sections: vec!["needs_you".to_string(), "spaces".to_string()],
+            sidebar_sections: vec!["spaces".to_string()],
             sidebar_split: 0.0,
             sidebar_row_gap: 1,
             sidebar_marker: true,
             tab_numbers: true,
-            sidebar_tabs: true,
+            sidebar_tabs: false,
             working_style: WorkingStyle::Spinner,
             activity_quiet_ms: 900,
             detect_osc133: false,
@@ -1635,7 +1638,7 @@ last_space = "alt-l"      # jump back to the previously-active space
 link_click = "plain"         # plain | ctrl | shift — how a click fires a link
 sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
-sidebar_sections = ["needs_you", "spaces"]  # order them, or drop one
+sidebar_sections = ["spaces"]  # add "needs_you" for a pinned "waiting on you" list at the top
 gutter = 1                  # cells between panes: 0 = dense, 2 = airy
 pane_padding = 0            # cells of breathing room inside each pane
 pane_titles = true          # false = pure grid, no per-pane title bars
@@ -1653,7 +1656,8 @@ spinner_ms = 120            # working-spinner speed
 toast = { position = "bottom-right", seconds = 4 }  # also: top-left/right, bottom-left
 header = "top"              # top | bottom | off
 footer = "bottom"           # bottom | top | off
-tab_strip = true            # false hides the tab row (tabs still in the sidebar)
+tab_strip = true            # false hides the top tab row
+sidebar_tabs = false        # true nests each space's tabs under it in the sidebar (the strip already shows them)
 mouse = true                # false leaves the mouse to your terminal (select/copy)
 mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt bindings
 
