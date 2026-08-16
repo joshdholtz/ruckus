@@ -6303,6 +6303,36 @@ impl App {
     }
 }
 
+/// True while a `guarded_draw` is in flight, so the panic hook recovers a
+/// transient render panic (a resize race from a mobile SSH client backgrounding)
+/// instead of tearing the terminal down.
+static RENDER_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw one frame, swallowing a panic from inside the render so a single bad
+/// frame — e.g. a rect that briefly exceeds the buffer mid-resize — can't kill
+/// the session. Nothing is flushed on panic (ratatui flushes after the closure),
+/// so the next frame redraws cleanly at the settled size. The panic is logged to
+/// `~/.ruckus/client.log` for root-causing.
+fn guarded_draw(
+    terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    RENDER_GUARD.store(true, Ordering::Relaxed);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        terminal.draw(|f| app.draw(f)).map(|_| ())
+    }));
+    RENDER_GUARD.store(false, Ordering::Relaxed);
+    // On a recovered panic, force a full repaint next frame so no stale cells linger.
+    match out {
+        Ok(res) => res,
+        Err(_) => {
+            let _ = terminal.clear();
+            Ok(())
+        }
+    }
+}
+
 pub async fn run(initial: Option<String>) -> Result<()> {
     crate::client::init_client_log();
     tracing::info!("ruckus tui starting");
@@ -6444,6 +6474,14 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a guarded draw is a transient render glitch (mobile
+        // resize race) — log it and let catch_unwind recover; DON'T tear the
+        // terminal down or we'd drop out of the alt screen mid-session.
+        if RENDER_GUARD.load(std::sync::atomic::Ordering::Relaxed) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            tracing::error!("recovered render panic: {info}\n{bt}");
+            return;
+        }
         let _ = disable_raw_mode();
         // Restore ALL modes we set (incl. bracketed paste) so a crash never leaves
         // the terminal unable to paste/select/click.
@@ -6491,7 +6529,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     app.refresh_status_cmds().await; // populate #(command) segments up front
     app.refresh_pane_status_cmds().await;
     while app.running {
-        terminal.draw(|f| app.draw(f))?;
+        guarded_draw(&mut terminal, &mut app)?;
         tokio::select! {
             ev = in_rx.recv() => match ev {
                 Some(e) => app.on_term_event(e).await,
@@ -6504,7 +6542,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                     // reattach instead of exiting. Panes persist across daemon
                     // restarts under the same ids, so the view comes right back.
                     app.toast("reconnecting…");
-                    terminal.draw(|f| app.draw(f))?;
+                    guarded_draw(&mut terminal, &mut app)?;
                     if !reconnect(&mut app, &mut in_rx, &mev_tx).await {
                         app.running = false;
                     }
