@@ -65,6 +65,10 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
         "disconnect remote (the space you're on)",
     ),
     (Action::Theme, "change theme (pick + live preview)"),
+    (
+        Action::ToggleMouse,
+        "toggle mouse (off = native select + local cmd-click over SSH)",
+    ),
     (Action::ToggleSidebar, "toggle sidebar"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
@@ -800,6 +804,14 @@ fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// True when this ruckus is running inside an SSH session, so "open a URL"
+/// can't reach a local browser — the controlling terminal is on another machine.
+fn in_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
 }
 
 fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
@@ -1619,6 +1631,16 @@ impl App {
         let Some((prog, args)) = argv.split_first() else {
             return;
         };
+        // Over SSH, `open`/`xdg-open` would run on the *remote* box — the wrong
+        // machine, usually with no browser at all. Copy the URL to the LOCAL
+        // terminal's clipboard (OSC 52 rides the SSH stream) so it's one ⌘V from
+        // the local browser instead of silently doing nothing.
+        if in_ssh() && matches!(prog.as_str(), "open" | "xdg-open" | "start") {
+            let url = args.last().map(String::as_str).unwrap_or(matched);
+            copy_to_clipboard(url);
+            self.notify(format!("🔗 copied (remote) — ⌘V to open: {matched}"));
+            return;
+        }
         let _ = std::process::Command::new(prog)
             .args(args)
             .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
@@ -2058,6 +2080,20 @@ impl App {
                 }
             }
             Action::Theme => self.open_theme_pick(),
+            Action::ToggleMouse => {
+                self.cfg.ui.mouse = !self.cfg.ui.mouse;
+                let mut out = std::io::stdout();
+                if self.cfg.ui.mouse {
+                    let _ = crossterm::execute!(out, EnableMouseCapture);
+                    self.toast("🖱 mouse on — ruckus handles clicks");
+                } else {
+                    let _ = crossterm::execute!(out, DisableMouseCapture);
+                    // Drop any in-flight ruckus selection so the terminal owns the mouse.
+                    self.select = None;
+                    self.selecting = false;
+                    self.toast("🖱 mouse off — native drag-select, ⌘-click opens locally");
+                }
+            }
         }
     }
 

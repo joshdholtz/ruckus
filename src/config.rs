@@ -41,6 +41,11 @@ pub enum Action {
     DisconnectRemote,
     /// Open the theme picker (built-ins + ~/.ruckus/themes) with live preview.
     Theme,
+    /// Toggle mouse capture at runtime. Off hands the mouse back to your
+    /// terminal for native drag-select and cmd-click-to-open (which opens links
+    /// on your *local* machine when you're SSH'd in). On restores ruckus's own
+    /// click/select handling.
+    ToggleMouse,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -70,6 +75,7 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::ConnectRemote, "connect_remote", &[]),
     (Action::DisconnectRemote, "disconnect_remote", &[]),
     (Action::Theme, "theme", &[]),
+    (Action::ToggleMouse, "toggle_mouse", &["alt-k"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
