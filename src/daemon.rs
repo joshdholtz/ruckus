@@ -321,13 +321,24 @@ fn kill_pane_session(p: &mut PaneSession) {
     p.pty.kill();
 }
 
-/// Resize the PTY to the max dimensions requested by any attached subscriber.
-/// No-op when nobody is attached (keeps the last size).
-fn apply_max_attach_size(p: &mut PaneSession) {
-    let (rows, cols) = p
-        .subs
-        .values()
-        .fold((0u16, 0u16), |(r, c), s| (r.max(s.rows), c.max(s.cols)));
+/// Resize the PTY to fit its attached subscribers: the largest by default (a
+/// tiny client can't shrink a big TUI), or the smallest when `smallest` is set
+/// (tmux-style — columns shrink to the narrowest client so a phone gets a
+/// readable, wrapped view). No-op when nobody is attached (keeps the last size).
+fn apply_attach_size(p: &mut PaneSession, smallest: bool) {
+    let dims: Vec<(u16, u16)> = p.subs.values().map(|s| (s.rows, s.cols)).collect();
+    if dims.is_empty() {
+        return;
+    }
+    let (rows, cols) = if smallest {
+        dims.iter()
+            .copied()
+            .reduce(|(r, c), (r2, c2)| (r.min(r2), c.min(c2)))
+            .unwrap()
+    } else {
+        dims.iter()
+            .fold((0u16, 0u16), |(r, c), &(r2, c2)| (r.max(r2), c.max(c2)))
+    };
     if rows == 0 || cols == 0 {
         return;
     }
@@ -707,6 +718,9 @@ struct State {
     detect_osc133: bool,
     detect_foreground: bool,
     agent_commands: Vec<String>,
+    /// true = size a shared pane to its smallest viewer (tmux-style); false
+    /// (default) = size to the largest so a phone/tail can't shrink a TUI.
+    attach_smallest: bool,
     /// Listening socket fd, handed off (un-CLOEXEC'd) across a self-exec upgrade.
     listener_fd: RawFd,
     /// Hybrid remote mirror: LIVE connections by origin; the known specs (persist
@@ -867,6 +881,7 @@ pub async fn run() -> Result<()> {
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
         agent_commands: cfg.ui.agent_commands.clone(),
+        attach_smallest: matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest),
         listener_fd,
         remotes: BTreeMap::new(),
         remote_specs: BTreeMap::new(),
@@ -1596,14 +1611,15 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     let Some(tx) = st.conns.get(&conn_id).cloned() else {
                         return err("connection not registered");
                     };
+                    let smallest = st.attach_smallest;
                     let Some(p) = st.panes.get_mut(&pane) else {
                         return err(format!("no pane {pane}"));
                     };
                     let rows = rows.max(1);
                     let cols = cols.max(1);
                     p.subs.insert(conn_id, Sub { tx, rows, cols });
-                    // Max-of-subscribers size: small clients cannot shrink a large TUI.
-                    apply_max_attach_size(p);
+                    // Size to subscribers (largest by default, or smallest per config).
+                    apply_attach_size(p, smallest);
                     let scrollback = B64.encode(p.scrollback.make_contiguous());
                     ServerMsg::Attached { pane, scrollback }
                 })
@@ -1612,10 +1628,11 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         Request::Detach { pane } => {
             state
                 .with(move |st| {
+                    let smallest = st.attach_smallest;
                     if let Some(p) = st.panes.get_mut(&pane) {
                         p.subs.remove(&conn_id);
                         // Recompute size from remaining subscribers (if any).
-                        apply_max_attach_size(p);
+                        apply_attach_size(p, smallest);
                     }
                     ServerMsg::Done
                 })
@@ -1640,6 +1657,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         Request::Resize { pane, rows, cols } => {
             state
                 .with(move |st| {
+                    let smallest = st.attach_smallest;
                     let Some(p) = st.panes.get_mut(&pane) else {
                         return err(format!("no pane {pane}"));
                     };
@@ -1648,7 +1666,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     if let Some(sub) = p.subs.get_mut(&conn_id) {
                         sub.rows = rows;
                         sub.cols = cols;
-                        apply_max_attach_size(p);
+                        apply_attach_size(p, smallest);
                     } else {
                         // No active attach for this conn — apply size directly.
                         p.pty.resize(rows, cols);
@@ -1705,6 +1723,13 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     st.detect_osc133 = cfg.ui.detect_osc133;
                     st.detect_foreground = cfg.ui.detect_foreground;
                     st.agent_commands = cfg.ui.agent_commands.clone();
+                    st.attach_smallest =
+                        matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest);
+                    // Re-apply sizing to every pane so a policy change takes effect now.
+                    let smallest = st.attach_smallest;
+                    for p in st.panes.values_mut() {
+                        apply_attach_size(p, smallest);
+                    }
                     info!("config reloaded; notifying {} clients", st.conns.len());
                     broadcast(st, ServerMsg::ConfigChanged);
                     ServerMsg::Done

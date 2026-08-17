@@ -452,6 +452,18 @@ pub enum ToastPos {
     BottomRight,
 }
 
+/// How a pane's PTY is sized when several clients view it at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachSize {
+    /// Size to the largest viewer — a small client (a phone, a `tail`) can't
+    /// shrink a big TUI. The default.
+    Largest,
+    /// Size to the smallest viewer (tmux-style): the pane's columns shrink to
+    /// the narrowest connected client, so a phone gets a readable, wrapped view
+    /// and every client shares it.
+    Smallest,
+}
+
 /// How a "working" pane is indicated in the dots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingStyle {
@@ -510,6 +522,8 @@ pub struct UiConfig {
     /// List each space's tabs under it in the sidebar (default false, since the
     /// tab strip already shows them). true = tabs nested under every space.
     pub sidebar_tabs: bool,
+    /// How a shared pane's PTY is sized across clients: largest | smallest.
+    pub attach_size: AttachSize,
     /// How a working pane is shown: spinner | pulse | dot.
     pub working_style: WorkingStyle,
     /// Milliseconds of output silence before a pane drops working -> idle/waiting.
@@ -595,6 +609,7 @@ impl Default for UiConfig {
             sidebar_marker: true,
             tab_numbers: true,
             sidebar_tabs: false,
+            attach_size: AttachSize::Largest,
             working_style: WorkingStyle::Spinner,
             activity_quiet_ms: 900,
             detect_osc133: false,
@@ -813,6 +828,7 @@ struct RawUi {
     sidebar_marker: Option<bool>,
     tab_numbers: Option<bool>,
     sidebar_tabs: Option<bool>,
+    attach_size: Option<String>,
     working_style: Option<String>,
     activity_quiet_ms: Option<u64>,
     detect_osc133: Option<bool>,
@@ -1379,6 +1395,10 @@ impl Config {
             sidebar_marker: raw.ui.sidebar_marker.unwrap_or(d.sidebar_marker),
             tab_numbers: raw.ui.tab_numbers.unwrap_or(d.tab_numbers),
             sidebar_tabs: raw.ui.sidebar_tabs.unwrap_or(d.sidebar_tabs),
+            attach_size: match raw.ui.attach_size.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("smallest") => AttachSize::Smallest,
+                _ => AttachSize::Largest,
+            },
             working_style: match raw
                 .ui
                 .working_style
@@ -1658,6 +1678,7 @@ header = "top"              # top | bottom | off
 footer = "bottom"           # bottom | top | off
 tab_strip = true            # false hides the top tab row
 sidebar_tabs = false        # true nests each space's tabs under it in the sidebar (the strip already shows them)
+attach_size = "largest"     # largest = a small viewer (phone/tail) can't shrink a big TUI; smallest = columns shrink to the narrowest client (tmux-style, readable on a phone)
 mouse = true                # false leaves the mouse to your terminal (select/copy)
 mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt bindings
 
