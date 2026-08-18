@@ -593,6 +593,8 @@ pub struct UiConfig {
     pub mac_option_fallback: bool,
     /// What click fires a link handler: ctrl | shift | plain.
     pub link_click: LinkClick,
+    /// How matched links are drawn: none | underline | accent | both.
+    pub link_style: LinkStyle,
     pub space_row: String,
     pub tab_row: String,
     pub queue_row: String,
@@ -664,6 +666,7 @@ impl Default for UiConfig {
             mouse_select: true,
             mac_option_fallback: true,
             link_click: LinkClick::Plain,
+            link_style: LinkStyle::Underline,
             space_row: "{icon} {name}".to_string(),
             tab_row: "{icon} {title}".to_string(),
             queue_row: "{icon} {title}".to_string(),
@@ -737,6 +740,28 @@ pub enum LinkClick {
     Ctrl,
     Shift,
     Plain,
+}
+
+/// How matched links (regex rules + OSC 8 hyperlinks) are drawn in a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStyle {
+    /// No decoration — a link looks like plain text (still clickable).
+    None,
+    /// Underline the link text.
+    Underline,
+    /// Tint the link text with the theme accent color.
+    Accent,
+    /// Underline *and* accent-tint — the classic "this is a link" look.
+    Both,
+}
+
+impl LinkStyle {
+    pub fn underline(self) -> bool {
+        matches!(self, LinkStyle::Underline | LinkStyle::Both)
+    }
+    pub fn accent(self) -> bool {
+        matches!(self, LinkStyle::Accent | LinkStyle::Both)
+    }
 }
 
 /// A remote daemon to mirror into the sidebar (config `[[remote]]`), reached via
@@ -865,6 +890,7 @@ struct RawUi {
     mouse_select: Option<bool>,
     mac_option_fallback: Option<bool>,
     link_click: Option<String>,
+    link_style: Option<String>,
     space_row: Option<String>,
     remote_label: Option<String>,
     tab_row: Option<String>,
@@ -1488,6 +1514,12 @@ impl Config {
                 Some("shift") => LinkClick::Shift,
                 _ => LinkClick::Plain,
             },
+            link_style: match raw.ui.link_style.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("none") | Some("off") => LinkStyle::None,
+                Some("accent") | Some("color") => LinkStyle::Accent,
+                Some("both") => LinkStyle::Both,
+                _ => LinkStyle::Underline,
+            },
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
             remote_label: raw.ui.remote_label.unwrap_or(d.remote_label),
             tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
@@ -1662,6 +1694,7 @@ last_space = "alt-l"      # jump back to the previously-active space
 
 [ui]
 link_click = "plain"         # plain | ctrl | shift — how a click fires a link
+link_style = "underline"     # none | underline | accent | both — how links are drawn
 sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
 sidebar_sections = ["spaces"]  # add "needs_you" for a pinned "waiting on you" list at the top

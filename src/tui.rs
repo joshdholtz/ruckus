@@ -5870,6 +5870,69 @@ impl App {
         }
     }
 
+    /// Decorate matched links (regex rules + OSC 8 hyperlinks) so they read as
+    /// links. Mirrors `link_at`'s matching exactly — same regex rules, same
+    /// hyperlink cells, same live-screen-only scope — so what's underlined is
+    /// precisely what a click will open.
+    fn draw_links(&self, f: &mut Frame) {
+        let style = self.cfg.ui.link_style;
+        if style == crate::config::LinkStyle::None {
+            return;
+        }
+        let mut link_style = Style::default();
+        if style.underline() {
+            link_style = link_style.add_modifier(Modifier::UNDERLINED);
+        }
+        if style.accent() {
+            link_style = link_style.fg(self.cfg.theme.accent);
+        }
+        for (pid, rect) in &self.pane_rects {
+            let c = self.pane_content_rect(*rect);
+            if c.width == 0 || c.height == 0 {
+                continue;
+            }
+            let Some(view) = self.views.get(pid) else {
+                continue;
+            };
+            // Only the live screen is matched — link_at ignores scrollback too,
+            // so decorating a scrolled-back view would disagree with clicks.
+            if view.scroll != 0 {
+                continue;
+            }
+            let screen = view.parser.screen();
+            let contents = screen.contents();
+            let rows: Vec<&str> = contents.lines().collect();
+            let buf = f.buffer_mut();
+            for r in 0..c.height {
+                // Char-column ranges matched by the regex link rules on this row.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                if let Some(line) = rows.get(r as usize) {
+                    for rule in &self.cfg.links {
+                        for m in rule.pattern.find_iter(line) {
+                            let start = line[..m.start()].chars().count();
+                            let end = start + m.as_str().chars().count();
+                            ranges.push((start, end));
+                        }
+                    }
+                }
+                for col in 0..c.width {
+                    let osc8 = screen
+                        .cell(r, col)
+                        .and_then(|cell| cell.hyperlink())
+                        .is_some();
+                    let matched =
+                        ranges.iter().any(|&(s, e)| (col as usize) >= s && (col as usize) < e);
+                    if !(osc8 || matched) {
+                        continue;
+                    }
+                    if let Some(cell) = buf.cell_mut((c.x + col, c.y + r)) {
+                        cell.set_style(link_style);
+                    }
+                }
+            }
+        }
+    }
+
     fn draw_menu(&self, f: &mut Frame) {
         let Some(m) = &self.menu else { return };
         let th = &self.cfg.theme;
@@ -6306,6 +6369,7 @@ impl App {
             }
         }
         self.draw_panes(f);
+        self.draw_links(f);
         self.draw_dividers(f);
         self.draw_selection(f);
         if let Some(r) = self.frame.action {
