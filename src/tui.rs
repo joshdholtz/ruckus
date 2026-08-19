@@ -3427,10 +3427,12 @@ impl App {
                 false,
             ),
         };
-        let bytes = if mode != vt100::MouseProtocolMode::None {
+        let bytes = if altscreen && mode != vt100::MouseProtocolMode::None {
+            // Full-screen app that grabbed the mouse (vim, htop): forward the wheel
+            // so the app scrolls its own viewport.
             Some(encode_mouse_wheel(up, ccol, crow, enc))
         } else if altscreen {
-            // Alternate-scroll: most terminals send arrow keys here.
+            // Full-screen app without mouse: alternate-scroll sends arrow keys.
             let seq: &[u8] = match (up, appcursor) {
                 (true, true) => b"\x1bOA",
                 (true, false) => b"\x1b[A",
@@ -3439,6 +3441,10 @@ impl App {
             };
             Some(seq.repeat(3))
         } else {
+            // Main screen (shells, Claude Code, Codex, an ssh'd agent): the wheel
+            // scrolls OUR pane scrollback so history is visible — even if the app
+            // enabled mouse reporting. A normal terminal treats wheel-on-main-screen
+            // this way too; forwarding it to the app is what ate the scrollback.
             None
         };
         match bytes {
