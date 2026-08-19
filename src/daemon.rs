@@ -269,7 +269,14 @@ struct PaneSession {
     /// and its cached result. Heavy output (Claude Code redraws) would otherwise
     /// scan the whole screen thousands of times/sec under the state lock.
     last_prompt_scan: std::time::Instant,
-    prompt_cached: bool,
+    /// Cached classification of the visible screen (from `classify_tail`). Lets a
+    /// "waiting on you" prompt win even while the agent footer keeps animating —
+    /// otherwise any repaint pinned the pane on Working forever.
+    scan_cached: Activity,
+    /// Sticky: set once we ever see a coding-agent marker in this pane's output.
+    /// Survives a raw `ssh host` command whose program name is `ssh`, not
+    /// `claude` — so an ssh'd agent still gets the "quiet → needs you" inference.
+    looks_like_agent: bool,
     /// Scrollback changed since the last disk flush.
     dirty: bool,
     /// Rendered screen state — activity classification reads what a user would
@@ -579,11 +586,84 @@ fn notify_system(title: &str, msg: &str) {
     }
 }
 
+/// Strong coding-agent markers. Seeing any of these means the pane is running an
+/// agent even if its command is `ssh` — used to latch `looks_like_agent`.
+fn has_agent_marker(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("esc to interrupt")
+        || t.contains("ctrl+c to interrupt")
+        || t.contains("esc to cancel")
+        || t.contains("do you want to proceed")
+        || t.contains("tab to amend")
+}
+
+/// The program name to classify against. A raw `ssh host` running claude/codex
+/// reports its command as `ssh`, so once we've latched `looks_like_agent` we
+/// classify as an agent — that's what restores "quiet → needs you" over SSH.
+fn effective_prog(p: &PaneSession) -> String {
+    if p.looks_like_agent {
+        return "claude".to_string();
+    }
+    basename(p.info.cmd.first().map(String::as_str).unwrap_or(""))
+}
+
 /// Classify a pane that has gone quiet: is it blocked on you, or just idle?
 fn classify_quiet(p: &PaneSession) -> Activity {
     let text = p.screen.screen().contents();
-    let prog = basename(p.info.cmd.first().map(String::as_str).unwrap_or(""));
-    classify_tail(&prog, &text)
+    classify_tail(&effective_prog(p), &text)
+}
+
+fn activity_name(a: Activity) -> &'static str {
+    match a {
+        Activity::Working => "working",
+        Activity::Waiting => "waiting",
+        Activity::Done => "done",
+        Activity::Idle => "idle",
+    }
+}
+
+/// Run a plugin/config hook command detached, with the pane's context in env
+/// (RUCKUS_PANE / RUCKUS_PANE_TITLE / RUCKUS_ACTIVITY plus the usual SOCK/DIR).
+fn spawn_hook(run: &str, pane: u64, title: &str, activity: &str) {
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(run)
+        .env("RUCKUS_SOCK", socket_path().display().to_string())
+        .env("RUCKUS_DIR", ruckus_dir().display().to_string())
+        .env("RUCKUS_PANE", pane.to_string())
+        .env("RUCKUS_PANE_TITLE", title)
+        .env("RUCKUS_ACTIVITY", activity)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Collect the hook commands to run for a set of `(pane, new activity)` changes.
+/// Returns `(run, pane, title, activity)` tuples to spawn *after* the state lock
+/// is released — never spawn a subprocess while holding the actor.
+fn collect_hook_fires(
+    hooks: &[crate::config::Hook],
+    panes: &HashMap<u64, PaneSession>,
+    changes: &[(u64, Activity)],
+) -> Vec<(String, u64, String, &'static str)> {
+    if hooks.is_empty() {
+        return Vec::new();
+    }
+    let mut fires = Vec::new();
+    for (pane, activity) in changes {
+        let name = activity_name(*activity);
+        let title = panes
+            .get(pane)
+            .map(|p| p.info.title.clone())
+            .unwrap_or_default();
+        for h in hooks {
+            if h.on == name {
+                fires.push((h.run.clone(), *pane, title.clone(), name));
+            }
+        }
+    }
+    fires
 }
 
 /// True when a single line looks like an interactive input prompt, not a log
@@ -721,6 +801,9 @@ struct State {
     /// true = size a shared pane to its smallest viewer (tmux-style); false
     /// (default) = size to the largest so a phone/tail can't shrink a TUI.
     attach_smallest: bool,
+    /// Activity-transition hooks (config + plugin `[[hook]]`): fired when a pane
+    /// enters a matching state.
+    hooks: Vec<crate::config::Hook>,
     /// Listening socket fd, handed off (un-CLOEXEC'd) across a self-exec upgrade.
     listener_fd: RawFd,
     /// Hybrid remote mirror: LIVE connections by origin; the known specs (persist
@@ -882,6 +965,7 @@ pub async fn run() -> Result<()> {
         detect_foreground: cfg.ui.detect_foreground,
         agent_commands: cfg.ui.agent_commands.clone(),
         attach_smallest: matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest),
+        hooks: cfg.hooks.clone(),
         listener_fd,
         remotes: BTreeMap::new(),
         remote_specs: BTreeMap::new(),
@@ -962,7 +1046,7 @@ pub async fn run() -> Result<()> {
                 // (broadcast frames, desktop notifications, scrollback writes) and
                 // run it AFTER releasing — holding the mutex across a subprocess
                 // spawn or 38 disk writes is what made the contention window huge.
-                let (frames, txs, notify_titles, flushes) = state
+                let (frames, txs, notify_titles, flushes, hook_fires) = state
                     .with(move |st| {
                         let quiet_after = st.quiet_after;
                         let notify_waiting = st.notify_waiting;
@@ -1023,7 +1107,8 @@ pub async fn run() -> Result<()> {
                         } else {
                             Vec::new()
                         };
-                        (frames, txs, notify_titles, flushes)
+                        let hook_fires = collect_hook_fires(&st.hooks, &st.panes, &changes);
+                        (frames, txs, notify_titles, flushes, hook_fires)
                     })
                     .await; // actor released before any I/O below
 
@@ -1037,6 +1122,9 @@ pub async fn run() -> Result<()> {
                 }
                 for (id, bytes) in flushes {
                     let _ = std::fs::write(scrollback_path(id), &bytes);
+                }
+                for (run, pane, title, activity) in hook_fires {
+                    spawn_hook(&run, pane, &title, activity);
                 }
             }
         });
@@ -1725,6 +1813,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     st.agent_commands = cfg.ui.agent_commands.clone();
                     st.attach_smallest =
                         matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest);
+                    st.hooks = cfg.hooks.clone();
                     // Re-apply sizing to every pane so a policy change takes effect now.
                     let smallest = st.attach_smallest;
                     for p in st.panes.values_mut() {
@@ -2142,7 +2231,8 @@ fn install_pane(
             resized_at: now,
             reported: None,
             last_prompt_scan: now,
-            prompt_cached: false,
+            scan_cached: Activity::Idle,
+            looks_like_agent: false,
             dirty: false,
             screen,
         },
@@ -2335,25 +2425,31 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                             p.last_output = std::time::Instant::now();
                             p.dirty = true;
                             p.screen.process(&bytes);
-                            // Throttle full-screen agent-prompt scans — Claude redraws
-                            // would otherwise peg the daemon under the lock.
+                            // Throttle the full-screen scan — Claude redraws would
+                            // otherwise peg the daemon under the lock. Classify with the
+                            // same rich matcher the quiet ticker uses (not a 3-phrase
+                            // subset) so "waiting on you" is caught immediately and both
+                            // paths agree. Also latch a sticky agent flag so a raw
+                            // `ssh host` running claude/codex is still treated as an agent.
                             if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250)
                             {
-                                let text = p.screen.screen().contents().to_lowercase();
-                                p.prompt_cached = text.contains("esc to cancel")
-                                    || text.contains("do you want to proceed")
-                                    || text.contains("tab to amend");
+                                let text = p.screen.screen().contents();
+                                if has_agent_marker(&text) {
+                                    p.looks_like_agent = true;
+                                }
+                                p.scan_cached = classify_tail(&effective_prog(p), &text);
                                 p.last_prompt_scan = std::time::Instant::now();
                             }
-                            let waiting_prompt = p.prompt_cached;
                             // Ignore repaint bursts after resize (view switch).
                             let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
-                            let target = if waiting_prompt {
-                                Some(Activity::Waiting)
-                            } else if !repaint {
-                                Some(Activity::Working)
-                            } else {
-                                None
+                            // A "waiting on you" prompt wins even while the footer keeps
+                            // animating — otherwise continuous repaints pinned the pane on
+                            // Working. "esc to interrupt" is an explicit Working signal.
+                            let target = match p.scan_cached {
+                                Activity::Waiting => Some(Activity::Waiting),
+                                Activity::Working => Some(Activity::Working),
+                                _ if !repaint => Some(Activity::Working),
+                                _ => None,
                             };
                             // Detector owns this pane — don't let raw output override it.
                             let changed = match target {
@@ -2384,14 +2480,29 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                         } else {
                             None
                         };
-                        Some((changed, notify_title, osc_change, sub_txs))
+                        // Fire activity hooks for whichever transition happened (the
+                        // output heuristic or an OSC 133 report). Collected here, run
+                        // after the lock releases.
+                        let mut act_changes: Vec<(u64, Activity)> = Vec::new();
+                        if let Some(a) = changed {
+                            act_changes.push((id, a));
+                        }
+                        if let Some(a) = osc_change {
+                            act_changes.push((id, a));
+                        }
+                        let hook_fires = collect_hook_fires(&st.hooks, &st.panes, &act_changes);
+                        Some((changed, notify_title, osc_change, sub_txs, hook_fires))
                     })
                     .await;
-                let Some((changed, notify_waiting_title, osc_change, sub_txs)) = result else {
+                let Some((changed, notify_waiting_title, osc_change, sub_txs, hook_fires)) = result
+                else {
                     continue; // pane gone
                 };
                 for tx in &sub_txs {
                     let _ = tx.send(out_frame.clone());
+                }
+                for (run, pane, title, activity) in hook_fires {
+                    spawn_hook(&run, pane, &title, activity);
                 }
                 if changed.is_some() || osc_change.is_some() {
                     state
@@ -2739,5 +2850,27 @@ mod tests {
         assert!(!looks_like_input_prompt("Error: boom"));
         assert!(!looks_like_input_prompt("Compiling foo:"));
         assert!(!looks_like_input_prompt("https://x.com:"));
+    }
+
+    #[test]
+    fn agent_markers_latch_over_ssh() {
+        // A raw `ssh box` running claude shows an agent footer — we must recognize
+        // it so the pane (whose program is `ssh`) still classifies as an agent.
+        assert!(has_agent_marker("... esc to interrupt\n"));
+        assert!(has_agent_marker("Do you want to proceed?\n❯ 1. Yes"));
+        assert!(!has_agent_marker("just some log output\ncompiling..."));
+
+        // Latched agent + a quiet screen (no explicit marker) => "needs you",
+        // even though the command name is `ssh`. classify_tail keys off the
+        // effective program name, which effective_prog() maps to an agent.
+        assert_eq!(
+            classify_tail("claude", "here is my summary of the changes"),
+            Activity::Waiting
+        );
+        // Without the latch, the same quiet screen under `ssh` is just idle.
+        assert_eq!(
+            classify_tail("ssh", "here is my summary of the changes"),
+            Activity::Idle
+        );
     }
 }

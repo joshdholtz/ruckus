@@ -786,6 +786,9 @@ pub struct Config {
     pub commands: Vec<CommandBind>,
     /// Link handlers: pattern → command. Defaults to opening URLs.
     pub links: Vec<LinkRule>,
+    /// Activity-transition hooks (config + plugin `[[hook]]`): on a pane entering
+    /// a state, the daemon runs a command. The reactive/alerting layer.
+    pub hooks: Vec<Hook>,
     /// Declared plugin refs (`owner/repo[/subpath]`) — installed on startup so a
     /// copied config.toml reproduces your setup on a new machine.
     pub plugins: Vec<String>,
@@ -1013,8 +1016,34 @@ fn lower_links(raw: &[RawLink]) -> Vec<LinkRule> {
         .collect()
 }
 
-/// A plugin manifest (`ruckus-plugin.toml`). Reuses the `[[bind]]` / `[[link]]`
-/// shapes so a plugin adds command shortcuts and link handlers.
+/// A pane activity-transition hook: when a pane enters `on`, the daemon runs
+/// `run` (detached) with RUCKUS_PANE / RUCKUS_PANE_TITLE / RUCKUS_ACTIVITY set.
+/// The reactive layer — wire a sound, a push, a nudge to another agent.
+#[derive(Debug, Clone)]
+pub struct Hook {
+    /// "waiting" | "working" | "done" | "idle"
+    pub on: String,
+    pub run: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawHook {
+    on: String,
+    run: String,
+}
+
+fn lower_hooks(raw: &[RawHook]) -> Vec<Hook> {
+    raw.iter()
+        .filter(|h| !h.on.trim().is_empty() && !h.run.trim().is_empty())
+        .map(|h| Hook {
+            on: h.on.trim().to_lowercase(),
+            run: h.run.clone(),
+        })
+        .collect()
+}
+
+/// A plugin manifest (`ruckus-plugin.toml`). Reuses the `[[bind]]` / `[[link]]` /
+/// `[[hook]]` shapes so a plugin adds shortcuts, link handlers, and reactions.
 #[derive(Debug, Default, Deserialize)]
 struct RawManifest {
     plugin: Option<RawPluginMeta>,
@@ -1024,6 +1053,8 @@ struct RawManifest {
     link: Vec<RawLink>,
     #[serde(default)]
     status: Vec<RawStatus>,
+    #[serde(default)]
+    hook: Vec<RawHook>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1213,6 +1244,9 @@ struct RawConfig {
     /// Link handlers: pattern → command.
     #[serde(default)]
     link: Vec<RawLink>,
+    /// Activity-transition hooks: on = state, run = command.
+    #[serde(default)]
+    hook: Vec<RawHook>,
     /// Declared plugin refs installed on startup.
     #[serde(default)]
     plugins: Vec<String>,
@@ -1288,6 +1322,7 @@ impl Config {
                 }
                 self.commands.extend(binds);
                 self.links.extend(lower_links(&m.link));
+                self.hooks.extend(lower_hooks(&m.hook));
                 // Plugin status segments. Each is a named token `#{<plugin>}` you
                 // place anywhere in status_left/right — the template stays the
                 // single source of truth for layout. If you haven't placed the
@@ -1360,8 +1395,9 @@ impl Config {
             None if keymap == Keymap::Alt => None,
             None => parse_binding("ctrl-b").ok(),
         };
-        // Command shortcuts + link handlers (shared with plugin manifests).
+        // Command shortcuts + link handlers + hooks (shared with plugin manifests).
         let commands = lower_binds(&raw.bind);
+        let hooks = lower_hooks(&raw.hook);
         let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
@@ -1553,6 +1589,7 @@ impl Config {
             prefix_keys,
             commands,
             links,
+            hooks,
             plugins: raw.plugins,
             remotes: raw.remote,
             theme,
@@ -1676,6 +1713,19 @@ last_space = "alt-l"      # jump back to the previously-active space
 # key = "alt-e"
 # run = "htop"
 # where = "tab"
+
+# Hooks: run a command when a pane enters an activity state (waiting | working |
+# done | idle). Runs detached via `sh -c`, with RUCKUS_PANE, RUCKUS_PANE_TITLE,
+# RUCKUS_ACTIVITY (+ RUCKUS_SOCK / RUCKUS_DIR) in the environment. The reactive
+# layer — wire a sound, a push notification, or a nudge to another agent.
+# Plugins can ship the same `[[hook]]` blocks in their ruckus-plugin.toml.
+# [[hook]]
+# on = "waiting"                 # a pane (e.g. an agent) now needs you
+# run = "afplay /System/Library/Sounds/Glass.aiff"
+#
+# [[hook]]
+# on = "waiting"
+# run = 'terminal-notifier -message "$RUCKUS_PANE_TITLE needs you"'
 
 # Link handlers: text matching `pattern` (Rust regex) becomes clickable and
 # runs `run` — ${url}/${match} are replaced with the matched text as ONE
@@ -1908,6 +1958,32 @@ run = "open https://linear.app/issue/${match}"
         let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
         assert_eq!(m.as_str(), "FIS-42");
         assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
+    }
+
+    #[test]
+    fn hooks_parse_and_normalize() {
+        let cfg = Config::from_toml_str("");
+        assert!(cfg.hooks.is_empty());
+        let cfg = Config::from_toml_str(
+            r#"
+[[hook]]
+on = "Waiting"
+run = "afplay glass.aiff"
+
+[[hook]]
+on = "done"
+run = "echo done"
+
+[[hook]]
+on = ""
+run = "ignored — no trigger"
+"#,
+        );
+        // Blank-trigger hook dropped; `on` lowercased.
+        assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.hooks[0].on, "waiting");
+        assert_eq!(cfg.hooks[0].run, "afplay glass.aiff");
+        assert_eq!(cfg.hooks[1].on, "done");
     }
 
     #[test]
