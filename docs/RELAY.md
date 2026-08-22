@@ -7,8 +7,24 @@ mirror into your sidebar and are fully read/write, exactly like the SSH remote
 mirror today ([REMOTE.md](REMOTE.md)) — this only swaps the **transport** under
 the existing hub.
 
-Status: **design — not yet built.** Terminal-only. Auth MVP: a **shared account
-secret**. This doc is the plan of record; nothing here is implemented.
+Status: **RL0–RL4 implemented** (RL5 TLS skipped — run inside Tailscale; RL6
+TUI/startup polish pending). Terminal-only. Auth MVP: a **shared account
+secret**. Verified end-to-end: a client daemon mirrors a device daemon's tabs
+through the broker with no SSH.
+
+## Implemented surface
+
+- `ruckus relay --listen 0.0.0.0:9777 --account <acct>` — run the broker
+  (secret from `$RUCKUS_RELAY_SECRET`). Put one on a tailnet host.
+- `[relay]` config: `url` (host:port), `account`, `device` (advertise this
+  daemon), `secret_env` (default `RUCKUS_RELAY_SECRET`). A daemon with `device`
+  set dials out and registers automatically.
+- `ruckus relay-attach <device>` — attach a remote device through the relay;
+  it mirrors into the sidebar exactly like an SSH remote, and auto-reconnects.
+
+**Pending (RL6):** a TUI palette action + startup auto-attach for relay
+`[[remote]]`s (today attach is via the CLI), and TLS/E2E (RL5, deferred to
+Tailscale). Everything below is the design of record.
 
 ## Why a relay (vs. today's SSH mirror)
 

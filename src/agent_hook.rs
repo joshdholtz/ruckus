@@ -238,6 +238,114 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+// ─────────────────────────────── install ───────────────────────────────
+
+/// Print (or, with `write`, idempotently merge) the hook config that wires an
+/// agent's native hooks to `ruckus agent-hook`. `gate` also installs a blocking
+/// approve-from-sidebar hook for risky tools (Bash/Write/Edit).
+pub async fn setup(agent: String, gate: bool, write: Option<std::path::PathBuf>) -> Result<()> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "ruckus".into());
+    match agent.as_str() {
+        "claude" => setup_claude(&exe, gate, write),
+        "codex" => {
+            let cmd = format!("[\"{exe}\", \"agent-hook\", \"codex\"]");
+            println!(
+                "# Codex reads notify from ~/.codex/config.toml (global only). Add:\n\nnotify = {cmd}\n\n\
+                 # Note: Codex's notify fires only on turn-complete. Full state + approvals\n\
+                 # need `codex app-server` (planned, see docs/AGENT_ADAPTERS.md AA5)."
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("no adapter for `{other}` (try: claude, codex)"),
+    }
+}
+
+fn setup_claude(exe: &str, gate: bool, write: Option<std::path::PathBuf>) -> Result<()> {
+    // Observe on every relevant event; optionally gate risky tools for approval.
+    let observe = |args: &str| {
+        json!([{ "hooks": [{ "type": "command", "command": format!("{exe} agent-hook {args}") }] }])
+    };
+    let mut hooks = serde_json::Map::new();
+    let pre = if gate {
+        json!([
+            { "matcher": "Bash|Write|Edit|MultiEdit",
+              "hooks": [{ "type": "command", "command": format!("{exe} agent-hook claude --gate") }] },
+            { "matcher": "*",
+              "hooks": [{ "type": "command", "command": format!("{exe} agent-hook claude") }] },
+        ])
+    } else {
+        json!([{ "matcher": "*",
+                 "hooks": [{ "type": "command", "command": format!("{exe} agent-hook claude") }] }])
+    };
+    hooks.insert("PreToolUse".into(), pre);
+    hooks.insert("PostToolUse".into(), observe("claude"));
+    hooks.insert("Notification".into(), observe("claude"));
+    hooks.insert("Stop".into(), observe("claude"));
+    hooks.insert("SessionEnd".into(), observe("claude"));
+    let hooks = Value::Object(hooks);
+
+    let Some(path) = write else {
+        println!(
+            "# Add this to your Claude settings (~/.claude/settings.json or a\n\
+             # project .claude/settings.json). Re-run with --write <path> to merge:\n"
+        );
+        println!("{}", serde_json::to_string_pretty(&json!({ "hooks": hooks }))?);
+        return Ok(());
+    };
+
+    // Idempotent merge: preserve the user's file + any non-ruckus hooks; replace
+    // only our own entries (identified by "ruckus agent-hook" in the command).
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    let obj = root.as_object_mut().unwrap();
+    let existing = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`hooks` in {} is not an object", path.display()))?;
+    for (event, groups) in hooks.as_object().unwrap() {
+        let list = existing
+            .entry(event.clone())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
+        // Drop our previous entries, keep the user's.
+        list.retain(|g| !group_is_ours(g));
+        if let Some(arr) = groups.as_array() {
+            list.extend(arr.iter().cloned());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    println!("wrote ruckus agent hooks to {}", path.display());
+    Ok(())
+}
+
+/// Does a hook group contain a `ruckus agent-hook` command (i.e. one we own)?
+fn group_is_ours(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .map(|hs| {
+            hs.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("agent-hook"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -7,8 +7,35 @@ it's blocked on (`Bash(rm -rf …)`, a file diff), and let you **approve / deny 
 answer / interrupt from the sidebar** (from any attached client, including a
 relay laptop — see [RELAY.md](RELAY.md)).
 
-Status: **design — not yet built.** Grounded in the current tree + a survey of
-Claude Code, Codex, opencode, and Cursor integration surfaces (2026).
+Status: **AA0–AA2 implemented** (Claude observe + approve-from-sidebar; Codex
+notify-observe). AA3 TUI cards, AA4 opencode/Cursor, AA5 Codex app-server, AA6
+scopes pending. Grounded in the current tree + a survey of Claude Code, Codex,
+opencode, and Cursor integration surfaces (2026).
+
+## Implemented surface
+
+- `ruckus agent-hook <agent> [--gate]` — the universal adapter handler. Runs
+  inside a pane; reads `RUCKUS_PANE` + the agent's hook JSON on stdin; reports
+  exact state via `ReportAgentState`. `--gate` blocks on `AwaitDecision` and
+  prints Claude's `permissionDecision` so you can approve/deny from the sidebar.
+- `ruckus agent-setup <agent> [--gate] [--write <settings.json>]` — print (or
+  idempotently merge) the hook config into Claude's settings / Codex's config.
+- `ruckus resolve <pane> <request_id> allow|deny|escalate` — resolve a pending
+  approval (what the TUI's approve/deny button will call).
+- New protocol: `AgentState`/`AgentPhase`/`Approval`/`Decision`,
+  `PaneInfo.agent_state`, `ReportAgentState`/`AwaitDecision`/`ResolveDecision`,
+  `AgentState`/`Decided` events, a pending-decision registry on the daemon. All
+  pane-scoped, so approvals raised on a device resolve from any relay client.
+
+Verified end-to-end: a blocked Claude `PreToolUse` gate surfaces the approval
+(`Bash(rm -rf …)`), `resolve allow` propagates back as
+`permissionDecision:allow`.
+
+**Pending:** AA3 (TUI approval cards + keybinds — the visible sidebar UX; the
+data is already on `PaneInfo.agent_state`), AA4 (opencode/Cursor via the same
+`agent-hook`), AA5 (Codex `app-server` for real state + interrupt/steer), AA6
+(capability scopes gating remote control). Everything below is the design of
+record.
 
 ## What Ruckus does today (the clean slate we build on)
 

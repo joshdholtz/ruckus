@@ -63,6 +63,19 @@ enum Cmd {
         #[arg(long)]
         gate: bool,
     },
+    /// Print or install the hook config that wires an agent (claude/codex) to
+    /// ruckus so it reports exact state (and, with --gate, sidebar approvals).
+    AgentSetup {
+        /// Agent name: claude | codex
+        agent: String,
+        /// Also install a blocking approve-from-sidebar hook for risky tools.
+        #[arg(long)]
+        gate: bool,
+        /// Merge into this settings file instead of printing (e.g.
+        /// ~/.claude/settings.json or .claude/settings.json).
+        #[arg(long)]
+        write: Option<std::path::PathBuf>,
+    },
     /// Resolve a pending agent approval (what the sidebar approve/deny does).
     Resolve {
         /// Pane id the approval is on
@@ -239,6 +252,7 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
         Some(Cmd::AgentHook { agent, gate }) => agent_hook::run(agent, gate).await,
+        Some(Cmd::AgentSetup { agent, gate, write }) => agent_hook::setup(agent, gate, write).await,
         Some(Cmd::Resolve {
             pane,
             request_id,
