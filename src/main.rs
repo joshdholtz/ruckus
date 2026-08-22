@@ -1,3 +1,4 @@
+mod agent_hook;
 mod client;
 mod config;
 mod daemon;
@@ -50,6 +51,27 @@ enum Cmd {
     RelayAttach {
         /// Device name registered on the relay
         device: String,
+    },
+    /// Internal: per-agent hook callback. Reads the agent's hook JSON on stdin
+    /// and reports exact agent state into ruckus; `--gate` blocks for a sidebar
+    /// approval. Installed into the agent's own hook config.
+    #[command(name = "agent-hook", hide = true)]
+    AgentHook {
+        /// Agent name: claude | codex | …
+        agent: String,
+        /// Block on tool-use and answer allow/deny from the sidebar.
+        #[arg(long)]
+        gate: bool,
+    },
+    /// Resolve a pending agent approval (what the sidebar approve/deny does).
+    Resolve {
+        /// Pane id the approval is on
+        pane: u64,
+        /// Approval request id (from the pane's agent_state.pending)
+        request_id: String,
+        /// allow | deny | escalate
+        #[arg(value_parser = ["allow", "deny", "escalate"])]
+        decision: String,
     },
     /// List spaces, tabs, and panes
     Ls,
@@ -216,6 +238,27 @@ async fn main() -> Result<()> {
             relay::run_broker(&listen, account, secret).await
         }
         Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
+        Some(Cmd::AgentHook { agent, gate }) => agent_hook::run(agent, gate).await,
+        Some(Cmd::Resolve {
+            pane,
+            request_id,
+            decision,
+        }) => {
+            let decision = match decision.as_str() {
+                "allow" => Decision::Allow,
+                "deny" => Decision::Deny,
+                _ => Decision::Escalate,
+            };
+            simple_req(
+                Request::ResolveDecision {
+                    pane,
+                    request_id,
+                    decision,
+                },
+                "resolved",
+            )
+            .await
+        }
         Some(Cmd::Ls) => ls().await,
         Some(Cmd::New { name, detach, cmd }) => new_tab(name, detach, cmd).await,
         Some(Cmd::NewSpace { name }) => new_space(name).await,

@@ -6884,6 +6884,7 @@ mod palette_tests {
             preview: String::new(),
             activity_since: 0,
             git_branch: String::new(),
+            agent_state: None,
         }
     }
     fn tab(id: u64, name: &str, pane_id: u64) -> TabInfo {

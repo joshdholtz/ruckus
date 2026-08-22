@@ -87,7 +87,11 @@ pub fn prefix_servermsg(msg: &mut ServerMsg, origin: Origin) {
             g(tab);
             g(pane);
         }
-        ServerMsg::Done | ServerMsg::Error { .. } | ServerMsg::ConfigChanged => {}
+        ServerMsg::AgentState { pane, .. } => g(pane),
+        ServerMsg::Done
+        | ServerMsg::Error { .. }
+        | ServerMsg::ConfigChanged
+        | ServerMsg::Decided { .. } => {}
     }
 }
 
@@ -139,6 +143,11 @@ pub fn route_request(req: &mut Request) -> Origin {
         Request::Resize { pane, .. } => strip1(pane),
         Request::ReportActivity { pane, .. } => strip1(pane),
         Request::ReportAgent { pane, .. } => strip1(pane),
+        // Per-agent adapter traffic is pane-scoped: strip to local and forward,
+        // so approvals raised on a remote device resolve from any client.
+        Request::ReportAgentState { pane, .. } => strip1(pane),
+        Request::AwaitDecision { pane, .. } => strip1(pane),
+        Request::ResolveDecision { pane, .. } => strip1(pane),
         Request::Snapshot
         | Request::NewSpace { .. }
         | Request::Reload
@@ -194,6 +203,7 @@ mod tests {
             preview: String::new(),
             activity_since: 0,
             git_branch: String::new(),
+            agent_state: None,
         }
     }
 

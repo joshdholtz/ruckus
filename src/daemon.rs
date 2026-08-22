@@ -827,6 +827,9 @@ struct State {
     remote_origins: BTreeMap<String, Origin>,
     connecting: std::collections::HashSet<Origin>,
     next_origin: Origin,
+    /// Pending per-agent approvals: (pane, request_id) → the parked `AwaitDecision`
+    /// reply sink. Fulfilled by `ResolveDecision` from any client. Never persisted.
+    decisions: HashMap<(u64, String), tokio::sync::oneshot::Sender<Decision>>,
     /// Set by any job that changes the persisted tree; the actor drains it to nudge
     /// the debounced saver. Never serialized.
     dirty: bool,
@@ -985,6 +988,7 @@ pub async fn run() -> Result<()> {
         remote_origins: BTreeMap::new(),
         connecting: std::collections::HashSet::new(),
         next_origin: 0,
+        decisions: HashMap::new(),
         dirty: false,
     };
 
@@ -1896,6 +1900,77 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 })
                 .await
         }
+        Request::ReportAgentState {
+            pane,
+            state: agent_state,
+        } => {
+            state
+                .with(move |st| {
+                    let Some(p) = st.panes.get_mut(&pane) else {
+                        return err(format!("no pane {pane}"));
+                    };
+                    // Exact phase overrides the heuristic (freeze), like report-activity.
+                    let activity = agent_state.phase.activity();
+                    p.reported = Some(activity);
+                    let changed =
+                        p.info.status == PaneStatus::Running && p.info.activity != activity;
+                    if changed {
+                        p.info.activity = activity;
+                        p.info.activity_since = unix_now();
+                    }
+                    p.info.agent = Some(agent_state.agent.clone());
+                    p.info.agent_state = Some(agent_state.clone());
+                    broadcast(st, ServerMsg::AgentState { pane, state: agent_state });
+                    if changed {
+                        broadcast(st, ServerMsg::Activity { pane, activity });
+                    }
+                    broadcast_state(st);
+                    ServerMsg::Done
+                })
+                .await
+        }
+        Request::ResolveDecision {
+            pane,
+            request_id,
+            decision,
+        } => {
+            state
+                .with(move |st| match st.decisions.remove(&(pane, request_id.clone())) {
+                    Some(tx) => {
+                        let _ = tx.send(decision);
+                        ServerMsg::Done
+                    }
+                    None => err(format!("no pending approval `{request_id}` on pane {pane}")),
+                })
+                .await
+        }
+        Request::AwaitDecision { pane, request_id } => {
+            // Park a reply sink under the actor, then await OUTSIDE it so the
+            // actor is never blocked. Times out to Escalate so the agent's own
+            // in-pane prompt still works if nobody answers.
+            let key = (pane, request_id);
+            let key2 = key.clone();
+            let rx = state
+                .with(move |st| {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    st.decisions.insert(key2, tx);
+                    rx
+                })
+                .await;
+            let decision = match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await
+            {
+                Ok(Ok(d)) => d,
+                _ => {
+                    state
+                        .with(move |st| {
+                            st.decisions.remove(&key);
+                        })
+                        .await;
+                    Decision::Escalate
+                }
+            };
+            ServerMsg::Decided { decision }
+        }
         Request::Reload => {
             state
                 .with(move |st| {
@@ -2324,6 +2399,7 @@ fn spawn_pane_with_id(
         preview: String::new(),
         activity_since: unix_now(),
         git_branch: String::new(),
+        agent_state: None,
     };
     install_pane(
         state,
