@@ -46,6 +46,10 @@ pub enum Action {
     /// on your *local* machine when you're SSH'd in). On restores ruckus's own
     /// click/select handling.
     ToggleMouse,
+    /// Approve the focused pane's pending agent approval (per-agent adapter).
+    ApproveAgent,
+    /// Deny the focused pane's pending agent approval.
+    DenyAgent,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -76,6 +80,8 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::DisconnectRemote, "disconnect_remote", &[]),
     (Action::Theme, "theme", &[]),
     (Action::ToggleMouse, "toggle_mouse", &["alt-k"]),
+    (Action::ApproveAgent, "approve_agent", &["alt-y"]),
+    (Action::DenyAgent, "deny_agent", &["alt-r"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of

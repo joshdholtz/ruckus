@@ -7,10 +7,10 @@ it's blocked on (`Bash(rm -rf …)`, a file diff), and let you **approve / deny 
 answer / interrupt from the sidebar** (from any attached client, including a
 relay laptop — see [RELAY.md](RELAY.md)).
 
-Status: **AA0–AA2 implemented** (Claude observe + approve-from-sidebar; Codex
-notify-observe). AA3 TUI cards, AA4 opencode/Cursor, AA5 Codex app-server, AA6
-scopes pending. Grounded in the current tree + a survey of Claude Code, Codex,
-opencode, and Cursor integration surfaces (2026).
+Status: **AA0–AA3 implemented** (Claude observe + approve-from-sidebar, Codex
+notify-observe, and the TUI approval cards + keybinds). AA4 opencode/Cursor, AA5
+Codex app-server, AA6 scopes pending. Grounded in the current tree + a survey of
+Claude Code, Codex, opencode, and Cursor integration surfaces (2026).
 
 ## Implemented surface
 
@@ -31,11 +31,14 @@ Verified end-to-end: a blocked Claude `PreToolUse` gate surfaces the approval
 (`Bash(rm -rf …)`), `resolve allow` propagates back as
 `permissionDecision:allow`.
 
-**Pending:** AA3 (TUI approval cards + keybinds — the visible sidebar UX; the
-data is already on `PaneInfo.agent_state`), AA4 (opencode/Cursor via the same
-`agent-hook`), AA5 (Codex `app-server` for real state + interrupt/steer), AA6
-(capability scopes gating remote control). Everything below is the design of
-record.
+- **TUI (AA3):** the NEEDS-YOU queue shows a pane's pending approval
+  (`⚠ Bash(rm -rf …)`) with `⌥y approve · ⌥r deny`; `approve_agent`/`deny_agent`
+  actions (default `alt-y`/`alt-r`, also in the palette) resolve the focused
+  pane's request. `ServerMsg::AgentState` updates the view live.
+
+**Pending:** AA4 (opencode/Cursor via the same `agent-hook`), AA5 (Codex
+`app-server` for real state + interrupt/steer), AA6 (capability scopes gating
+remote control). Everything below is the design of record.
 
 ## What Ruckus does today (the clean slate we build on)
 

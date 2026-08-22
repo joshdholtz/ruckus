@@ -70,6 +70,8 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
         "toggle mouse (off = native select + local cmd-click over SSH)",
     ),
     (Action::ToggleSidebar, "toggle sidebar"),
+    (Action::ApproveAgent, "approve agent request (focused pane)"),
+    (Action::DenyAgent, "deny agent request (focused pane)"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
 ];
@@ -1371,6 +1373,36 @@ impl App {
         }
     }
 
+    /// Resolve the focused pane's pending agent approval (the sidebar
+    /// approve/deny). No-op with a hint if nothing is pending. Routes through the
+    /// hub, so this works on a relay/SSH-remote pane too.
+    async fn resolve_focused_agent(&mut self, decision: Decision) {
+        let pane = self.focused;
+        let pending = self
+            .snap
+            .pane(pane)
+            .and_then(|p| p.agent_state.as_ref())
+            .and_then(|s| s.pending.as_ref())
+            .map(|a| (a.request_id.clone(), a.title.clone()));
+        let Some((request_id, title)) = pending else {
+            self.toast("no agent request pending on this pane");
+            return;
+        };
+        let verb = match decision {
+            Decision::Allow => "approved",
+            Decision::Deny => "denied",
+            Decision::Escalate => "escalated",
+        };
+        self.notify(format!("{verb} {title}"));
+        let _ = self
+            .route(Request::ResolveDecision {
+                pane,
+                request_id,
+                decision,
+            })
+            .await;
+    }
+
     /// The client's live SSH env, handed to the daemon so its detached `ssh` can
     /// authenticate as the user (agent auth / hardware-key touch are agent-side).
     fn ssh_env() -> std::collections::BTreeMap<String, String> {
@@ -2079,6 +2111,8 @@ impl App {
                     let _ = self.route(Request::DisconnectRemote { origin }).await;
                 }
             }
+            Action::ApproveAgent => self.resolve_focused_agent(Decision::Allow).await,
+            Action::DenyAgent => self.resolve_focused_agent(Decision::Deny).await,
             Action::Theme => self.open_theme_pick(),
             Action::ToggleMouse => {
                 self.cfg.ui.mouse = !self.cfg.ui.mouse;
@@ -3524,6 +3558,24 @@ impl App {
                     self.unread.insert(pane);
                 }
             }
+            ServerMsg::AgentState { pane, state } => {
+                let phase = state.phase;
+                if let Some(p) = self.snap.pane_mut(pane) {
+                    p.activity = phase.activity();
+                    p.agent = Some(state.agent.clone());
+                    p.agent_state = Some(state);
+                }
+                self.flash.insert(pane, Instant::now());
+                // A remote/unfocused pane asking for approval or input is notable.
+                if pane != self.focused
+                    && matches!(
+                        phase,
+                        AgentPhase::AwaitingApproval | AgentPhase::AwaitingInput | AgentPhase::Done
+                    )
+                {
+                    self.unread.insert(pane);
+                }
+            }
             ServerMsg::ConfigChanged => self.reload_config().await,
             _ => {}
         }
@@ -4113,6 +4165,31 @@ impl App {
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
                         push!(Line::from(spans), Some(Target::Pane(id)));
+                        // Per-agent adapter: if this pane is blocked on an approval,
+                        // show what it wants + how to answer (⌥y/⌥r by default).
+                        if let Some(appr) = self
+                            .snap
+                            .pane(id)
+                            .and_then(|p| p.agent_state.as_ref())
+                            .and_then(|s| s.pending.as_ref())
+                        {
+                            let cap = w.saturating_sub(6).max(8);
+                            let title: String = appr.title.chars().take(cap).collect();
+                            push!(
+                                Line::from(Span::styled(
+                                    format!("   ⚠ {title}"),
+                                    Style::default().fg(th.accent).bg(th.sidebar_bg),
+                                )),
+                                Some(Target::Pane(id))
+                            );
+                            push!(
+                                Line::from(Span::styled(
+                                    "     ⌥y approve · ⌥r deny".to_string(),
+                                    Style::default().fg(th.bar_fg).bg(th.sidebar_bg),
+                                )),
+                                None::<Target>
+                            );
+                        }
                     }
                     push!(Line::raw(""), None::<Target>);
                 }
