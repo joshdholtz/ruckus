@@ -9,10 +9,10 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::protocol::*;
 use crate::remote::{self, Origin};
@@ -142,9 +142,20 @@ fn persisted_bytes(st: &mut State) -> Option<Vec<u8>> {
 /// `remote_specs` so a dropped connection can be auto-reconnected without a client.
 #[derive(Clone)]
 struct RemoteSpecEnv {
+    /// SSH host, or — for a relay remote — the device name (used as the row tag).
     host: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    /// `Some` → reach this remote through a relay instead of SSH.
+    relay: Option<RelayTarget>,
+}
+
+/// Relay coordinates for a relay-transport remote.
+#[derive(Clone)]
+struct RelayTarget {
+    url: String,
+    account: String,
+    secret: String,
 }
 
 /// A LIVE mirrored remote daemon reached over `ssh … ruckus __proxy`. The daemon
@@ -153,8 +164,10 @@ struct RemoteSpecEnv {
 struct RemoteConn {
     host: String,
     client: Arc<crate::client::Client>,
-    /// kill_on_drop child; kept alive so the SSH survives client disconnects.
-    _child: tokio::process::Child,
+    /// kill_on_drop SSH child, kept alive so the link survives client
+    /// disconnects. `None` for a relay remote (the relay conn has no child; the
+    /// `Client`'s tasks + event stream keep it alive).
+    _child: Option<tokio::process::Child>,
     snapshot: Snapshot,
 }
 
@@ -1234,15 +1247,28 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    let mut next_conn: u64 = 1;
+    // Shared connection-id allocator: the unix accept loop and any relay-dialed
+    // sessions draw from the same counter so ids never collide in `st.conns`.
+    let conn_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Relay device registration: dial out to the broker and serve incoming
+    // sessions with the same `handle_conn` engine as local unix connections.
+    if let Some(relay) = cfg.relay.clone() {
+        if relay.device.is_some() {
+            let state = state.clone();
+            let conn_seq = conn_seq.clone();
+            tokio::spawn(relay_dial_loop(state, relay, conn_seq));
+        }
+    }
+
     loop {
         let (stream, _) = listener.accept().await?;
-        let conn_id = next_conn;
-        next_conn += 1;
+        let conn_id = conn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!("conn {conn_id}: accepted");
         let st = state.clone();
+        let (read_half, write_half) = stream.into_split();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(st, conn_id, stream).await {
+            if let Err(e) = handle_conn(st, conn_id, read_half, write_half).await {
                 error!("conn {conn_id}: {e:#}");
             }
             info!("conn {conn_id}: closed");
@@ -1250,8 +1276,19 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn handle_conn(state: StateHandle, conn_id: u64, stream: UnixStream) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+/// Speak the JSON-RPC protocol over any framed reader + writer. The unix socket
+/// accept loop splits its `UnixStream` and calls this; a relay-dialed stream
+/// drives the exact same per-connection engine (see docs/RELAY.md).
+async fn handle_conn<R, W>(
+    state: StateHandle,
+    conn_id: u64,
+    read_half: R,
+    mut write_half: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, mut rx) = unbounded_channel::<String>();
     {
         let tx = tx.clone();
@@ -1374,6 +1411,66 @@ async fn handle_conn(state: StateHandle, conn_id: u64, stream: UnixStream) -> Re
         .await;
     writer_task.abort();
     Ok(())
+}
+
+/// Device side of the relay: keep a control connection to the broker registered
+/// as `spec.device`; for every `NewSession` the broker pushes, dial a fresh data
+/// connection and serve it through `handle_conn` — an incoming relay session is
+/// indistinguishable from an accepted unix connection. Backoff-reconnects the
+/// control channel, mirroring the SSH remote reconnect ticker. See docs/RELAY.md.
+async fn relay_dial_loop(
+    state: StateHandle,
+    spec: crate::config::RelaySpec,
+    conn_seq: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use crate::relay::{self, RelayMsg};
+    let Some(device) = spec.device.clone() else {
+        return;
+    };
+    let Some(secret) = spec.secret() else {
+        error!(
+            "relay: device `{device}` configured but {} is unset",
+            spec.secret_env
+        );
+        return;
+    };
+    let (addr, account) = (spec.url.clone(), spec.account.clone());
+    loop {
+        match relay::open_control(&addr, &account, &secret, &device).await {
+            Ok((mut r, mut w)) => {
+                info!("relay: registered as device `{device}` at {addr}");
+                loop {
+                    match relay::read_frame::<_, RelayMsg>(&mut r).await {
+                        Ok(Some(RelayMsg::NewSession { session })) => {
+                            let st = state.clone();
+                            let conn_id = conn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let (addr, account, secret) =
+                                (addr.clone(), account.clone(), secret.clone());
+                            tokio::spawn(async move {
+                                match relay::open_data(&addr, &account, &secret, session).await {
+                                    Ok((dr, dw)) => {
+                                        info!("relay: serving session {session} (conn {conn_id})");
+                                        if let Err(e) = handle_conn(st, conn_id, dr, dw).await {
+                                            warn!("relay session {session}: {e:#}");
+                                        }
+                                    }
+                                    Err(e) => warn!("relay: open_data {session}: {e:#}"),
+                                }
+                            });
+                        }
+                        Ok(Some(RelayMsg::Ping)) => {
+                            let _ = relay::write_frame(&mut w, &RelayMsg::Pong).await;
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break, // control channel dropped
+                    }
+                }
+                warn!("relay: control channel to {addr} dropped; reconnecting");
+            }
+            Err(e) => warn!("relay: connect {addr} failed: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Log a request without dumping payloads — Input carries keystrokes/pastes we
@@ -1842,6 +1939,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 host: host.clone(),
                 args,
                 env,
+                relay: None,
             };
             let spec2 = spec.clone();
             // Under the actor: assign/refresh the origin; decide whether to dial.
@@ -1868,6 +1966,50 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 })
                 .await;
             // Spawn the connector OUTSIDE the actor (it does ssh + I/O).
+            if let Some(origin) = dial {
+                spawn_remote_connect(state.clone(), origin, spec);
+            }
+            ServerMsg::Done
+        }
+        Request::ConnectRelay {
+            device,
+            url,
+            account,
+            secret,
+        } => {
+            let spec = RemoteSpecEnv {
+                host: device.clone(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                relay: Some(RelayTarget {
+                    url,
+                    account,
+                    secret,
+                }),
+            };
+            let spec2 = spec.clone();
+            let dial = state
+                .with(move |st| {
+                    let origin = match st.remote_origins.get(&device) {
+                        Some(o) => *o,
+                        None => {
+                            st.next_origin += 1;
+                            let o = st.next_origin;
+                            st.remote_origins.insert(device.clone(), o);
+                            o
+                        }
+                    };
+                    st.remote_specs.insert(origin, spec2);
+                    if st.remotes.contains_key(&origin) {
+                        return None;
+                    }
+                    if st.connecting.insert(origin) {
+                        Some(origin)
+                    } else {
+                        None
+                    }
+                })
+                .await;
             if let Some(origin) = dial {
                 spawn_remote_connect(state.clone(), origin, spec);
             }
@@ -1901,14 +2043,6 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
 /// it in, then pump its events until the link drops. Never stalls the main loop.
 fn spawn_remote_connect(state: StateHandle, origin: Origin, spec: RemoteSpecEnv) {
     tokio::spawn(async move {
-        let mut ssh_args = vec![
-            "-o".to_string(),
-            "ConnectTimeout=6".to_string(),
-            // Detached daemon can't answer a prompt — fail fast to agent/pubkey.
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-        ];
-        ssh_args.extend(spec.args.iter().cloned());
         info!("connect remote {} (origin {origin})", spec.host);
         async fn clear(state: &StateHandle, origin: Origin) {
             state
@@ -1917,14 +2051,36 @@ fn spawn_remote_connect(state: StateHandle, origin: Origin, spec: RemoteSpecEnv)
                 })
                 .await;
         }
-        let (client, events, child) =
+        // Relay transport dials the broker; SSH transport spawns `ssh … __proxy`.
+        // Both yield a `Client` + event stream feeding the same remote hub; only
+        // SSH has a child process to keep alive.
+        let (client, events, child) = if let Some(rt) = &spec.relay {
+            match crate::client::connect_via_relay(&rt.url, &rt.account, &rt.secret, &spec.host)
+                .await
+            {
+                Ok((c, ev)) => (c, ev, None),
+                Err(e) => {
+                    error!("connect relay {}: {e:#}", spec.host);
+                    return clear(&state, origin).await;
+                }
+            }
+        } else {
+            let mut ssh_args = vec![
+                "-o".to_string(),
+                "ConnectTimeout=6".to_string(),
+                // Detached daemon can't answer a prompt — fail fast to agent/pubkey.
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+            ];
+            ssh_args.extend(spec.args.iter().cloned());
             match crate::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
-                Ok(t) => t,
+                Ok((c, ev, ch)) => (c, ev, Some(ch)),
                 Err(e) => {
                     error!("connect remote {}: ssh failed: {e:#}", spec.host);
                     return clear(&state, origin).await;
                 }
-            };
+            }
+        };
         let client = Arc::new(client);
         let mut snap = match client.snapshot().await {
             Ok(s) => s,

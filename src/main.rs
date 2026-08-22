@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod layout;
 mod protocol;
+mod relay;
 mod remote;
 mod render;
 mod tui;
@@ -33,6 +34,23 @@ enum Cmd {
     /// Internal: relay this box's daemon socket over stdio (used over SSH)
     #[command(name = "__proxy", hide = true)]
     Proxy,
+    /// Run a relay broker: bridges devices and clients that both dial out to it
+    /// (run one on an always-reachable box, e.g. a tailnet host). Secret comes
+    /// from `$RUCKUS_RELAY_SECRET`.
+    Relay {
+        /// Address to listen on (e.g. `0.0.0.0:9777`)
+        #[arg(long, default_value = "0.0.0.0:9777")]
+        listen: String,
+        /// Account name devices/clients must present
+        #[arg(long, default_value = "ruckus")]
+        account: String,
+    },
+    /// Attach a remote device through the configured relay (no SSH). Reads
+    /// `[relay]` from your config for the broker url/account/secret.
+    RelayAttach {
+        /// Device name registered on the relay
+        device: String,
+    },
     /// List spaces, tabs, and panes
     Ls,
     /// Create a new tab running CMD (defaults to your shell) and open the TUI on it
@@ -191,6 +209,13 @@ async fn main() -> Result<()> {
         None => tui::run(None).await,
         Some(Cmd::Daemon) => daemon::run().await,
         Some(Cmd::Proxy) => client::proxy().await,
+        Some(Cmd::Relay { listen, account }) => {
+            let secret = std::env::var("RUCKUS_RELAY_SECRET").map_err(|_| {
+                anyhow::anyhow!("set RUCKUS_RELAY_SECRET (the shared relay secret)")
+            })?;
+            relay::run_broker(&listen, account, secret).await
+        }
+        Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
         Some(Cmd::Ls) => ls().await,
         Some(Cmd::New { name, detach, cmd }) => new_tab(name, detach, cmd).await,
         Some(Cmd::NewSpace { name }) => new_space(name).await,
@@ -422,6 +447,27 @@ async fn reload() -> Result<()> {
     client.request(Request::Reload).await?;
     println!("config reloaded");
     Ok(())
+}
+
+/// Attach a remote device through the configured relay: reads `[relay]` from
+/// config for the broker coordinates and asks the local daemon to mirror it in.
+async fn relay_attach(device: String) -> Result<()> {
+    let relay = config::Config::load()
+        .relay
+        .ok_or_else(|| anyhow::anyhow!("no [relay] section in your config.toml"))?;
+    let secret = relay
+        .secret()
+        .ok_or_else(|| anyhow::anyhow!("relay secret env `{}` is unset", relay.secret_env))?;
+    simple_req(
+        Request::ConnectRelay {
+            device: device.clone(),
+            url: relay.url,
+            account: relay.account,
+            secret,
+        },
+        &format!("attaching `{device}` via relay"),
+    )
+    .await
 }
 
 /// Send a fire-and-forget request, print `ok_msg` on success or bail on error.

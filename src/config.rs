@@ -774,6 +774,39 @@ pub struct RemoteSpec {
     pub args: Vec<String>,
 }
 
+/// Relay transport config (`[relay]`). Lets this daemon dial out to a broker and
+/// register as a device, and lets clients attach to remote devices through it
+/// (no SSH, works behind NAT). The secret is read from an env var, never the
+/// file. See docs/RELAY.md.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelaySpec {
+    /// Relay address, `host:port` (e.g. a tailnet host `mini-relay:9777`).
+    pub url: String,
+    /// Account name presented to the relay.
+    #[serde(default = "default_relay_account")]
+    pub account: String,
+    /// This daemon's advertised device name. Omit on a client-only machine.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Env var holding the shared secret.
+    #[serde(default = "default_relay_secret_env")]
+    pub secret_env: String,
+}
+
+fn default_relay_account() -> String {
+    "ruckus".into()
+}
+fn default_relay_secret_env() -> String {
+    "RUCKUS_RELAY_SECRET".into()
+}
+
+impl RelaySpec {
+    /// Resolve the shared secret from `secret_env`.
+    pub fn secret(&self) -> Option<String> {
+        std::env::var(&self.secret_env).ok().filter(|s| !s.is_empty())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub keys: HashMap<Action, Vec<Binding>>,
@@ -794,6 +827,8 @@ pub struct Config {
     pub plugins: Vec<String>,
     /// Remote daemons to mirror into the sidebar over SSH.
     pub remotes: Vec<RemoteSpec>,
+    /// Relay transport (`[relay]`), if configured.
+    pub relay: Option<RelaySpec>,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -1253,6 +1288,9 @@ struct RawConfig {
     /// Remote daemons to mirror over SSH.
     #[serde(default)]
     remote: Vec<RemoteSpec>,
+    /// Relay transport config.
+    #[serde(default)]
+    relay: Option<RelaySpec>,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -1592,6 +1630,7 @@ impl Config {
             hooks,
             plugins: raw.plugins,
             remotes: raw.remote,
+            relay: raw.relay,
             theme,
             ui,
             glyphs,

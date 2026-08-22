@@ -146,7 +146,8 @@ pub fn route_request(req: &mut Request) -> Origin {
         // Remote lifecycle is acted on by the LOCAL daemon (it owns the mirror),
         // never forwarded to the remote itself.
         | Request::ConnectRemote { .. }
-        | Request::DisconnectRemote { .. } => LOCAL,
+        | Request::DisconnectRemote { .. }
+        | Request::ConnectRelay { .. } => LOCAL,
     }
 }
 

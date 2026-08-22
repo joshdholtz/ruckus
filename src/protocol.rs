@@ -135,6 +135,16 @@ pub enum Request {
     DisconnectRemote {
         origin: u16,
     },
+    /// Relay remote mirror: ask THIS daemon to attach a remote `device` through a
+    /// relay broker (no SSH, works behind NAT). The client supplies the relay
+    /// coordinates from its own `[relay]` config. Deduped by device. Replies
+    /// `Done`. See docs/RELAY.md.
+    ConnectRelay {
+        device: String,
+        url: String,
+        account: String,
+        secret: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
