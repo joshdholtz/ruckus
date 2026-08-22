@@ -597,6 +597,9 @@ struct ThemePick {
 enum ChipAction {
     /// Bytes to type into the focused pane (usually includes trailing newline).
     Send(Vec<u8>),
+    /// Approve / deny the focused pane's pending agent approval (mobile tap).
+    ApproveAgent,
+    DenyAgent,
     Restart,
     Close,
     JumpWaiting,
@@ -1958,6 +1961,8 @@ impl App {
     async fn run_chip(&mut self, chip: ChipAction) {
         match chip {
             ChipAction::Send(bytes) => self.send_bytes(&bytes).await,
+            ChipAction::ApproveAgent => self.resolve_focused_agent(Decision::Allow).await,
+            ChipAction::DenyAgent => self.resolve_focused_agent(Decision::Deny).await,
             ChipAction::Restart => self.restart_action(self.focused).await,
             ChipAction::Close => self.close_pane_action(self.focused).await,
             ChipAction::JumpWaiting => self.do_action(Action::JumpWaiting).await,
@@ -5517,6 +5522,24 @@ impl App {
         let th = self.cfg.theme.clone();
         // label → chip action
         let chips: Vec<(&str, ChipAction)> = match kind {
+            // When the focused pane is blocked on an agent approval, offer
+            // approve/deny taps that resolve it (works on relay/remote panes too);
+            // otherwise the normal y/n/enter reply chips.
+            "waiting"
+                if self
+                    .snap
+                    .pane(self.focused)
+                    .and_then(|p| p.agent_state.as_ref())
+                    .and_then(|s| s.pending.as_ref())
+                    .is_some() =>
+            {
+                vec![
+                    ("approve", ChipAction::ApproveAgent),
+                    ("deny", ChipAction::DenyAgent),
+                    ("type…", ChipAction::Reply),
+                    ("next", ChipAction::JumpWaiting),
+                ]
+            }
             "waiting" => vec![
                 ("y", ChipAction::Send(b"y\n".to_vec())),
                 ("n", ChipAction::Send(b"n\n".to_vec())),

@@ -37,8 +37,11 @@ Verified end-to-end: a blocked Claude `PreToolUse` gate surfaces the approval
   pane's request. `ServerMsg::AgentState` updates the view live. The card lives
   in the NEEDS-YOU section, so enable it:
   `[ui] sidebar_sections = ["needs_you", "spaces"]`. (The `alt-y`/`alt-r` keys
-  work regardless of whether the section is shown.) Verified via a pyte-rendered
-  PTY: the card and hint render and the daemon reports `awaiting_approval`.
+  work regardless of whether the section is shown.)
+- **Mobile (AA3):** on a narrow terminal, tapping into a blocked pane shows big
+  `[approve] [deny]` tap chips in the action bar (beside `type…`/`next`).
+- Verified via pyte-rendered PTYs (desktop card + mobile chips): both render and
+  the daemon reports `awaiting_approval`.
 
 **Pending:** AA4 (opencode/Cursor via the same `agent-hook`), AA5 (Codex
 `app-server` for real state + interrupt/steer), AA6 (capability scopes gating
