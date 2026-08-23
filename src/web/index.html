@@ -52,6 +52,23 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap;opacity:.85}
 
+  /* home: needs-you + collapsible space groups */
+  .needhdr{font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--wait);
+    text-transform:uppercase;margin:2px 4px 6px}
+  .divider{height:1px;background:var(--border);margin:10px 2px 12px}
+  .grphdr{display:flex;align-items:center;gap:9px;padding:12px 6px;cursor:pointer;
+    font-weight:600;font-size:15px;border-radius:10px}
+  .grphdr:active{background:color-mix(in srgb,var(--idle) 12%,transparent)}
+  .grphdr .caret{color:var(--muted);width:12px;font-size:12px}
+  .grphdr .cnt{margin-left:auto;color:var(--muted);font-size:13px;font-weight:400}
+  .trow{display:flex;align-items:center;gap:11px;padding:11px 8px 11px 28px;cursor:pointer;border-radius:10px}
+  .trow:active{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+  .trow .sd{width:9px;height:9px;border-radius:50%;flex:none}
+  .sd.idle{background:var(--idle)} .sd.working{background:var(--accent)}
+  .sd.waiting{background:var(--wait)} .sd.done{background:var(--ok)}
+  .trow .tn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .trow .ts{color:var(--muted);font-size:12px;flex:none}
+
   /* approval */
   .appr{margin-top:12px;border:1px solid color-mix(in srgb,var(--wait) 45%,var(--border));
     border-radius:12px;padding:11px 12px;background:color-mix(in srgb,var(--wait) 8%,transparent)}
@@ -271,31 +288,60 @@ function stateLabel(p){
   return {working:'working',waiting:'waiting',done:'done',idle:'idle'}[stateOf(p)];
 }
 
+let openState={};
+function needsYou(p){ return !!(p.agent_state&&p.agent_state.pending) || p.activity==='waiting' || p.activity==='done'; }
+function isOpen(sp){
+  if(sp.id in openState) return openState[sp.id];
+  // default: expand a space that has anything needing you
+  return (sp.tabs||[]).some(t=>{ const p=snap.panes.find(p=>p.id===t.active_pane); return p&&needsYou(p); });
+}
+const stDot=p=>`<span class="sd ${stateOf(p)}"></span>`;
+function tabRow(t,p){
+  const d=document.createElement('div'); d.className='trow';
+  d.innerHTML=`${stDot(p)}<span class="tn">${esc(t.name||p.title)}</span><span class="ts">${stateLabel(p)}</span>`;
+  d.onclick=()=>openSession(p.id);
+  return d;
+}
+function needRow(sp,t,p){
+  const wrap=document.createElement('div');
+  const d=document.createElement('div'); d.className='trow';
+  d.innerHTML=`${stDot(p)}<span class="tn">${esc(t.name||p.title)} <span class="ts">· ${esc(sp.name)}</span></span><span class="ts">${stateLabel(p)}</span>`;
+  d.onclick=()=>openSession(p.id);
+  wrap.appendChild(d);
+  const pend=p.agent_state&&p.agent_state.pending;
+  if(pend){
+    const a=document.createElement('div'); a.className='appr'; a.style.margin='0 6px 8px 28px';
+    a.innerHTML=`<div class="cmd">${esc(pend.title)}</div><div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
+    a.querySelector('.allow').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'allow');};
+    a.querySelector('.deny').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'deny');};
+    wrap.appendChild(a);
+  }
+  return wrap;
+}
 function render(){
   if(view.name==='session'){ renderSession(); return; }
   $('#back').style.display='none'; $('#add').style.display=''; $('#title').textContent='ruckus'; $('#sub').textContent='';
-  const list = sessions().sort((a,b)=>rank(b.pane)-rank(a.pane));
   const main=$('#main'); main.innerHTML=''; main.style.display='block'; main.style.overflowY='auto'; main.style.paddingTop='12px';
-  if(!list.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run something in a ruckus tab.</div>'; return; }
-  for(const s of list){
-    const p=s.pane;
-    const c=document.createElement('div'); c.className='card';
-    const pend=p.agent_state?.pending;
-    c.innerHTML =
-      `<div class="row"><span class="name">${esc(s.tab||p.title)}</span>
-        <span class="pill ${stateOf(p)}">${stateLabel(p)}</span></div>
-       <div class="meta">${esc(s.space)} · ${esc(loc(p))}</div>
-       ${p.preview?`<div class="preview">${esc(p.preview)}</div>`:''}`;
-    if(pend){
-      const a=document.createElement('div'); a.className='appr';
-      a.innerHTML=`<div class="q">Approve this?</div><div class="cmd">${esc(pend.title)}</div>
-        <div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
-      a.querySelector('.allow').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'allow');};
-      a.querySelector('.deny').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'deny');};
-      c.appendChild(a);
-    }
-    c.onclick=()=>openSession(p.id);
-    main.appendChild(c);
+  const paneOf=t=>snap.panes.find(p=>p.id===t.active_pane);
+  const groups=(snap.spaces||[]).map(sp=>({sp,tabs:(sp.tabs||[]).map(t=>({t,p:paneOf(t)})).filter(x=>x.p)})).filter(g=>g.tabs.length);
+  if(!groups.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Tap + New.</div>'; return; }
+  // NEEDS YOU
+  const attn=[];
+  for(const g of groups) for(const {t,p} of g.tabs) if(needsYou(p)) attn.push({sp:g.sp,t,p});
+  attn.sort((a,b)=>rank(b.p)-rank(a.p));
+  if(attn.length){
+    const h=document.createElement('div'); h.className='needhdr'; h.textContent='Needs you'; main.appendChild(h);
+    for(const {sp,t,p} of attn) main.appendChild(needRow(sp,t,p));
+    const dv=document.createElement('div'); dv.className='divider'; main.appendChild(dv);
+  }
+  // collapsible space groups
+  for(const g of groups){
+    const open=isOpen(g.sp);
+    const hdr=document.createElement('div'); hdr.className='grphdr';
+    hdr.innerHTML=`<span class="caret">${open?'▾':'▸'}</span><span>${esc(g.sp.name)}</span><span class="cnt">${g.tabs.length}</span>`;
+    hdr.onclick=()=>{ openState[g.sp.id]=!open; render(); };
+    main.appendChild(hdr);
+    if(open) for(const {t,p} of g.tabs) main.appendChild(tabRow(t,p));
   }
 }
 const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
