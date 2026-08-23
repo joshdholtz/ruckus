@@ -149,8 +149,39 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
                     Some("input") => {
                         let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
                         let mut text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                        text.push('\r');
+                        if v.get("enter").and_then(Value::as_bool).unwrap_or(true) {
+                            text.push('\r');
+                        }
                         client.notify(Request::Input { pane, data: B64.encode(text.as_bytes()) });
+                    }
+                    // Attach to a pane to stream its live terminal output.
+                    Some("attach") => {
+                        let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
+                        if let Ok(ServerMsg::Attached { scrollback, .. }) = client
+                            .request(Request::Attach { pane, rows: 50, cols: 120 })
+                            .await
+                        {
+                            let _ = tx.send(Message::Text(
+                                json!({ "t": "attached", "pane": pane, "scrollback": scrollback })
+                                    .to_string())).await;
+                        }
+                    }
+                    Some("detach") => {
+                        let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
+                        client.notify(Request::Detach { pane });
+                    }
+                    // Session management from the phone.
+                    Some("close") => {
+                        let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
+                        let _ = client.request(Request::ClosePane { pane }).await;
+                        if let Ok(snap) = client.snapshot().await {
+                            let _ = tx.send(Message::Text(
+                                json!({ "t": "snapshot", "snapshot": snap }).to_string())).await;
+                        }
+                    }
+                    Some("restart") => {
+                        let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
+                        let _ = client.request(Request::Restart { pane }).await;
                     }
                     _ => {}
                 }

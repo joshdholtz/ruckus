@@ -109,6 +109,19 @@
   .sheet input:focus{border-color:var(--accent)}
   .sheet .start{width:100%;margin-top:18px;border:0;background:var(--accent);color:#fff;
     border-radius:12px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}
+
+  /* session mode row (chat/terminal toggle + actions) */
+  .moderow{display:flex;align-items:center;gap:6px;margin-bottom:12px}
+  .tabbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
+    border-radius:9px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
+  .tabbtn.sel{color:var(--accent);border-color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 10%,transparent)}
+  .iconbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
+    border-radius:9px;width:34px;height:32px;font-size:15px;cursor:pointer}
+  .iconbtn.danger{color:var(--err)}
+  .term{background:#0b0d12;color:#cdd3de;border:1px solid var(--border);border-radius:10px;
+    padding:12px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;
+    overflow-x:auto;min-height:240px;-webkit-overflow-scrolling:touch}
 </style>
 </head>
 <body>
@@ -138,7 +151,7 @@
 </div>
 <script>
 const $ = s => document.querySelector(s);
-let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null}, sessionMsgs = {};
+let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, termbufs = {};
 
 function connect(){
   ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
@@ -148,7 +161,8 @@ function connect(){
     const m = JSON.parse(e.data);
     if(m.t==='snapshot'){ snap = m.snapshot; render(); }
     else if(m.t==='event'){ onEvent(m.msg); }
-    else if(m.t==='session'){ sessionMsgs[m.pane] = m.msgs; if(view.name==='session'&&view.pane===m.pane) render(); }
+    else if(m.t==='session'){ sessionMsgs[m.pane] = m.msgs; if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat') render(); }
+    else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(view.name==='session'&&view.pane===m.pane&&view.mode==='terminal') paintTerm(); }
   };
 }
 function onEvent(msg){
@@ -160,6 +174,14 @@ function onEvent(msg){
     render();
   }
   else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; render(); }
+  else if(msg.type==='output'){
+    if(view.name==='session'&&view.mode==='terminal'&&msg.pane===view.pane){
+      let b=(termbufs[msg.pane]||'')+decodeB64(msg.data);
+      if(b.length>200000) b=b.slice(-200000);   // cap the buffer
+      termbufs[msg.pane]=b; paintTerm();
+    }
+  }
+  else if(msg.type==='exited'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p){p.status={state:'exited',code:msg.code};p.activity='done';} render(); }
 }
 const phaseActivity = ph => ({working:'working',awaiting_approval:'waiting',awaiting_input:'waiting',done:'done',error:'done'}[ph]||'idle');
 const send = o => ws && ws.readyState===1 && ws.send(JSON.stringify(o));
@@ -218,13 +240,43 @@ function render(){
 const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
 function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'·'+p.git_branch:''; return cwd+br; }
 
-function openSession(pane){ view={name:'session',pane}; sessionMsgs[pane]=sessionMsgs[pane]||null; send({t:'session',pane}); render(); }
+function defaultMode(p){ return (p&&(p.agent==='claude'||p.agent_state)) ? 'chat' : 'terminal'; }
+function openSession(pane){
+  const p=snap.panes.find(x=>x.id===pane);
+  view={name:'session',pane,mode:defaultMode(p)};
+  sessionMsgs[pane]=sessionMsgs[pane]||null;
+  send({t:'session',pane});
+  if(view.mode==='terminal') attach(pane);
+  render();
+}
+function attach(pane){ if(!(pane in termbufs)) termbufs[pane]=''; send({t:'attach',pane}); }
+function leaveSession(){ if(view.name==='session'&&view.mode==='terminal') send({t:'detach',pane:view.pane}); }
+function setMode(m){
+  if(m===view.mode) return;
+  if(view.mode==='terminal') send({t:'detach',pane:view.pane});
+  view.mode=m;
+  if(m==='terminal') attach(view.pane); else send({t:'session',pane:view.pane});
+  render();
+}
 function renderSession(){
   const p=snap.panes.find(p=>p.id===view.pane);
-  $('#back').style.display=''; $('#add').style.display='none'; $('#back').onclick=()=>{view={name:'timeline'};render();};
+  $('#back').style.display=''; $('#add').style.display='none';
+  $('#back').onclick=()=>{ leaveSession(); view={name:'timeline'}; render(); };
   $('#title').textContent = p?paneName(p):'session';
-  $('#sub').textContent = p?stateLabel(p):'';
+  $('#sub').textContent = p?(loc(p)||stateLabel(p)):'';
   const main=$('#main'); main.innerHTML='';
+
+  const row=document.createElement('div'); row.className='moderow';
+  row.innerHTML=`<button class="tabbtn ${view.mode==='chat'?'sel':''}" data-m="chat">Chat</button>
+    <button class="tabbtn ${view.mode==='terminal'?'sel':''}" data-m="terminal">Terminal</button>
+    <span style="margin-left:auto"></span>
+    <button class="iconbtn" id="restart" title="restart">↻</button>
+    <button class="iconbtn danger" id="close" title="close">✕</button>`;
+  row.querySelectorAll('.tabbtn').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+  row.querySelector('#restart').onclick=()=>{ if(confirm('Restart this session?')) send({t:'restart',pane:view.pane}); };
+  row.querySelector('#close').onclick=()=>{ if(confirm('Close (kill) this session?')){ send({t:'close',pane:view.pane}); leaveSession(); view={name:'timeline'}; render(); } };
+  main.appendChild(row);
+
   const pend=p&&p.agent_state?.pending;
   if(pend){
     const a=document.createElement('div'); a.className='appr';
@@ -234,21 +286,41 @@ function renderSession(){
     a.querySelector('.deny').onclick=()=>resolve(p.id,pend.request_id,'deny');
     main.appendChild(a);
   }
-  const msgs=sessionMsgs[view.pane];
-  if(msgs===null||msgs===undefined){ main.insertAdjacentHTML('beforeend','<div class="empty">Loading…</div>'); }
-  else if(!msgs.length){ main.insertAdjacentHTML('beforeend','<div class="empty">No transcript yet.</div>'); }
-  else for(const m of msgs) main.appendChild(renderMsg(m));
-  // reply bar
+
+  if(view.mode==='terminal'){
+    const pre=document.createElement('pre'); pre.className='term'; pre.id='term';
+    pre.textContent = termText(termbufs[view.pane]||'') || '…';
+    main.appendChild(pre);
+  } else {
+    const msgs=sessionMsgs[view.pane];
+    if(msgs===null||msgs===undefined){ main.insertAdjacentHTML('beforeend','<div class="empty">Loading…</div>'); }
+    else if(!msgs.length){ main.insertAdjacentHTML('beforeend','<div class="empty">No transcript yet — try Terminal.</div>'); }
+    else for(const m of msgs) main.appendChild(renderMsg(m));
+  }
+
   const bar=document.createElement('div'); bar.className='reply';
-  bar.innerHTML=`<input id="rin" placeholder="Reply to the agent…" autocomplete="off"><button id="rsend">Send</button>`;
+  bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
   main.appendChild(bar);
   const inp=bar.querySelector('#rin');
-  const go=()=>{ const t=inp.value.trim(); if(!t)return; send({t:'input',pane:view.pane,text:t}); inp.value=''; };
+  const go=()=>{ const t=inp.value; if(!t)return; send({t:'input',pane:view.pane,text:t}); inp.value=''; };
   bar.querySelector('#rsend').onclick=go;
   inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
-  main.scrollIntoView({block:'end'});
-  window.scrollTo(0,document.body.scrollHeight);
+  if(view.mode==='terminal') paintTerm(); else window.scrollTo(0,document.body.scrollHeight);
 }
+function paintTerm(){
+  const el=$('#term'); if(!el) return;
+  el.textContent = termText(termbufs[view.pane]||'').split('\n').slice(-500).join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+function termText(raw){
+  return raw
+    .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g,'')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'')
+    .replace(/\x1b[=>()#][0-9A-Za-z]?/g,'')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,'')
+    .split('\n').map(l=>{ const p=l.split('\r'); return p[p.length-1]; }).join('\n');
+}
+function decodeB64(b64){ try{ return new TextDecoder().decode(Uint8Array.from(atob(b64),c=>c.charCodeAt(0))); }catch(e){ return ''; } }
 function renderMsg(m){
   const d=document.createElement('div');
   if(m.kind==='text'){
