@@ -104,6 +104,10 @@
     padding:12px;background:color-mix(in srgb,var(--accent) 6%,transparent)}
   .qq{font-weight:600;margin-bottom:10px}
   .qopts{display:flex;flex-direction:column;gap:8px}
+  .qopt{text-align:left;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:10px;padding:11px 13px;font-size:14px;cursor:pointer;width:100%;display:flex;gap:8px}
+  .qopt:active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}
+  .qopt .qnum{color:var(--muted);font-weight:600}
   .qopt-ro{border:1px solid var(--border);border-radius:10px;padding:10px 13px;font-size:14px;color:var(--muted)}
   .qterm{width:100%;margin-top:11px;border:0;background:var(--accent);color:#fff;border-radius:10px;
     padding:12px;font-weight:600;font-size:14px;cursor:pointer}
@@ -353,6 +357,12 @@ function isAgentSession(p){
   return !!(p.agent || p.agent_state || /claude|codex|aider|goose|opencode|gemini|cursor|amp|cody/.test(nm));
 }
 function defaultMode(p){ return isAgentSession(p) ? 'chat' : 'terminal'; }
+function answerQuestion(i, qp){
+  if(qp&&qp.multi){ setMode('terminal'); return; }
+  // Number-key selection (1-based) + Enter — coordinate-free; exact if the picker
+  // takes number keys. If it misfires, "Answer in Terminal" is the sure path.
+  send({t:'input',pane:view.pane,text:(i+1)+'\r',enter:false});
+}
 function openSession(pane){
   const p=snap.panes.find(x=>x.id===pane);
   view={name:'session',pane,mode:defaultMode(p)};
@@ -453,9 +463,10 @@ function renderSession(){
     const qp = p && p.agent_state && p.agent_state.prompt;
     if(qp){
       const q=document.createElement('div'); q.className='msg';
-      const opts=(qp.options||[]).map(o=>`<div class="qopt-ro">${esc(o)}</div>`).join('');
+      const opts=(qp.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}"><span class="qnum">${i+1}</span><span>${esc(o)}</span></button>`).join('');
       q.innerHTML=`<div class="qcard"><div class="qq">${esc(qp.question)}</div><div class="qopts">${opts}</div>`+
         `<button class="qterm">Answer in Terminal →</button></div>`;
+      q.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, qp));
       q.querySelector('.qterm').onclick=()=>setMode('terminal');
       main.appendChild(q);
     }
