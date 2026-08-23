@@ -77,6 +77,11 @@
     color:#cdd3de;padding:10px 11px;border-radius:8px;overflow-x:auto;white-space:pre;margin:7px 0}
   .bubble a{color:var(--accent)}
   .bubble b{font-weight:650}
+  .msg.sending .bubble{opacity:.5}
+  .sendtag{font-size:11px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:5px}
+  .sendtag::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
   .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
     padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
   .tool .t{color:var(--muted);font-weight:700;margin-right:6px;text-transform:none}
@@ -172,7 +177,7 @@
 </div>
 <script>
 const $ = s => document.querySelector(s);
-let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, sessionModel = {}, sessionEffort = {}, termbufs = {};
+let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, sessionModel = {}, sessionEffort = {}, termbufs = {}, pendingMsgs = {};
 
 function connect(){
   ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
@@ -184,7 +189,12 @@ function connect(){
     else if(m.t==='event'){ onEvent(m.msg); }
     else if(m.t==='session'){ const prev=sessionMsgs[m.pane], pm=sessionModel[m.pane], pe=sessionEffort[m.pane];
       sessionMsgs[m.pane]=m.msgs; sessionModel[m.pane]=m.model; sessionEffort[m.pane]=m.effort;
-      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length||pm!==m.model||pe!==m.effort)) render(); }
+      // Drop optimistic "sending" bubbles once the message lands in the transcript
+      // (or after 45s, in case it never gets recorded).
+      const pnd=pendingMsgs[m.pane];
+      if(pnd&&pnd.length){ const ut=new Set((m.msgs||[]).filter(x=>x.role==='user'&&x.kind==='text').map(x=>(x.text||'').trim()));
+        pendingMsgs[m.pane]=pnd.filter(p=>!ut.has(p.text.trim()) && Date.now()-p.ts<45000); }
+      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length||pm!==m.model||pe!==m.effort||(pnd&&pnd.length!==(pendingMsgs[m.pane]||[]).length))) render(); }
     else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(view.name==='session'&&view.pane===m.pane&&view.mode==='terminal') paintTerm(); }
   };
 }
@@ -349,11 +359,22 @@ function renderSession(){
     else for(const m of msgs) main.appendChild(renderMsg(m));
   }
 
+  // optimistic "sending…" bubbles (chat only) — cleared once the transcript lands
+  if(view.mode==='chat') for(const pm of (pendingMsgs[view.pane]||[])){
+    const d=document.createElement('div'); d.className='msg user sending';
+    d.innerHTML=`<div class="who">you</div><div class="bubble">${md(pm.text)}</div><div class="sendtag">sending…</div>`;
+    main.appendChild(d);
+  }
+
   const bar=document.createElement('div'); bar.className='reply';
   bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
   main.appendChild(bar);
   const inp=bar.querySelector('#rin');
-  const go=()=>{ const t=inp.value; if(!t)return; send({t:'input',pane:view.pane,text:t}); inp.value=''; };
+  const go=()=>{ const t=inp.value; if(!t)return;
+    if(view.mode==='chat') (pendingMsgs[view.pane]=pendingMsgs[view.pane]||[]).push({text:t,ts:Date.now()});
+    send({t:'input',pane:view.pane,text:t}); inp.value='';
+    if(view.mode==='chat'){ render(); const ni=$('#rin'); if(ni) ni.focus(); }
+  };
   bar.querySelector('#rsend').onclick=go;
   inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
   const mn=$('#main');
