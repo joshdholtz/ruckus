@@ -85,6 +85,17 @@ enum Cmd {
         #[arg(long)]
         write: Option<std::path::PathBuf>,
     },
+    /// Run a read-only "briefing" agent for a space: it gathers status from your
+    /// connected sources (MGM/Linear/Sentry/Gmail/Grafana via MCP) and writes the
+    /// space's dashboard. It never sends or ships anything. See docs/AUTOPILOT.md.
+    Brief {
+        /// Space name (substring) or id
+        space: String,
+        /// Re-run on an interval headlessly (e.g. 30m, 1h). Omit for a one-shot
+        /// watchable session.
+        #[arg(long)]
+        every: Option<String>,
+    },
     /// Resolve a pending agent approval (what the sidebar approve/deny does).
     Resolve {
         /// Pane id the approval is on
@@ -263,6 +274,7 @@ async fn main() -> Result<()> {
         Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
         Some(Cmd::AgentHook { agent, gate }) => agent_hook::run(agent, gate).await,
         Some(Cmd::AgentSetup { agent, gate, write }) => agent_hook::setup(agent, gate, write).await,
+        Some(Cmd::Brief { space, every }) => brief(space, every).await,
         Some(Cmd::Resolve {
             pane,
             request_id,
@@ -535,6 +547,118 @@ async fn relay_attach(device: String) -> Result<()> {
         &format!("attaching `{device}` via relay"),
     )
     .await
+}
+
+/// Slug a space name to its dashboard filename (must match the web client).
+fn dash_slug(name: &str) -> String {
+    let mut s = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    s.trim_matches('-').to_string()
+}
+
+fn parse_dur(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    let i = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let n: u64 = s[..i].parse().map_err(|_| anyhow::anyhow!("bad duration '{s}'"))?;
+    let secs = match &s[i..] {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        u => anyhow::bail!("bad duration unit '{u}' (use s/m/h)"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+fn brief_prompt(space: &str, dash_path: &str) -> String {
+    format!(
+        r#"You are the ops briefing agent for the "{space}" space in ruckus. Your job is strictly READ-ONLY: gather current status and write ONE dashboard file. Do NOT send email, modify data, push code, merge, deploy, or take any action with an external effect. Only read, and write the single dashboard file below.
+
+1. Gather what you can from the available MCP connectors/tools; skip any that aren't connected, don't block:
+   - MGM (Mostly Good Metrics): headline metrics, funnels, retention, recent signups, churn-risk users.
+   - Linear: open/assigned issues relevant to this project.
+   - Sentry: recent or spiking errors (if connected).
+   - Gmail: triage the inbox — which need a reply vs. safe to archive (if connected).
+   - Grafana: current alerts/anomalies (only if you have API access).
+
+2. Write an HTML dashboard to EXACTLY this path, overwriting it:
+   {dash_path}
+
+   Start with: <!doctype html><html><head><meta charset="utf-8">
+   <meta name="viewport" content="width=device-width,initial-scale=1">
+   <link rel="stylesheet" href="/vendor/dash.css"></head><body> ... </body></html>
+
+   Use these component classes: .tile (with .n number, .l label, .d up|down delta);
+   .card (.title, .sub); .row (with .grow containing .t and .m); .pill (.ok|.warn|.err|.info);
+   .dot (.ok|.warn|.err|.info); table/th/td; pre.code; .btn (.primary|.ok|.danger);
+   .grid.two; h1/h2; and a trailing <div class="updated"> with the current time.
+
+   Sections (omit any with no data): a Snapshot row of stat tiles; "🔴 Alerts";
+   "📥 Inbox"; "📈 Retention" (churn-risk + new signups); "🛠 Prepared" (Linear tasks).
+   Keep it scannable on a phone.
+
+3. Do NOT ship anything. When the file is written, report a one-line summary and stop."#
+    )
+}
+
+/// Run the read-only briefing agent for a space (writes its dashboard).
+async fn brief(space_query: String, every: Option<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    let snap = client.snapshot().await?;
+    let q = space_query.to_lowercase();
+    let sp = snap
+        .spaces
+        .iter()
+        .find(|s| s.id.to_string() == space_query || s.name.to_lowercase().contains(&q))
+        .ok_or_else(|| anyhow::anyhow!("no space matching '{space_query}'"))?;
+    let (space_id, space_name) = (sp.id, sp.name.clone());
+    let slug = dash_slug(&space_name);
+    let dir = ruckus_dir().join("dashboards");
+    std::fs::create_dir_all(&dir).ok();
+    let dash_path = dir.join(format!("{slug}.html"));
+    let prompt = brief_prompt(&space_name, &dash_path.display().to_string());
+
+    match every {
+        // Scheduled: run headless (claude -p), exits each time, no tab pile-up.
+        Some(spec) => {
+            let dur = parse_dur(&spec)?;
+            println!("briefing '{space_name}' every {spec} → {}", dash_path.display());
+            loop {
+                let status = tokio::process::Command::new("claude")
+                    .arg("-p")
+                    .arg(&prompt)
+                    .arg("--permission-mode")
+                    .arg("acceptEdits")
+                    .status()
+                    .await;
+                match status {
+                    Ok(s) => println!("  briefed ({s})"),
+                    Err(e) => eprintln!("  brief failed: {e}"),
+                }
+                tokio::time::sleep(dur).await;
+            }
+        }
+        // One-shot: spawn a watchable claude tab in the space (approvals flow
+        // through the console). Great for the first run / building trust.
+        None => {
+            client
+                .request(Request::NewTab {
+                    space: space_id,
+                    name: Some("brief".into()),
+                    cmd: vec!["claude".into(), prompt],
+                    cwd: None,
+                })
+                .await?;
+            println!("briefing agent started in '{space_name}' → will write {}", dash_path.display());
+            Ok(())
+        }
+    }
 }
 
 /// Send a fire-and-forget request, print `ok_msg` on success or bail on error.
