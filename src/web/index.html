@@ -85,6 +85,30 @@
   .reply input:focus{border-color:var(--accent)}
   .reply button{border:0;background:var(--accent);color:#fff;border-radius:12px;
     padding:0 16px;font-weight:600;font-size:15px;cursor:pointer}
+
+  /* composer */
+  .add{margin-left:auto;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:10px;padding:7px 12px;font-size:14px;font-weight:600;cursor:pointer}
+  .sheet-bg{position:fixed;inset:0;background:rgba(0,0,0,.4);opacity:0;pointer-events:none;
+    transition:opacity .18s;z-index:20}
+  .sheet-bg.open{opacity:1;pointer-events:auto}
+  .sheet{position:fixed;left:0;right:0;bottom:0;z-index:21;background:var(--card);
+    border-top:1px solid var(--border);border-radius:20px 20px 0 0;
+    padding:18px 16px calc(env(safe-area-inset-bottom) + 18px);max-width:720px;margin:0 auto;
+    transform:translateY(110%);transition:transform .2s ease}
+  .sheet.open{transform:none}
+  .sheet h3{margin:0;font-size:16px}
+  .sheet .lab{font-size:11px;color:var(--muted);margin:16px 0 8px;text-transform:uppercase;
+    letter-spacing:.5px;font-weight:700}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{border:1px solid var(--border);background:transparent;color:var(--text);border-radius:999px;
+    padding:8px 14px;font-size:14px;cursor:pointer}
+  .chip.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent)}
+  .sheet input{width:100%;border:1px solid var(--border);background:var(--bg);color:var(--text);
+    border-radius:10px;padding:12px 13px;font-size:15px;outline:none;margin-top:8px}
+  .sheet input:focus{border-color:var(--accent)}
+  .sheet .start{width:100%;margin-top:18px;border:0;background:var(--accent);color:#fff;
+    border-radius:12px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}
 </style>
 </head>
 <body>
@@ -94,8 +118,23 @@
     <span class="dot" id="live"></span>
     <span class="title" id="title">ruckus</span>
     <span class="sub" id="sub"></span>
+    <button class="add" id="add">+ New</button>
   </header>
   <main id="main"><div class="empty">Connecting…</div></main>
+</div>
+<div class="sheet-bg" id="sheetbg"></div>
+<div class="sheet" id="sheet">
+  <h3>New session</h3>
+  <div class="lab">Run</div>
+  <div class="chips" id="cmdchips">
+    <button class="chip sel" data-cmd="claude">claude</button>
+    <button class="chip" data-cmd="codex">codex</button>
+    <button class="chip" data-cmd="">shell</button>
+  </div>
+  <input id="cmdin" placeholder="or type a command…" value="claude" autocomplete="off" autocapitalize="off">
+  <div class="lab">In</div>
+  <div class="chips" id="spacechips"></div>
+  <button class="start" id="startbtn">Start session</button>
 </div>
 <script>
 const $ = s => document.querySelector(s);
@@ -126,11 +165,20 @@ const phaseActivity = ph => ({working:'working',awaiting_approval:'waiting',awai
 const send = o => ws && ws.readyState===1 && ws.send(JSON.stringify(o));
 
 // ---- rendering ----
-function isAgent(p){ return p.agent || p.agent_state || !/^(-|\/)?(zsh|bash|sh|fish|nu|pwsh)$/.test((p.cmd&&p.cmd[0]||'').split('/').pop()); }
+// A "session" is a tab (which carries the name you gave it); agents run inside
+// its active pane. List every tab across every space.
+function sessions(){
+  const out=[];
+  for(const sp of (snap.spaces||[]))
+    for(const t of (sp.tabs||[])){
+      const pane = snap.panes.find(p=>p.id===t.active_pane);
+      if(pane) out.push({space:sp.name, tab:t.name, pane});
+    }
+  return out;
+}
 function paneName(p){
-  const sp = snap.spaces.find(s=>s.tabs.some(t=>t.active_pane===p.id||t.id));
-  const tab = sp && sp.tabs.find(t=>t.active_pane===p.id);
-  return p.agent_state?.agent || (tab&&tab.name) || p.title || 'session';
+  for(const sp of (snap.spaces||[])) for(const t of (sp.tabs||[])) if(t.active_pane===p.id) return t.name||p.title;
+  return (p.agent_state&&p.agent_state.agent)||p.title||'session';
 }
 function stateOf(p){ const a=p.activity; return a==='working'?'working':a==='waiting'?'waiting':a==='done'?'done':'idle'; }
 function stateLabel(p){
@@ -142,17 +190,18 @@ function stateLabel(p){
 
 function render(){
   if(view.name==='session'){ renderSession(); return; }
-  $('#back').style.display='none'; $('#title').textContent='ruckus'; $('#sub').textContent='';
-  const panes = snap.panes.filter(isAgent).sort((a,b)=>rank(b)-rank(a));
+  $('#back').style.display='none'; $('#add').style.display=''; $('#title').textContent='ruckus'; $('#sub').textContent='';
+  const list = sessions().sort((a,b)=>rank(b.pane)-rank(a.pane));
   const main=$('#main'); main.innerHTML='';
-  if(!panes.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run an agent in a ruckus pane.</div>'; return; }
-  for(const p of panes){
+  if(!list.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run something in a ruckus tab.</div>'; return; }
+  for(const s of list){
+    const p=s.pane;
     const c=document.createElement('div'); c.className='card';
     const pend=p.agent_state?.pending;
     c.innerHTML =
-      `<div class="row"><span class="name">${esc(paneName(p))}</span>
+      `<div class="row"><span class="name">${esc(s.tab||p.title)}</span>
         <span class="pill ${stateOf(p)}">${stateLabel(p)}</span></div>
-       <div class="meta">${esc(loc(p))}</div>
+       <div class="meta">${esc(s.space)} · ${esc(loc(p))}</div>
        ${p.preview?`<div class="preview">${esc(p.preview)}</div>`:''}`;
     if(pend){
       const a=document.createElement('div'); a.className='appr';
@@ -172,7 +221,7 @@ function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'
 function openSession(pane){ view={name:'session',pane}; sessionMsgs[pane]=sessionMsgs[pane]||null; send({t:'session',pane}); render(); }
 function renderSession(){
   const p=snap.panes.find(p=>p.id===view.pane);
-  $('#back').style.display=''; $('#back').onclick=()=>{view={name:'timeline'};render();};
+  $('#back').style.display=''; $('#add').style.display='none'; $('#back').onclick=()=>{view={name:'timeline'};render();};
   $('#title').textContent = p?paneName(p):'session';
   $('#sub').textContent = p?stateLabel(p):'';
   const main=$('#main'); main.innerHTML='';
@@ -217,6 +266,29 @@ function renderMsg(m){
 function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
   const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }
 function esc(s){ return (s==null?'':''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// ---- composer: start a new session (tab), optionally in a new space ----
+let startTarget=0;
+function openSheet(){
+  const sb=$('#spacechips'); sb.innerHTML=''; startTarget=0;
+  const mk=(id,label)=>{
+    const b=document.createElement('button'); b.className='chip'+(id===0?' sel':''); b.textContent=label;
+    b.onclick=()=>{ startTarget=id; [...sb.children].forEach(c=>c.classList.remove('sel')); b.classList.add('sel'); };
+    return b;
+  };
+  sb.appendChild(mk(0,'＋ New space'));
+  for(const s of (snap.spaces||[])) sb.appendChild(mk(s.id, s.name));
+  $('#sheetbg').classList.add('open'); $('#sheet').classList.add('open');
+  setTimeout(()=>$('#cmdin').focus(),60);
+}
+function closeSheet(){ $('#sheetbg').classList.remove('open'); $('#sheet').classList.remove('open'); }
+$('#add').onclick=openSheet;
+$('#sheetbg').onclick=closeSheet;
+document.querySelectorAll('#cmdchips .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('#cmdchips .chip').forEach(x=>x.classList.remove('sel')); c.classList.add('sel');
+  $('#cmdin').value=c.dataset.cmd;
+});
+$('#startbtn').onclick=()=>{ send({t:'new_tab',space:startTarget,cmd:$('#cmdin').value.trim()}); closeSheet(); view={name:'timeline'}; };
 
 connect();
 </script>

@@ -105,6 +105,46 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
                         };
                         client.notify(Request::ResolveDecision { pane, request_id, decision });
                     }
+                    // Start a new tab (optionally in a fresh space) running a
+                    // command — e.g. claude / codex / a shell — from the phone.
+                    Some("new_tab") => {
+                        let cmd_str = v.get("cmd").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                        let mut cmd: Vec<String> =
+                            cmd_str.split_whitespace().map(String::from).collect();
+                        if cmd.is_empty() {
+                            cmd = vec![default_shell()];
+                        }
+                        let name = cmd.first().map(|c| {
+                            c.rsplit('/').next().unwrap_or(c).to_string()
+                        });
+                        let mut space = v.get("space").and_then(Value::as_u64).unwrap_or(0);
+                        if space == 0 {
+                            if let Ok(ServerMsg::Created { space: s, .. }) = client
+                                .request(Request::NewSpace { name: name.clone(), cwd: None })
+                                .await
+                            {
+                                space = s;
+                            }
+                        }
+                        if space != 0 {
+                            let _ = client
+                                .request(Request::NewTab { space, name, cmd, cwd: None })
+                                .await;
+                        }
+                        if let Ok(snap) = client.snapshot().await {
+                            let _ = tx.send(Message::Text(
+                                json!({ "t": "snapshot", "snapshot": snap }).to_string())).await;
+                        }
+                    }
+                    Some("new_space") => {
+                        let name = v.get("name").and_then(Value::as_str)
+                            .filter(|s| !s.is_empty()).map(String::from);
+                        let _ = client.request(Request::NewSpace { name, cwd: None }).await;
+                        if let Ok(snap) = client.snapshot().await {
+                            let _ = tx.send(Message::Text(
+                                json!({ "t": "snapshot", "snapshot": snap }).to_string())).await;
+                        }
+                    }
                     // Send a reply (types text + Enter into the real session).
                     Some("input") => {
                         let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
