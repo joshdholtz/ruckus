@@ -25,6 +25,15 @@ pub async fn run(addr: &str) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/manifest.webmanifest", get(manifest))
+        .route("/vendor/xterm.js", get(|| async {
+            ([("content-type", "text/javascript")], include_str!("web/vendor/xterm.js"))
+        }))
+        .route("/vendor/xterm.css", get(|| async {
+            ([("content-type", "text/css")], include_str!("web/vendor/xterm.css"))
+        }))
+        .route("/vendor/addon-fit.js", get(|| async {
+            ([("content-type", "text/javascript")], include_str!("web/vendor/addon-fit.js"))
+        }))
         .route("/ws", get(ws_upgrade));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -171,6 +180,13 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
                     Some("detach") => {
                         let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
                         client.notify(Request::Detach { pane });
+                    }
+                    // Resize the pane to match the browser terminal (xterm fit).
+                    Some("resize") => {
+                        let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
+                        let rows = v.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+                        let cols = v.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+                        client.notify(Request::Resize { pane, rows, cols });
                     }
                     // Session management from the phone.
                     Some("close") => {
@@ -322,6 +338,38 @@ fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>, Optio
 
 /// A one-line-ish summary of a tool call for the chat card.
 fn tool_summary(name: &str, input: &Value) -> String {
+    // Rich interactions get readable text instead of a raw-JSON dump.
+    if name == "AskUserQuestion" {
+        let mut s = String::new();
+        if let Some(qs) = input.get("questions").and_then(Value::as_array) {
+            for q in qs {
+                if let Some(t) = q.get("question").and_then(Value::as_str) {
+                    s.push_str("❓ ");
+                    s.push_str(t);
+                    s.push('\n');
+                }
+                if let Some(opts) = q.get("options").and_then(Value::as_array) {
+                    for o in opts {
+                        if let Some(l) = o.get("label").and_then(Value::as_str) {
+                            s.push_str("   • ");
+                            s.push_str(l);
+                            s.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        return s.trim_end().to_string();
+    }
+    if name == "ExitPlanMode" {
+        return input
+            .get("plan")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(2000)
+            .collect();
+    }
     let pick = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let s = match name {
         "Bash" => pick("command"),

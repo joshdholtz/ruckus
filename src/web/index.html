@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0f1115">
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/vendor/xterm.css">
 <title>ruckus</title>
 <style>
   :root{
@@ -83,7 +84,8 @@
     animation:pulse 1s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
   .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
-    padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+    padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+    white-space:pre-wrap;word-break:break-word}
   .tool .t{color:var(--muted);font-weight:700;margin-right:6px;text-transform:none}
   .tool.err{border-color:color-mix(in srgb,var(--err) 40%,var(--border))}
   .tool.res{color:var(--muted);white-space:pre-wrap}
@@ -130,9 +132,9 @@
   .iconbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
     border-radius:9px;width:34px;height:32px;font-size:15px;cursor:pointer}
   .iconbtn.danger{color:var(--err)}
-  .term{background:#0b0d12;color:#cdd3de;border:1px solid var(--border);border-radius:10px;
-    padding:12px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;
-    overflow-x:auto;min-height:240px;-webkit-overflow-scrolling:touch}
+  #termhost{flex:1;min-height:220px;border:1px solid var(--border);border-radius:10px;
+    overflow:hidden;background:#0b0d12;padding:6px 8px}
+  #termhost .xterm{height:100%}
 </style>
 </head>
 <body>
@@ -175,9 +177,13 @@
   <div class="chips" id="spacechips"></div>
   <button class="start" id="startbtn">Start session</button>
 </div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, sessionModel = {}, sessionEffort = {}, termbufs = {}, pendingMsgs = {};
+let TERM=null, TERMFIT=null;
+function termLive(){ return view.name==='session' && view.mode==='terminal'; }
 
 function connect(){
   ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
@@ -195,32 +201,36 @@ function connect(){
       if(pnd&&pnd.length){ const ut=new Set((m.msgs||[]).filter(x=>x.role==='user'&&x.kind==='text').map(x=>(x.text||'').trim()));
         pendingMsgs[m.pane]=pnd.filter(p=>!ut.has(p.text.trim()) && Date.now()-p.ts<45000); }
       if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length||pm!==m.model||pe!==m.effort||(pnd&&pnd.length!==(pendingMsgs[m.pane]||[]).length))) render(); }
-    else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(view.name==='session'&&view.pane===m.pane&&view.mode==='terminal') paintTerm(); }
+    else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(TERM&&TERM._pane===m.pane){ try{TERM.clear();}catch(e){} TERM.write(termbufs[m.pane]); } }
   };
 }
 function onEvent(msg){
   if(!msg||!msg.type) return;
-  if(msg.type==='state'){ snap = msg.snapshot; render(); }
+  if(msg.type==='state'){ snap = msg.snapshot; if(termLive()) updateHeader(); else render(); }
   else if(msg.type==='agent_state'){
     const p = snap.panes.find(p=>p.id===msg.pane); if(p){ p.agent_state=msg.state; p.activity=phaseActivity(msg.state.phase); p.agent=p.agent||msg.state.agent; }
     if(view.name==='session'&&view.pane===msg.pane){
       // A just-opened agent session may have defaulted to Terminal before it was
       // flagged; flip it to Chat once (unless the user chose Terminal themselves).
-      if(view.mode==='terminal'&&!view.userToggled&&msg.state.session){ send({t:'detach',pane:msg.pane}); view.mode='chat'; }
+      if(view.mode==='terminal'&&!view.userToggled&&msg.state.session){ disposeTerm(); send({t:'detach',pane:msg.pane}); view.mode='chat'; render(); return; }
       if(view.mode==='chat') send({t:'session',pane:msg.pane});
     }
-    render();
+    if(termLive()) updateHeader(); else render();
   }
-  else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; render(); }
+  else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; if(termLive()) updateHeader(); else render(); }
   else if(msg.type==='output'){
-    if(view.name==='session'&&view.mode==='terminal'&&msg.pane===view.pane){
-      let b=(termbufs[msg.pane]||'')+decodeB64(msg.data);
-      if(b.length>200000) b=b.slice(-200000);   // cap the buffer
-      termbufs[msg.pane]=b; paintTerm();
+    if(termLive()&&msg.pane===view.pane){
+      const dec=decodeB64(msg.data);
+      termbufs[msg.pane]=((termbufs[msg.pane]||'')+dec).slice(-400000);
+      if(TERM&&TERM._pane===msg.pane) TERM.write(dec);
     }
   }
-  else if(msg.type==='exited'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p){p.status={state:'exited',code:msg.code};p.activity='done';} render(); }
+  else if(msg.type==='exited'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p){p.status={state:'exited',code:msg.code};p.activity='done';} if(termLive()) updateHeader(); else render(); }
 }
+function updateHeader(){ const p=snap.panes.find(p=>p.id===view.pane); if(!p) return;
+  $('#title').textContent=paneName(p);
+  const mdl=sessionModel[view.pane], eff=sessionEffort[view.pane];
+  $('#sub').textContent=[mdl,eff,loc(p)].filter(Boolean).join(' · ')||stateLabel(p); }
 const phaseActivity = ph => ({working:'working',awaiting_approval:'waiting',awaiting_input:'waiting',done:'done',error:'done'}[ph]||'idle');
 const send = o => ws && ws.readyState===1 && ws.send(JSON.stringify(o));
 
@@ -252,7 +262,7 @@ function render(){
   if(view.name==='session'){ renderSession(); return; }
   $('#back').style.display='none'; $('#add').style.display=''; $('#title').textContent='ruckus'; $('#sub').textContent='';
   const list = sessions().sort((a,b)=>rank(b.pane)-rank(a.pane));
-  const main=$('#main'); main.innerHTML='';
+  const main=$('#main'); main.innerHTML=''; main.style.display='block'; main.style.overflowY='auto';
   if(!list.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run something in a ruckus tab.</div>'; return; }
   for(const s of list){
     const p=s.pane;
@@ -293,11 +303,11 @@ function openSession(pane){
   render();
 }
 function attach(pane){ if(!(pane in termbufs)) termbufs[pane]=''; send({t:'attach',pane}); }
-function leaveSession(){ if(view.name==='session'&&view.mode==='terminal') send({t:'detach',pane:view.pane}); }
+function leaveSession(){ if(view.name==='session'&&view.mode==='terminal'){ send({t:'detach',pane:view.pane}); disposeTerm(); } }
 function setMode(m){
   if(m===view.mode) return;
   view.userToggled=true;
-  if(view.mode==='terminal') send({t:'detach',pane:view.pane});
+  if(view.mode==='terminal'){ send({t:'detach',pane:view.pane}); disposeTerm(); }
   view.mode=m;
   if(m==='terminal') attach(view.pane); else send({t:'session',pane:view.pane});
   render();
@@ -349,10 +359,10 @@ function renderSession(){
   }
 
   if(view.mode==='terminal'){
-    const pre=document.createElement('pre'); pre.className='term'; pre.id='term';
-    pre.textContent = termText(termbufs[view.pane]||'') || '…';
-    main.appendChild(pre);
+    main.style.display='flex'; main.style.flexDirection='column'; main.style.overflow='hidden';
+    const host=document.createElement('div'); host.id='termhost'; main.appendChild(host);
   } else {
+    main.style.display='block'; main.style.overflowY='auto';
     const msgs=sessionMsgs[view.pane];
     if(msgs===null||msgs===undefined){ main.insertAdjacentHTML('beforeend','<div class="empty">Loading…</div>'); }
     else if(!msgs.length){ main.insertAdjacentHTML('beforeend','<div class="empty">No transcript yet — try Terminal.</div>'); }
@@ -377,23 +387,26 @@ function renderSession(){
   };
   bar.querySelector('#rsend').onclick=go;
   inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
-  const mn=$('#main');
-  if(view.mode==='terminal') paintTerm(); else mn.scrollTop=mn.scrollHeight;
+  if(view.mode==='terminal') createTerm(view.pane); else main.scrollTop=main.scrollHeight;
 }
-function paintTerm(){
-  const el=$('#term'); if(!el) return;
-  el.textContent = termText(termbufs[view.pane]||'').split('\n').slice(-500).join('\n');
-  el.scrollTop = el.scrollHeight;
-  const mn=$('#main'); if(mn) mn.scrollTop=mn.scrollHeight;
+function createTerm(pane){
+  disposeTerm();
+  const host=$('#termhost'); if(!host||typeof Terminal==='undefined') return;
+  const t=new Terminal({fontSize:12,fontFamily:'ui-monospace,Menlo,monospace',cursorBlink:false,scrollback:8000,
+    theme:{background:'#0b0d12',foreground:'#cdd3de',cursor:'#cdd3de',selectionBackground:'#33415580'}});
+  const fit=new FitAddon.FitAddon(); t.loadAddon(fit); t.open(host);
+  try{fit.fit();}catch(e){}
+  t._pane=pane; TERM=t; TERMFIT=fit;
+  if(termbufs[pane]) t.write(termbufs[pane]);
+  sendResize(pane);
+  t.onData(d=>send({t:'input',pane,text:d,enter:false}));
+  window.__tr=()=>{ try{fit.fit(); sendResize(pane);}catch(e){} };
+  window.addEventListener('resize', window.__tr);
+  // one more fit after layout settles (mobile)
+  setTimeout(()=>{ try{fit.fit(); sendResize(pane);}catch(e){} }, 60);
 }
-function termText(raw){
-  return raw
-    .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g,'')
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'')
-    .replace(/\x1b[=>()#][0-9A-Za-z]?/g,'')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,'')
-    .split('\n').map(l=>{ const p=l.split('\r'); return p[p.length-1]; }).join('\n');
-}
+function sendResize(pane){ if(TERM) send({t:'resize',pane,rows:TERM.rows||24,cols:TERM.cols||80}); }
+function disposeTerm(){ if(window.__tr){window.removeEventListener('resize',window.__tr); window.__tr=null;} if(TERM){try{TERM.dispose();}catch(e){}} TERM=null; TERMFIT=null; }
 function decodeB64(b64){ try{ return new TextDecoder().decode(Uint8Array.from(atob(b64),c=>c.charCodeAt(0))); }catch(e){ return ''; } }
 function renderMsg(m){
   const d=document.createElement('div');
