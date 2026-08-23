@@ -11,7 +11,27 @@ the biggest real gap between Ruckus and Longhouse.
 byte-for-byte what it is today; the web view is a second lens for people who want
 the clean chat/timeline instead of a PTY. Two front-ends, one brain.
 
-Status: **design — not yet built.** Web-first (iOS = a PWA later).
+Status: **WC0–WC2 implemented** (`ruckus web`: serves a clean mobile-first
+console, WebSocket bridge to the daemon, normalized Claude transcript view,
+inline approve/deny + reply). WC3 raw-terminal toggle, WC4 search, WC5 relay
+tunnel + richer PWA, WC6 Codex/push pending. Web-first (iOS = a PWA later).
+
+## Implemented surface
+
+- `ruckus web --listen 0.0.0.0:8080` — serves a self-contained mobile web console
+  (reach it over Tailscale, e.g. `http://mini:8080`, or later the relay).
+- **Timeline** of agent sessions with live state; a pending approval shows an
+  inline **Approve / Deny** right on the card.
+- **Session view** rendered from the agent's own transcript (Claude JSONL, via
+  `agent_state.session` + `~/.claude/projects`) — user/assistant text, tool
+  cards, results — plus an approval banner and a **reply box** (sends `Input` to
+  the real session).
+- The browser speaks a tiny JSON protocol over `/ws`; the server bridges to the
+  daemon (`Snapshot`/events/`ResolveDecision`/`Input`) and reads transcripts
+  directly — **no daemon changes, terminal TUI untouched**.
+- Verified end-to-end: page + manifest serve, WS streams the snapshot + pending
+  approval, and approving from the browser lands `permissionDecision:allow` back
+  in Claude.
 
 ## Why this is very buildable on Ruckus
 

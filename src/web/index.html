@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>ruckus</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --text:#16181d; --muted:#6b7280; --border:#e6e8ec;
+    --accent:#2563eb; --wait:#c2740b; --ok:#16a34a; --err:#dc2626; --idle:#9aa0aa;
+    --shadow:0 1px 2px rgba(16,18,29,.05);
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --bg:#0f1115; --card:#171a21; --text:#e7e8ec; --muted:#8b909b; --border:#242833;
+    --accent:#5b8cff; --wait:#e0952f; --ok:#3fbf6b; --err:#f0616b; --idle:#5c626e;
+    --shadow:none;
+  }}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;min-height:100%;display:flex;flex-direction:column}
+  header{position:sticky;top:0;z-index:5;background:var(--bg);
+    padding:calc(env(safe-area-inset-top) + 14px) 16px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:12px}
+  header .title{font-weight:600;font-size:16px;letter-spacing:.2px}
+  header .dot{width:8px;height:8px;border-radius:50%;background:var(--idle)}
+  header .dot.live{background:var(--ok)}
+  .back{border:0;background:none;color:var(--accent);font-size:15px;padding:6px 2px;cursor:pointer}
+  .sub{color:var(--muted);font-size:13px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
+  main{flex:1;padding:12px 12px 24px}
+  .empty{color:var(--muted);text-align:center;padding:48px 20px;font-size:14px}
+
+  /* timeline cards */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
+    padding:14px;margin-bottom:10px;box-shadow:var(--shadow);cursor:pointer}
+  .card:active{transform:scale(.995)}
+  .card .row{display:flex;align-items:center;gap:8px}
+  .card .name{font-weight:600}
+  .card .pill{margin-left:auto;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;
+    background:color-mix(in srgb,var(--idle) 16%,transparent);color:var(--idle)}
+  .pill.working{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+  .pill.waiting{background:color-mix(in srgb,var(--wait) 18%,transparent);color:var(--wait)}
+  .pill.done{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .card .meta{color:var(--muted);font-size:13px;margin-top:4px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .card .preview{color:var(--muted);font-size:13px;margin-top:6px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+
+  /* approval */
+  .appr{margin-top:12px;border:1px solid color-mix(in srgb,var(--wait) 45%,var(--border));
+    border-radius:12px;padding:11px 12px;background:color-mix(in srgb,var(--wait) 8%,transparent)}
+  .appr .q{font-size:13px;color:var(--muted);margin-bottom:4px}
+  .appr .cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
+    word-break:break-word;margin-bottom:10px}
+  .appr .btns{display:flex;gap:8px}
+  .btn{flex:1;border:0;border-radius:10px;padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+  .btn.allow{background:var(--ok);color:#fff}
+  .btn.deny{background:color-mix(in srgb,var(--err) 14%,transparent);color:var(--err)}
+  .btn:active{filter:brightness(.95)}
+
+  /* chat */
+  .msg{margin-bottom:14px;display:flex;flex-direction:column}
+  .msg .who{font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--muted);margin-bottom:4px}
+  .msg.user .who{color:var(--accent)}
+  .bubble{background:var(--card);border:1px solid var(--border);border-radius:12px;
+    padding:11px 13px;white-space:pre-wrap;word-break:break-word}
+  .msg.user .bubble{background:color-mix(in srgb,var(--accent) 9%,var(--card))}
+  .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
+    padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  .tool .t{color:var(--muted);font-weight:700;margin-right:6px;text-transform:none}
+  .tool.err{border-color:color-mix(in srgb,var(--err) 40%,var(--border))}
+  .tool.res{color:var(--muted);white-space:pre-wrap}
+
+  /* reply bar */
+  .reply{position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--border);
+    padding:10px 12px calc(env(safe-area-inset-bottom) + 10px);display:flex;gap:8px}
+  .reply input{flex:1;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:12px;padding:12px 14px;font-size:15px;outline:none}
+  .reply input:focus{border-color:var(--accent)}
+  .reply button{border:0;background:var(--accent);color:#fff;border-radius:12px;
+    padding:0 16px;font-weight:600;font-size:15px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <button class="back" id="back" style="display:none">‹ Sessions</button>
+    <span class="dot" id="live"></span>
+    <span class="title" id="title">ruckus</span>
+    <span class="sub" id="sub"></span>
+  </header>
+  <main id="main"><div class="empty">Connecting…</div></main>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null}, sessionMsgs = {};
+
+function connect(){
+  ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  ws.onopen = () => { $('#live').classList.add('live'); };
+  ws.onclose = () => { $('#live').classList.remove('live'); setTimeout(connect, 1500); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if(m.t==='snapshot'){ snap = m.snapshot; render(); }
+    else if(m.t==='event'){ onEvent(m.msg); }
+    else if(m.t==='session'){ sessionMsgs[m.pane] = m.msgs; if(view.name==='session'&&view.pane===m.pane) render(); }
+  };
+}
+function onEvent(msg){
+  if(!msg||!msg.type) return;
+  if(msg.type==='state'){ snap = msg.snapshot; render(); }
+  else if(msg.type==='agent_state'){
+    const p = snap.panes.find(p=>p.id===msg.pane); if(p){ p.agent_state=msg.state; p.activity=phaseActivity(msg.state.phase); }
+    if(view.name==='session'&&view.pane===msg.pane) ws.send(JSON.stringify({t:'session',pane:msg.pane}));
+    render();
+  }
+  else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; render(); }
+}
+const phaseActivity = ph => ({working:'working',awaiting_approval:'waiting',awaiting_input:'waiting',done:'done',error:'done'}[ph]||'idle');
+const send = o => ws && ws.readyState===1 && ws.send(JSON.stringify(o));
+
+// ---- rendering ----
+function isAgent(p){ return p.agent || p.agent_state || !/^(-|\/)?(zsh|bash|sh|fish|nu|pwsh)$/.test((p.cmd&&p.cmd[0]||'').split('/').pop()); }
+function paneName(p){
+  const sp = snap.spaces.find(s=>s.tabs.some(t=>t.active_pane===p.id||t.id));
+  const tab = sp && sp.tabs.find(t=>t.active_pane===p.id);
+  return p.agent_state?.agent || (tab&&tab.name) || p.title || 'session';
+}
+function stateOf(p){ const a=p.activity; return a==='working'?'working':a==='waiting'?'waiting':a==='done'?'done':'idle'; }
+function stateLabel(p){
+  const ph=p.agent_state?.phase;
+  if(ph==='awaiting_approval') return 'needs approval';
+  if(ph==='awaiting_input') return 'your turn';
+  return {working:'working',waiting:'waiting',done:'done',idle:'idle'}[stateOf(p)];
+}
+
+function render(){
+  if(view.name==='session'){ renderSession(); return; }
+  $('#back').style.display='none'; $('#title').textContent='ruckus'; $('#sub').textContent='';
+  const panes = snap.panes.filter(isAgent).sort((a,b)=>rank(b)-rank(a));
+  const main=$('#main'); main.innerHTML='';
+  if(!panes.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run an agent in a ruckus pane.</div>'; return; }
+  for(const p of panes){
+    const c=document.createElement('div'); c.className='card';
+    const pend=p.agent_state?.pending;
+    c.innerHTML =
+      `<div class="row"><span class="name">${esc(paneName(p))}</span>
+        <span class="pill ${stateOf(p)}">${stateLabel(p)}</span></div>
+       <div class="meta">${esc(loc(p))}</div>
+       ${p.preview?`<div class="preview">${esc(p.preview)}</div>`:''}`;
+    if(pend){
+      const a=document.createElement('div'); a.className='appr';
+      a.innerHTML=`<div class="q">Approve this?</div><div class="cmd">${esc(pend.title)}</div>
+        <div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
+      a.querySelector('.allow').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'allow');};
+      a.querySelector('.deny').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'deny');};
+      c.appendChild(a);
+    }
+    c.onclick=()=>openSession(p.id);
+    main.appendChild(c);
+  }
+}
+const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
+function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'·'+p.git_branch:''; return cwd+br; }
+
+function openSession(pane){ view={name:'session',pane}; sessionMsgs[pane]=sessionMsgs[pane]||null; send({t:'session',pane}); render(); }
+function renderSession(){
+  const p=snap.panes.find(p=>p.id===view.pane);
+  $('#back').style.display=''; $('#back').onclick=()=>{view={name:'timeline'};render();};
+  $('#title').textContent = p?paneName(p):'session';
+  $('#sub').textContent = p?stateLabel(p):'';
+  const main=$('#main'); main.innerHTML='';
+  const pend=p&&p.agent_state?.pending;
+  if(pend){
+    const a=document.createElement('div'); a.className='appr';
+    a.innerHTML=`<div class="q">Approve this?</div><div class="cmd">${esc(pend.title)}${pend.detail&&pend.detail!==pend.title?'\n'+esc(pend.detail):''}</div>
+      <div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
+    a.querySelector('.allow').onclick=()=>resolve(p.id,pend.request_id,'allow');
+    a.querySelector('.deny').onclick=()=>resolve(p.id,pend.request_id,'deny');
+    main.appendChild(a);
+  }
+  const msgs=sessionMsgs[view.pane];
+  if(msgs===null||msgs===undefined){ main.insertAdjacentHTML('beforeend','<div class="empty">Loading…</div>'); }
+  else if(!msgs.length){ main.insertAdjacentHTML('beforeend','<div class="empty">No transcript yet.</div>'); }
+  else for(const m of msgs) main.appendChild(renderMsg(m));
+  // reply bar
+  const bar=document.createElement('div'); bar.className='reply';
+  bar.innerHTML=`<input id="rin" placeholder="Reply to the agent…" autocomplete="off"><button id="rsend">Send</button>`;
+  main.appendChild(bar);
+  const inp=bar.querySelector('#rin');
+  const go=()=>{ const t=inp.value.trim(); if(!t)return; send({t:'input',pane:view.pane,text:t}); inp.value=''; };
+  bar.querySelector('#rsend').onclick=go;
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+  main.scrollIntoView({block:'end'});
+  window.scrollTo(0,document.body.scrollHeight);
+}
+function renderMsg(m){
+  const d=document.createElement('div');
+  if(m.kind==='text'){
+    d.className='msg '+(m.role==='user'?'user':'assistant');
+    d.innerHTML=`<div class="who">${m.role==='user'?'you':'assistant'}</div><div class="bubble">${esc(m.text)}</div>`;
+  } else if(m.kind==='tool_call'){
+    d.className='msg';
+    d.innerHTML=`<div class="tool"><span class="t">${esc(m.tool)}</span>${esc(m.input||'')}</div>`;
+  } else if(m.kind==='tool_result'){
+    d.className='msg';
+    d.innerHTML=`<div class="tool res ${m.is_error?'err':''}">${esc(m.text||'(done)')}</div>`;
+  }
+  return d;
+}
+function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
+  const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }
+function esc(s){ return (s==null?'':''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+connect();
+</script>
+</body>
+</html>

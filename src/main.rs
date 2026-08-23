@@ -8,6 +8,7 @@ mod relay;
 mod remote;
 mod render;
 mod tui;
+mod web;
 
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -45,6 +46,14 @@ enum Cmd {
         /// Account name devices/clients must present
         #[arg(long, default_value = "ruckus")]
         account: String,
+    },
+    /// Serve the mobile-friendly web console (reach it over Tailscale or the
+    /// relay). A parallel front-end over the same daemon; the terminal is
+    /// untouched.
+    Web {
+        /// Address to listen on
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
     },
     /// Attach a remote device through the configured relay (no SSH). Reads
     /// `[relay]` from your config for the broker url/account/secret.
@@ -250,6 +259,7 @@ async fn main() -> Result<()> {
             })?;
             relay::run_broker(&listen, account, secret).await
         }
+        Some(Cmd::Web { listen }) => web::run(&listen).await,
         Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
         Some(Cmd::AgentHook { agent, gate }) => agent_hook::run(agent, gate).await,
         Some(Cmd::AgentSetup { agent, gate, write }) => agent_hook::setup(agent, gate, write).await,
