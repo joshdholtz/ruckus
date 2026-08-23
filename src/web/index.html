@@ -347,12 +347,12 @@ function render(){
 const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
 function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'·'+p.git_branch:''; return cwd+br; }
 
-function defaultMode(p){
-  if(!p) return 'chat';
+function isAgentSession(p){
+  if(!p) return false;
   const nm=(paneName(p)||'').toLowerCase();
-  const agentish = p.agent || p.agent_state || /claude|codex|aider|goose|opencode|gemini|cursor|amp|cody/.test(nm);
-  return agentish ? 'chat' : 'terminal';
+  return !!(p.agent || p.agent_state || /claude|codex|aider|goose|opencode|gemini|cursor|amp|cody/.test(nm));
 }
+function defaultMode(p){ return isAgentSession(p) ? 'chat' : 'terminal'; }
 function openSession(pane){
   const p=snap.panes.find(x=>x.id===pane);
   view={name:'session',pane,mode:defaultMode(p)};
@@ -380,11 +380,16 @@ function renderSession(){
   $('#sub').textContent = [mdl, eff, p&&loc(p)].filter(Boolean).join(' · ') || (p?stateLabel(p):'');
   const main=$('#main'); main.innerHTML=''; main.style.paddingTop='0';
 
+  // Chat + model/effort only make sense for agent sessions (they have a
+  // transcript). A plain shell is Terminal-only.
+  const agentSess = isAgentSession(p);
+  if(!agentSess && view.mode==='chat'){ view.mode='terminal'; }
+
   const row=document.createElement('div'); row.className='moderow';
-  row.innerHTML=`<button class="tabbtn ${view.mode==='chat'?'sel':''}" data-m="chat">Chat</button>
-    <button class="tabbtn ${view.mode==='terminal'?'sel':''}" data-m="terminal">Terminal</button>
+  row.innerHTML=`${agentSess?`<button class="tabbtn ${view.mode==='chat'?'sel':''}" data-m="chat">Chat</button>
+    <button class="tabbtn ${view.mode==='terminal'?'sel':''}" data-m="terminal">Terminal</button>`:''}
     <span style="margin-left:auto"></span>
-    <button class="iconbtn" id="cfg" title="model / effort">⚙</button>
+    ${agentSess?`<button class="iconbtn" id="cfg" title="model / effort">⚙</button>`:''}
     <button class="iconbtn" id="restart" title="restart">↻</button>
     <button class="iconbtn danger" id="close" title="close">✕</button>`;
   row.querySelectorAll('.tabbtn').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
@@ -392,20 +397,22 @@ function renderSession(){
   row.querySelector('#close').onclick=()=>{ if(confirm('Close (kill) this session?')){ send({t:'close',pane:view.pane}); leaveSession(); view={name:'timeline'}; render(); } };
   main.appendChild(row);
 
-  // model / effort change panel (sends /model & /effort into the session).
-  // Both the current model and effort come from the transcript and are highlighted.
-  const curModel = sessionModel[view.pane], curEffort = sessionEffort[view.pane];
-  const cfg=document.createElement('div'); cfg.id='cfgpanel'; cfg.style.display='none'; cfg.style.marginBottom='12px';
-  cfg.innerHTML=`<div class="lab" style="margin-top:0">Model</div>
-    <div class="chips">${['opus','sonnet','haiku'].map(m=>`<button class="chip ${m===curModel?'sel':''}" data-c="/model ${m}">${m}</button>`).join('')}</div>
-    <div class="lab">Effort</div>
-    <div class="chips">${['low','medium','high','max'].map(e=>`<button class="chip ${e===curEffort?'sel':''}" data-c="/effort ${e}">${e}</button>`).join('')}</div>`;
-  cfg.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
-    send({t:'input',pane:view.pane,text:b.dataset.c});
-    const group=b.parentElement; group.querySelectorAll('.chip').forEach(x=>x.classList.remove('sel')); b.classList.add('sel');
-  });
-  main.appendChild(cfg);
-  row.querySelector('#cfg').onclick=()=>{ cfg.style.display = cfg.style.display==='none' ? '' : 'none'; };
+  if(agentSess){
+    // model / effort change panel (sends /model & /effort into the session);
+    // current model + effort come from the transcript and are highlighted.
+    const curModel = sessionModel[view.pane], curEffort = sessionEffort[view.pane];
+    const cfg=document.createElement('div'); cfg.id='cfgpanel'; cfg.style.display='none'; cfg.style.marginBottom='12px';
+    cfg.innerHTML=`<div class="lab" style="margin-top:0">Model</div>
+      <div class="chips">${['opus','sonnet','haiku'].map(m=>`<button class="chip ${m===curModel?'sel':''}" data-c="/model ${m}">${m}</button>`).join('')}</div>
+      <div class="lab">Effort</div>
+      <div class="chips">${['low','medium','high','max'].map(e=>`<button class="chip ${e===curEffort?'sel':''}" data-c="/effort ${e}">${e}</button>`).join('')}</div>`;
+    cfg.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
+      send({t:'input',pane:view.pane,text:b.dataset.c});
+      const group=b.parentElement; group.querySelectorAll('.chip').forEach(x=>x.classList.remove('sel')); b.classList.add('sel');
+    });
+    main.appendChild(cfg);
+    row.querySelector('#cfg').onclick=()=>{ cfg.style.display = cfg.style.display==='none' ? '' : 'none'; };
+  }
 
   const pend=p&&p.agent_state?.pending;
   if(pend){
