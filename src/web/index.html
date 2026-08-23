@@ -87,9 +87,9 @@
     padding:12px;background:color-mix(in srgb,var(--accent) 6%,transparent)}
   .qq{font-weight:600;margin-bottom:10px}
   .qopts{display:flex;flex-direction:column;gap:8px}
-  .qopt{text-align:left;border:1px solid var(--border);background:var(--card);color:var(--text);
-    border-radius:10px;padding:11px 13px;font-size:14px;cursor:pointer;width:100%}
-  .qopt:active{border-color:var(--accent)}
+  .qopt-ro{border:1px solid var(--border);border-radius:10px;padding:10px 13px;font-size:14px;color:var(--muted)}
+  .qterm{width:100%;margin-top:11px;border:0;background:var(--accent);color:#fff;border-radius:10px;
+    padding:12px;font-weight:600;font-size:14px;cursor:pointer}
   .qnote{font-size:12px;color:var(--muted);margin-top:9px}
   .thinking{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:7px;padding:3px 2px}
   .thinking::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);
@@ -400,10 +400,10 @@ function renderSession(){
     const qp = p && p.agent_state && p.agent_state.prompt;
     if(qp){
       const q=document.createElement('div'); q.className='msg';
-      const opts=(qp.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}">${esc(o)}</button>`).join('');
+      const opts=(qp.options||[]).map(o=>`<div class="qopt-ro">${esc(o)}</div>`).join('');
       q.innerHTML=`<div class="qcard"><div class="qq">${esc(qp.question)}</div><div class="qopts">${opts}</div>`+
-        `<div class="qnote">${qp.multi?'multi-select — best in Terminal':'tap an option to answer'}</div></div>`;
-      q.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, qp.multi));
+        `<button class="qterm">Answer in Terminal →</button></div>`;
+      q.querySelector('.qterm').onclick=()=>setMode('terminal');
       main.appendChild(q);
     }
   }
@@ -483,19 +483,12 @@ function renderMsg(m){
     d.className='msg';
     d.innerHTML=`<div class="tool res ${m.is_error?'err':''}">${esc(m.text||'(done)')}</div>`;
   } else if(m.kind==='question'){
+    // Historical (answered) question — read-only; the answer follows in the result.
     d.className='msg';
-    const opts=(m.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}">${esc(o)}</button>`).join('');
-    d.innerHTML=`<div class="qcard"><div class="qq">${esc(m.question)}</div><div class="qopts">${opts}</div>`+
-      `<div class="qnote">${m.multi?'multi-select — best done in Terminal':'tap an option to answer'}</div></div>`;
-    d.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, m.multi));
+    const opts=(m.options||[]).map(o=>`<div class="qopt-ro">${esc(o)}</div>`).join('');
+    d.innerHTML=`<div class="qcard"><div class="qq">${esc(m.question)}</div><div class="qopts">${opts}</div></div>`;
   }
   return d;
-}
-function answerQuestion(i, multi){
-  if(multi){ setMode('terminal'); return; }
-  // Drive a top-anchored TUI picker: ↓ i times then Enter. Best-effort — if it
-  // misfires, Terminal mode answers directly.
-  send({t:'input', pane:view.pane, text:'\x1b[B'.repeat(i)+'\r', enter:false});
 }
 function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
   const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }

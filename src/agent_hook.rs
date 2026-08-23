@@ -333,6 +333,7 @@ fn claude_hooks(exe: &str, gate: bool) -> Value {
                  "hooks": [{ "type": "command", "command": format!("{exe} agent-hook claude") }] }])
     };
     let mut hooks = serde_json::Map::new();
+    hooks.insert("UserPromptSubmit".into(), observe("claude"));
     hooks.insert("PreToolUse".into(), pre);
     hooks.insert("PostToolUse".into(), observe("claude"));
     hooks.insert("Notification".into(), observe("claude"));
