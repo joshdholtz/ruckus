@@ -1,0 +1,68 @@
+/* ruckus dashboard component kit — self-contained, theme-aware.
+   Agent-authored dashboards <link> this and use these classes for a consistent look. */
+:root{
+  --bg:#f6f7f9; --card:#fff; --text:#16181d; --muted:#6b7280; --border:#e6e8ec;
+  --accent:#2563eb; --wait:#c2740b; --ok:#16a34a; --err:#dc2626; --idle:#9aa0aa;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f1115; --card:#171a21; --text:#e7e8ec; --muted:#8b909b; --border:#242833;
+  --accent:#5b8cff; --wait:#e0952f; --ok:#3fbf6b; --err:#f0616b; --idle:#5c626e;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:14px}
+h1,h2{margin:0 0 12px} h1{font-size:19px} h2{font-size:13px;text-transform:uppercase;
+  letter-spacing:.5px;color:var(--muted);margin:22px 0 10px}
+a{color:var(--accent)}
+
+/* layout */
+.grid{display:grid;gap:10px} .grid.two{grid-template-columns:1fr 1fr}
+@media (max-width:520px){.grid.two{grid-template-columns:1fr}}
+
+/* card */
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:10px}
+.card .title{font-weight:600;margin-bottom:6px}
+.card .sub{color:var(--muted);font-size:13px}
+
+/* stat tile */
+.tile{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+.tile .n{font-size:26px;font-weight:700;letter-spacing:-.5px}
+.tile .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.4px;margin-top:2px}
+.tile .d{font-size:12px;margin-top:6px}
+.tile .d.up{color:var(--ok)} .tile .d.down{color:var(--err)}
+
+/* status pill + dot */
+.pill{display:inline-block;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;
+  background:color-mix(in srgb,var(--idle) 16%,transparent);color:var(--idle)}
+.pill.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.pill.warn{background:color-mix(in srgb,var(--wait) 18%,transparent);color:var(--wait)}
+.pill.err{background:color-mix(in srgb,var(--err) 16%,transparent);color:var(--err)}
+.pill.info{background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--idle);margin-right:6px}
+.dot.ok{background:var(--ok)} .dot.warn{background:var(--wait)} .dot.err{background:var(--err)} .dot.info{background:var(--accent)}
+
+/* list row */
+.row{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--border)}
+.row:last-child{border-bottom:0}
+.row .grow{flex:1;min-width:0}
+.row .grow .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .grow .m{color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* table */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.3px}
+
+/* code / diff */
+pre.code{background:#0b0d12;color:#cdd3de;border-radius:10px;padding:11px;overflow-x:auto;
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:6px 0}
+
+/* buttons (visual only in AP0; wired via the bridge later) */
+.btn{border:1px solid var(--border);background:var(--card);color:var(--text);border-radius:10px;
+  padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.btn.primary{border:0;background:var(--accent);color:#fff}
+.btn.ok{border:0;background:var(--ok);color:#fff}
+.btn.danger{border:0;background:color-mix(in srgb,var(--err) 14%,transparent);color:var(--err)}
+.muted{color:var(--muted)} .small{font-size:12.5px}
+.updated{color:var(--muted);font-size:12px;margin-top:18px;text-align:center}

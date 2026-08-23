@@ -7,7 +7,9 @@
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::{Html, IntoResponse};
+use axum::extract::Path;
+use axum::response::{Html, IntoResponse, Response};
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -34,6 +36,11 @@ pub async fn run(addr: &str) -> Result<()> {
         .route("/vendor/addon-fit.js", get(|| async {
             ([("content-type", "text/javascript")], include_str!("web/vendor/addon-fit.js"))
         }))
+        .route("/vendor/dash.css", get(|| async {
+            ([("content-type", "text/css")], include_str!("web/dash.css"))
+        }))
+        .route("/api/dashboards", get(dashboards_list))
+        .route("/dash/:slug", get(dash_page))
         .route("/ws", get(ws_upgrade));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -49,6 +56,46 @@ async fn index() -> impl IntoResponse {
         [("cache-control", "no-store, must-revalidate")],
         Html(include_str!("web/index.html")),
     )
+}
+
+/// List the space-slugs that have a dashboard file (`~/.ruckus/dashboards/*.html`).
+async fn dashboards_list() -> impl IntoResponse {
+    let dir = crate::protocol::ruckus_dir().join("dashboards");
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("html") {
+                if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+    }
+    axum::Json(out)
+}
+
+/// Serve a per-space dashboard (agent-authored HTML), sandboxed by the client.
+async fn dash_page(Path(slug): Path<String>) -> Response {
+    // Path-traversal guard: slugs are [a-z0-9-] only.
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return (StatusCode::NOT_FOUND, Html("not found".to_string())).into_response();
+    }
+    let path = crate::protocol::ruckus_dir()
+        .join("dashboards")
+        .join(format!("{slug}.html"));
+    match std::fs::read_to_string(&path) {
+        Ok(html) => (
+            [("content-type", "text/html"), ("cache-control", "no-store")],
+            Html(html),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Html("<p style=\"font-family:sans-serif;color:#888\">No dashboard yet.</p>".to_string()),
+        )
+            .into_response(),
+    }
 }
 
 async fn manifest() -> impl IntoResponse {
