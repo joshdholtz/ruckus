@@ -71,11 +71,6 @@ async fn claude(pane: u64, gate: bool, v: &Value) -> Result<()> {
     // AskUserQuestion: surface the pending question live — the transcript omits an
     // open question until it's answered, so a transcript reader can't show it.
     let prompt = if ev == "PreToolUse" && tool == "AskUserQuestion" {
-        // Capture the real payload once so we can match Claude's actual shape.
-        let _ = std::fs::write(
-            crate::protocol::ruckus_dir().join("askq-debug.json"),
-            serde_json::to_vec_pretty(v).unwrap_or_default(),
-        );
         question_from(v)
     } else {
         None

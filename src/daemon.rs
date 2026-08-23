@@ -1908,13 +1908,28 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         }
         Request::ReportAgentState {
             pane,
-            state: agent_state,
+            state: mut agent_state,
         } => {
             state
                 .with(move |st| {
                     let Some(p) = st.panes.get_mut(&pane) else {
                         return err(format!("no pane {pane}"));
                     };
+                    // Keep an open question alive across intermediate awaiting-state
+                    // reports (a Notification firing mid-question would otherwise
+                    // clear it). It only clears when the agent moves on (Working/Done)
+                    // or a new prompt arrives.
+                    if agent_state.prompt.is_none()
+                        && matches!(
+                            agent_state.phase,
+                            AgentPhase::AwaitingInput | AgentPhase::AwaitingApproval
+                        )
+                    {
+                        if let Some(old) = p.info.agent_state.as_ref().and_then(|s| s.prompt.clone())
+                        {
+                            agent_state.prompt = Some(old);
+                        }
+                    }
                     // Exact phase overrides the heuristic (freeze), like report-activity.
                     let activity = agent_state.phase.activity();
                     p.reported = Some(activity);
