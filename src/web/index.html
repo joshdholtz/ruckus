@@ -431,6 +431,16 @@ function createTerm(pane){
   const fit=new FitAddon.FitAddon(); t.loadAddon(fit); t.open(host);
   try{fit.fit();}catch(e){}
   t._pane=pane; TERM=t; TERMFIT=fit;
+  // Swipe to scroll the scrollback (xterm has no native touch scroll on mobile).
+  let ty=null;
+  host.addEventListener('touchstart',e=>{ ty=e.touches[0].clientY; },{passive:true});
+  host.addEventListener('touchmove',e=>{
+    if(ty==null) return;
+    const y=e.touches[0].clientY, lineH=Math.max(8, host.clientHeight/(t.rows||24));
+    const n=Math.trunc((ty-y)/lineH);
+    if(n){ t.scrollLines(n); ty=y; }
+  },{passive:true});
+  host.addEventListener('touchend',()=>{ ty=null; },{passive:true});
   if(termbufs[pane]) t.write(termbufs[pane]);
   sendResize(pane);
   t.onData(d=>send({t:'input',pane,text:d,enter:false}));
