@@ -90,9 +90,10 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
                     // Read + parse this pane's transcript into normalized messages.
                     Some("session") => {
                         let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
-                        let (msgs, model) = load_session(&client, pane).await;
+                        let (msgs, model, effort) = load_session(&client, pane).await;
                         let _ = tx.send(Message::Text(
-                            json!({ "t": "session", "pane": pane, "msgs": msgs, "model": model })
+                            json!({ "t": "session", "pane": pane, "msgs": msgs,
+                                    "model": model, "effort": effort })
                                 .to_string())).await;
                     }
                     // Approve / deny a pending agent request.
@@ -194,13 +195,16 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
 
 /// Resolve a pane's live agent session id (from the daemon snapshot), locate its
 /// provider transcript, and parse it into normalized messages.
-async fn load_session(client: &crate::client::Client, pane: u64) -> (Vec<Value>, Option<String>) {
+async fn load_session(
+    client: &crate::client::Client,
+    pane: u64,
+) -> (Vec<Value>, Option<String>, Option<String>) {
     let snap = match client.snapshot().await {
         Ok(s) => s,
-        Err(_) => return (vec![], None),
+        Err(_) => return (vec![], None, None),
     };
     let Some(p) = snap.panes.iter().find(|p| p.id == pane) else {
-        return (vec![], None);
+        return (vec![], None, None);
     };
     let session = p
         .agent_state
@@ -212,7 +216,7 @@ async fn load_session(client: &crate::client::Client, pane: u64) -> (Vec<Value>,
             return parse_claude_transcript(&path);
         }
     }
-    (vec![], None)
+    (vec![], None, None)
 }
 
 /// Short friendly model name from a full id (claude-opus-4-8 → "opus").
@@ -245,12 +249,13 @@ fn find_claude_transcript(session: &str) -> Option<PathBuf> {
 /// Parse a Claude transcript JSONL into normalized chat messages. Each record's
 /// `message.content` is a string (user) or a list of blocks (assistant):
 /// text / thinking / tool_use / tool_result.
-fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>) {
+fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>, Option<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (vec![], None);
+        return (vec![], None, None);
     };
     let mut out = Vec::new();
     let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
     for line in text.lines() {
         let Ok(rec) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -267,6 +272,10 @@ fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>) {
                 .and_then(Value::as_str)
             {
                 model = Some(friendly_model(m));
+            }
+            // `effort` is a top-level field on the assistant record.
+            if let Some(e) = rec.get("effort").and_then(Value::as_str) {
+                effort = Some(e.to_string());
             }
         }
         let content = rec.get("message").and_then(|m| m.get("content"));
@@ -308,7 +317,7 @@ fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>) {
             _ => {}
         }
     }
-    (out, model)
+    (out, model, effort)
 }
 
 /// A one-line-ish summary of a tool call for the chat card.
