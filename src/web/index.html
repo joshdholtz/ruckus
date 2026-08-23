@@ -135,7 +135,8 @@
     border-radius:12px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}
 
   /* session mode row (chat/terminal toggle + actions) */
-  .moderow{display:flex;align-items:center;gap:6px;margin-bottom:12px}
+  .moderow{display:flex;align-items:center;gap:6px;margin-bottom:12px;
+    position:sticky;top:0;z-index:3;background:var(--bg);padding:6px 0}
   .tabbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
     border-radius:9px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
   .tabbtn.sel{color:var(--accent);border-color:var(--accent);
