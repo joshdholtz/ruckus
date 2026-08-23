@@ -316,6 +316,17 @@ pub enum Decision {
     Escalate,
 }
 
+/// A pending interactive question (e.g. Claude's AskUserQuestion). Surfaced live
+/// because the transcript omits an open question until it's answered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrompt {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub multi: bool,
+}
+
 /// Structured agent state for a pane — carried alongside the heuristic `Activity`
 /// so a per-agent UI can show exactly what's happening and what's blocked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +343,9 @@ pub struct AgentState {
     /// Last assistant line / "what it's doing".
     #[serde(default)]
     pub summary: Option<String>,
+    /// A pending interactive question the user must answer.
+    #[serde(default)]
+    pub prompt: Option<AgentPrompt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

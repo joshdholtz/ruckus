@@ -39,6 +39,7 @@ pub async fn run(agent: String, gate: bool) -> Result<()> {
                     session: None,
                     pending: None,
                     summary: None,
+                    prompt: None,
                 },
             )
             .await
@@ -67,11 +68,23 @@ async fn claude(pane: u64, gate: bool, v: &Value) -> Result<()> {
         return claude_gate(pane, session, tool, v).await;
     }
 
-    let phase = match ev {
-        "Notification" | "Stop" | "StopFailure" => AgentPhase::AwaitingInput,
-        "SessionEnd" => AgentPhase::Done,
-        "PermissionRequest" => AgentPhase::AwaitingApproval,
-        _ => AgentPhase::Working, // UserPromptSubmit / PreToolUse / PostToolUse / …
+    // AskUserQuestion: surface the pending question live — the transcript omits an
+    // open question until it's answered, so a transcript reader can't show it.
+    let prompt = if ev == "PreToolUse" && tool == "AskUserQuestion" {
+        question_from(v)
+    } else {
+        None
+    };
+
+    let phase = if prompt.is_some() {
+        AgentPhase::AwaitingInput
+    } else {
+        match ev {
+            "Notification" | "Stop" | "StopFailure" => AgentPhase::AwaitingInput,
+            "SessionEnd" => AgentPhase::Done,
+            "PermissionRequest" => AgentPhase::AwaitingApproval,
+            _ => AgentPhase::Working, // UserPromptSubmit / PreToolUse / PostToolUse / …
+        }
     };
     let summary = match ev {
         "PreToolUse" | "PostToolUse" if !tool.is_empty() => Some(tool.to_string()),
@@ -87,9 +100,29 @@ async fn claude(pane: u64, gate: bool, v: &Value) -> Result<()> {
             session,
             pending,
             summary,
+            prompt,
         },
     )
     .await
+}
+
+/// Build an `AgentPrompt` from an AskUserQuestion tool_input (first question).
+fn question_from(v: &Value) -> Option<AgentPrompt> {
+    let q = v.get("tool_input")?.get("questions")?.as_array()?.first()?;
+    let options = q
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| o.get("label").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AgentPrompt {
+        question: q.get("question").and_then(Value::as_str).unwrap_or("").to_string(),
+        options,
+        multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+    })
 }
 
 /// Report the pending approval, block until the user resolves it (or the daemon
@@ -114,6 +147,7 @@ async fn claude_gate(
                 session,
                 pending: Some(approval.clone()),
                 summary: Some(approval.title.clone()),
+                prompt: None,
             },
         })
         .await;
@@ -144,6 +178,7 @@ async fn claude_gate(
                 session: None,
                 pending: None,
                 summary: None,
+                prompt: None,
             },
         })
         .await;
@@ -229,6 +264,7 @@ async fn codex(pane: u64, v: &Value) -> Result<()> {
             session,
             pending: None,
             summary,
+            prompt: None,
         },
     )
     .await

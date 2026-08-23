@@ -393,6 +393,18 @@ function renderSession(){
       const d=document.createElement('div'); d.className='msg'; d.innerHTML='<div class="thinking">working…</div>'; main.appendChild(d);
     }
   }
+  // live pending question (from agent_state — the transcript omits an open one)
+  if(view.mode==='chat'){
+    const qp = p && p.agent_state && p.agent_state.prompt;
+    if(qp){
+      const q=document.createElement('div'); q.className='msg';
+      const opts=(qp.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}">${esc(o)}</button>`).join('');
+      q.innerHTML=`<div class="qcard"><div class="qq">${esc(qp.question)}</div><div class="qopts">${opts}</div>`+
+        `<div class="qnote">${qp.multi?'multi-select — best in Terminal':'tap an option to answer'}</div></div>`;
+      q.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, qp.multi));
+      main.appendChild(q);
+    }
+  }
 
   const bar=document.createElement('div'); bar.className='reply';
   bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
