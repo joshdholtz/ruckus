@@ -18,7 +18,7 @@
     --shadow:none;
   }}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  html,body{margin:0;height:100%}
+  html,body{margin:0;height:100%;overflow-x:hidden}
   body{background:var(--bg);color:var(--text);
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     -webkit-font-smoothing:antialiased}
@@ -71,6 +71,12 @@
   .bubble{background:var(--card);border:1px solid var(--border);border-radius:12px;
     padding:11px 13px;white-space:pre-wrap;word-break:break-word}
   .msg.user .bubble{background:color-mix(in srgb,var(--accent) 9%,var(--card))}
+  .bubble code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;
+    background:color-mix(in srgb,var(--muted) 20%,transparent);padding:1px 5px;border-radius:5px}
+  .bubble pre.code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#0b0d12;
+    color:#cdd3de;padding:10px 11px;border-radius:8px;overflow-x:auto;white-space:pre;margin:7px 0}
+  .bubble a{color:var(--accent)}
+  .bubble b{font-weight:650}
   .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
     padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
   .tool .t{color:var(--muted);font-weight:700;margin-right:6px;text-transform:none}
@@ -80,11 +86,11 @@
   /* reply bar */
   .reply{position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--border);
     padding:10px 12px calc(env(safe-area-inset-bottom) + 10px);display:flex;gap:8px}
-  .reply input{flex:1;border:1px solid var(--border);background:var(--card);color:var(--text);
-    border-radius:12px;padding:12px 14px;font-size:15px;outline:none}
+  .reply input{flex:1;min-width:0;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:12px;padding:11px 13px;font-size:16px;outline:none}
   .reply input:focus{border-color:var(--accent)}
   .reply button{border:0;background:var(--accent);color:#fff;border-radius:12px;
-    padding:0 16px;font-weight:600;font-size:15px;cursor:pointer}
+    padding:0 15px;font-weight:600;font-size:15px;cursor:pointer;flex:none}
 
   /* composer */
   .add{margin-left:auto;border:1px solid var(--border);background:var(--card);color:var(--text);
@@ -105,7 +111,7 @@
     padding:8px 14px;font-size:14px;cursor:pointer}
   .chip.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent)}
   .sheet input{width:100%;border:1px solid var(--border);background:var(--bg);color:var(--text);
-    border-radius:10px;padding:12px 13px;font-size:15px;outline:none;margin-top:8px}
+    border-radius:10px;padding:12px 13px;font-size:16px;outline:none;margin-top:8px}
   .sheet input:focus{border-color:var(--accent)}
   .sheet .start{width:100%;margin-top:18px;border:0;background:var(--accent);color:#fff;
     border-radius:12px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}
@@ -161,7 +167,8 @@ function connect(){
     const m = JSON.parse(e.data);
     if(m.t==='snapshot'){ snap = m.snapshot; render(); }
     else if(m.t==='event'){ onEvent(m.msg); }
-    else if(m.t==='session'){ sessionMsgs[m.pane] = m.msgs; if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat') render(); }
+    else if(m.t==='session'){ const prev=sessionMsgs[m.pane]; sessionMsgs[m.pane]=m.msgs;
+      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length)) render(); }
     else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(view.name==='session'&&view.pane===m.pane&&view.mode==='terminal') paintTerm(); }
   };
 }
@@ -169,8 +176,13 @@ function onEvent(msg){
   if(!msg||!msg.type) return;
   if(msg.type==='state'){ snap = msg.snapshot; render(); }
   else if(msg.type==='agent_state'){
-    const p = snap.panes.find(p=>p.id===msg.pane); if(p){ p.agent_state=msg.state; p.activity=phaseActivity(msg.state.phase); }
-    if(view.name==='session'&&view.pane===msg.pane) ws.send(JSON.stringify({t:'session',pane:msg.pane}));
+    const p = snap.panes.find(p=>p.id===msg.pane); if(p){ p.agent_state=msg.state; p.activity=phaseActivity(msg.state.phase); p.agent=p.agent||msg.state.agent; }
+    if(view.name==='session'&&view.pane===msg.pane){
+      // A just-opened agent session may have defaulted to Terminal before it was
+      // flagged; flip it to Chat once (unless the user chose Terminal themselves).
+      if(view.mode==='terminal'&&!view.userToggled&&msg.state.session){ send({t:'detach',pane:msg.pane}); view.mode='chat'; }
+      if(view.mode==='chat') send({t:'session',pane:msg.pane});
+    }
     render();
   }
   else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; render(); }
@@ -240,7 +252,12 @@ function render(){
 const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
 function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'·'+p.git_branch:''; return cwd+br; }
 
-function defaultMode(p){ return (p&&(p.agent==='claude'||p.agent_state)) ? 'chat' : 'terminal'; }
+function defaultMode(p){
+  if(!p) return 'chat';
+  const nm=(paneName(p)||'').toLowerCase();
+  const agentish = p.agent || p.agent_state || /claude|codex|aider|goose|opencode|gemini|cursor|amp|cody/.test(nm);
+  return agentish ? 'chat' : 'terminal';
+}
 function openSession(pane){
   const p=snap.panes.find(x=>x.id===pane);
   view={name:'session',pane,mode:defaultMode(p)};
@@ -253,6 +270,7 @@ function attach(pane){ if(!(pane in termbufs)) termbufs[pane]=''; send({t:'attac
 function leaveSession(){ if(view.name==='session'&&view.mode==='terminal') send({t:'detach',pane:view.pane}); }
 function setMode(m){
   if(m===view.mode) return;
+  view.userToggled=true;
   if(view.mode==='terminal') send({t:'detach',pane:view.pane});
   view.mode=m;
   if(m==='terminal') attach(view.pane); else send({t:'session',pane:view.pane});
@@ -325,7 +343,7 @@ function renderMsg(m){
   const d=document.createElement('div');
   if(m.kind==='text'){
     d.className='msg '+(m.role==='user'?'user':'assistant');
-    d.innerHTML=`<div class="who">${m.role==='user'?'you':'assistant'}</div><div class="bubble">${esc(m.text)}</div>`;
+    d.innerHTML=`<div class="who">${m.role==='user'?'you':'assistant'}</div><div class="bubble">${md(m.text)}</div>`;
   } else if(m.kind==='tool_call'){
     d.className='msg';
     d.innerHTML=`<div class="tool"><span class="t">${esc(m.tool)}</span>${esc(m.input||'')}</div>`;
@@ -338,6 +356,18 @@ function renderMsg(m){
 function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
   const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }
 function esc(s){ return (s==null?'':''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+// Tiny, safe markdown: escape first, then apply formatting.
+function md(s){
+  s=esc(s);
+  s=s.replace(/```([\s\S]*?)```/g,(m,c)=>`<pre class="code">${c.replace(/^\n/,'')}</pre>`);
+  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  s=s.replace(/^\s*#{1,6}\s+(.*)$/gm,'<b>$1</b>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+  s=s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g,'$1<i>$2</i>');
+  s=s.replace(/^\s*[-*]\s+(.*)$/gm,'• $1');
+  s=s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
 
 // ---- composer: start a new session (tab), optionally in a new space ----
 let startTarget=0;
@@ -361,6 +391,9 @@ document.querySelectorAll('#cmdchips .chip').forEach(c=>c.onclick=()=>{
   $('#cmdin').value=c.dataset.cmd;
 });
 $('#startbtn').onclick=()=>{ send({t:'new_tab',space:startTarget,cmd:$('#cmdin').value.trim()}); closeSheet(); view={name:'timeline'}; };
+
+// Poll the open chat transcript so new messages appear without a refresh.
+setInterval(()=>{ if(ws&&ws.readyState===1&&view.name==='session'&&view.mode==='chat') send({t:'session',pane:view.pane}); }, 2000);
 
 connect();
 </script>
