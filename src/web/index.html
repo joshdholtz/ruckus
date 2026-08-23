@@ -32,7 +32,7 @@
   header .dot.live{background:var(--ok)}
   .back{border:0;background:none;color:var(--accent);font-size:15px;padding:6px 2px;cursor:pointer}
   .sub{color:var(--muted);font-size:13px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
-  main{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:12px 12px 0}
+  main{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0 12px 0}
   .empty{color:var(--muted);text-align:center;padding:48px 20px;font-size:14px}
 
   /* timeline cards */
@@ -136,7 +136,7 @@
 
   /* session mode row (chat/terminal toggle + actions) */
   .moderow{display:flex;align-items:center;gap:6px;margin-bottom:12px;
-    position:sticky;top:0;z-index:3;background:var(--bg);padding:6px 0}
+    position:sticky;top:0;z-index:3;background:var(--bg);padding:12px 0 8px}
   .tabbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
     border-radius:9px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
   .tabbtn.sel{color:var(--accent);border-color:var(--accent);
@@ -274,7 +274,7 @@ function render(){
   if(view.name==='session'){ renderSession(); return; }
   $('#back').style.display='none'; $('#add').style.display=''; $('#title').textContent='ruckus'; $('#sub').textContent='';
   const list = sessions().sort((a,b)=>rank(b.pane)-rank(a.pane));
-  const main=$('#main'); main.innerHTML=''; main.style.display='block'; main.style.overflowY='auto';
+  const main=$('#main'); main.innerHTML=''; main.style.display='block'; main.style.overflowY='auto'; main.style.paddingTop='12px';
   if(!list.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Run something in a ruckus tab.</div>'; return; }
   for(const s of list){
     const p=s.pane;
@@ -331,7 +331,7 @@ function renderSession(){
   $('#title').textContent = p?paneName(p):'session';
   const mdl=sessionModel[view.pane], eff=sessionEffort[view.pane];
   $('#sub').textContent = [mdl, eff, p&&loc(p)].filter(Boolean).join(' · ') || (p?stateLabel(p):'');
-  const main=$('#main'); main.innerHTML='';
+  const main=$('#main'); main.innerHTML=''; main.style.paddingTop='0';
 
   const row=document.createElement('div'); row.className='moderow';
   row.innerHTML=`<button class="tabbtn ${view.mode==='chat'?'sel':''}" data-m="chat">Chat</button>
