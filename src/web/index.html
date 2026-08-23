@@ -407,17 +407,20 @@ function renderSession(){
     }
   }
 
-  const bar=document.createElement('div'); bar.className='reply';
-  bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
-  main.appendChild(bar);
-  const inp=bar.querySelector('#rin');
-  const go=()=>{ const t=inp.value; if(!t)return;
-    if(view.mode==='chat') (pendingMsgs[view.pane]=pendingMsgs[view.pane]||[]).push({text:t,ts:Date.now()});
-    send({t:'input',pane:view.pane,text:t}); inp.value='';
-    if(view.mode==='chat'){ render(); const ni=$('#rin'); if(ni) ni.focus(); }
-  };
-  bar.querySelector('#rsend').onclick=go;
-  inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+  // Reply bar only in Chat — Terminal has its own (xterm) input.
+  if(view.mode==='chat'){
+    const bar=document.createElement('div'); bar.className='reply';
+    bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
+    main.appendChild(bar);
+    const inp=bar.querySelector('#rin');
+    const go=()=>{ const t=inp.value; if(!t)return;
+      (pendingMsgs[view.pane]=pendingMsgs[view.pane]||[]).push({text:t,ts:Date.now()});
+      send({t:'input',pane:view.pane,text:t}); inp.value='';
+      render(); const ni=$('#rin'); if(ni) ni.focus();
+    };
+    bar.querySelector('#rsend').onclick=go;
+    inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+  }
   if(view.mode==='terminal') createTerm(view.pane); else main.scrollTop=main.scrollHeight;
 }
 function createTerm(pane){
