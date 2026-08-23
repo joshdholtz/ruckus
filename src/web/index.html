@@ -440,7 +440,24 @@ function createTerm(pane){
     e.preventDefault();   // consume the gesture so the page doesn't pull-to-refresh
     const y=e.touches[0].clientY, lineH=Math.max(8, host.clientHeight/(t.rows||24));
     const n=Math.trunc((ty-y)/lineH);
-    if(Math.abs(n)>=1){ t.scrollLines(n); ty=y; }
+    if(Math.abs(n)>=1){
+      const mm=(t.modes&&t.modes.mouseTrackingMode)||'none';
+      const alt=t.buffer&&t.buffer.active&&t.buffer.active.type==='alternate';
+      const steps=Math.min(Math.abs(n),6);
+      if(mm!=='none'){
+        // App captures the mouse (e.g. Claude/Codex TUI): forward wheel events so
+        // the app scrolls its own view. swipe up → wheel down (newer); down → up.
+        const btn=n>0?65:64; let seq='';
+        for(let i=0;i<steps;i++) seq+=`\x1b[<${btn};2;2M`;
+        send({t:'input',pane,text:seq,enter:false});
+      } else if(alt){
+        // alt-screen without mouse: arrow keys as a fallback
+        send({t:'input',pane,text:(n>0?'\x1b[B':'\x1b[A').repeat(steps),enter:false});
+      } else {
+        t.scrollLines(n);   // normal buffer (shell): real scrollback
+      }
+      ty=y;
+    }
   },{passive:false,capture:true});
   host.addEventListener('touchend',()=>{ ty=null; },{passive:false,capture:true});
   if(termbufs[pane]) t.write(termbufs[pane]);
