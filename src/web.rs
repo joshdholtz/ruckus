@@ -43,7 +43,12 @@ pub async fn run(addr: &str) -> Result<()> {
 }
 
 async fn index() -> impl IntoResponse {
-    Html(include_str!("web/index.html"))
+    // Never cache the app shell, so a redeploy is picked up on the next load
+    // (the browser was serving a stale index.html).
+    (
+        [("cache-control", "no-store, must-revalidate")],
+        Html(include_str!("web/index.html")),
+    )
 }
 
 async fn manifest() -> impl IntoResponse {
