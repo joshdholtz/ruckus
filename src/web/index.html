@@ -19,7 +19,7 @@
     --shadow:none;
   }}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  html,body{margin:0;height:100%;overflow-x:hidden}
+  html,body{margin:0;height:100%;overflow-x:hidden;overscroll-behavior:none}
   body{background:var(--bg);color:var(--text);
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     -webkit-font-smoothing:antialiased}
@@ -436,10 +436,11 @@ function createTerm(pane){
   host.addEventListener('touchstart',e=>{ ty=e.touches[0].clientY; },{passive:true});
   host.addEventListener('touchmove',e=>{
     if(ty==null) return;
+    e.preventDefault();   // consume the gesture so the page doesn't pull-to-refresh
     const y=e.touches[0].clientY, lineH=Math.max(8, host.clientHeight/(t.rows||24));
     const n=Math.trunc((ty-y)/lineH);
     if(n){ t.scrollLines(n); ty=y; }
-  },{passive:true});
+  },{passive:false});
   host.addEventListener('touchend',()=>{ ty=null; },{passive:true});
   if(termbufs[pane]) t.write(termbufs[pane]);
   sendResize(pane);
