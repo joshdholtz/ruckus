@@ -12,6 +12,23 @@ notify-observe, and the TUI approval cards + keybinds). AA4 opencode/Cursor, AA5
 Codex app-server, AA6 scopes pending. Grounded in the current tree + a survey of
 Claude Code, Codex, opencode, and Cursor integration surfaces (2026).
 
+## Quickstart (no commands)
+
+Add one line to `~/.ruckus/config.toml` and just run your agent in a pane —
+Ruckus wires everything itself (installs the hooks, shows approvals):
+
+```toml
+[agents]
+enable = ["claude"]   # auto-installs Claude's hooks on daemon startup
+# gate = true          # (default) approve risky tools from the sidebar/phone
+```
+
+That's it. Run `claude` in a Ruckus pane; when it wants to run something risky,
+the NEEDS-YOU queue (and the mobile action bar) show it with approve/deny — the
+section auto-appears when an approval is pending, no other config needed. Nothing
+to install by hand; the `agent-setup`/`agent-hook` commands below are just the
+manual escape hatch.
+
 ## Implemented surface
 
 - `ruckus agent-hook <agent> [--gate]` — the universal adapter handler. Runs

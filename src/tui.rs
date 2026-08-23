@@ -4021,7 +4021,18 @@ impl App {
     }
 
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
-        let sections = self.cfg.ui.sidebar_sections.clone();
+        let mut sections = self.cfg.ui.sidebar_sections.clone();
+        // Auto-surface the NEEDS-YOU queue when an agent is blocked on an approval,
+        // even if the user hasn't added it to sidebar_sections — so approvals are
+        // never hidden behind config.
+        let approval_pending = self
+            .snap
+            .panes
+            .iter()
+            .any(|p| p.agent_state.as_ref().is_some_and(|s| s.pending.is_some()));
+        if approval_pending && !sections.iter().any(|s| s == "needs_you") {
+            sections.insert(0, "needs_you".to_string());
+        }
         let split = self.cfg.ui.sidebar_split;
         self.sidebar_rows.clear();
         self.sidebar_buttons.clear();

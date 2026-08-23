@@ -264,11 +264,27 @@ pub async fn setup(agent: String, gate: bool, write: Option<std::path::PathBuf>)
 }
 
 fn setup_claude(exe: &str, gate: bool, write: Option<std::path::PathBuf>) -> Result<()> {
-    // Observe on every relevant event; optionally gate risky tools for approval.
+    let hooks = claude_hooks(exe, gate);
+    let Some(path) = write else {
+        println!(
+            "# Add this to your Claude settings (~/.claude/settings.json or a\n\
+             # project .claude/settings.json). Re-run with --write <path> to merge:\n"
+        );
+        println!("{}", serde_json::to_string_pretty(&json!({ "hooks": hooks }))?);
+        return Ok(());
+    };
+    match merge_hooks_file(&path, &hooks)? {
+        true => println!("wrote ruckus agent hooks to {}", path.display()),
+        false => println!("ruckus agent hooks already up to date in {}", path.display()),
+    }
+    Ok(())
+}
+
+/// The Claude `hooks` object that wires each event to `ruckus agent-hook`.
+fn claude_hooks(exe: &str, gate: bool) -> Value {
     let observe = |args: &str| {
         json!([{ "hooks": [{ "type": "command", "command": format!("{exe} agent-hook {args}") }] }])
     };
-    let mut hooks = serde_json::Map::new();
     let pre = if gate {
         json!([
             { "matcher": "Bash|Write|Edit|MultiEdit",
@@ -280,31 +296,28 @@ fn setup_claude(exe: &str, gate: bool, write: Option<std::path::PathBuf>) -> Res
         json!([{ "matcher": "*",
                  "hooks": [{ "type": "command", "command": format!("{exe} agent-hook claude") }] }])
     };
+    let mut hooks = serde_json::Map::new();
     hooks.insert("PreToolUse".into(), pre);
     hooks.insert("PostToolUse".into(), observe("claude"));
     hooks.insert("Notification".into(), observe("claude"));
     hooks.insert("Stop".into(), observe("claude"));
     hooks.insert("SessionEnd".into(), observe("claude"));
-    let hooks = Value::Object(hooks);
+    Value::Object(hooks)
+}
 
-    let Some(path) = write else {
-        println!(
-            "# Add this to your Claude settings (~/.claude/settings.json or a\n\
-             # project .claude/settings.json). Re-run with --write <path> to merge:\n"
-        );
-        println!("{}", serde_json::to_string_pretty(&json!({ "hooks": hooks }))?);
-        return Ok(());
-    };
-
-    // Idempotent merge: preserve the user's file + any non-ruckus hooks; replace
-    // only our own entries (identified by "ruckus agent-hook" in the command).
-    let mut root: Value = std::fs::read_to_string(&path)
+/// Idempotently merge our hook groups into a JSON settings file: preserve the
+/// user's file + any non-ruckus hooks, replace only our own entries. Returns
+/// Ok(true) only if the file actually changed (so callers can run it every
+/// startup without churning the file).
+fn merge_hooks_file(path: &std::path::Path, hooks: &Value) -> Result<bool> {
+    let mut root: Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
     if !root.is_object() {
         root = json!({});
     }
+    let before = root.clone();
     let obj = root.as_object_mut().unwrap();
     let existing = obj
         .entry("hooks")
@@ -317,18 +330,43 @@ fn setup_claude(exe: &str, gate: bool, write: Option<std::path::PathBuf>) -> Res
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
-        // Drop our previous entries, keep the user's.
         list.retain(|g| !group_is_ours(g));
         if let Some(arr) = groups.as_array() {
             list.extend(arr.iter().cloned());
         }
     }
+    if root == before {
+        return Ok(false);
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
-    println!("wrote ruckus agent hooks to {}", path.display());
-    Ok(())
+    std::fs::write(path, serde_json::to_string_pretty(&root)?)?;
+    Ok(true)
+}
+
+/// Auto-install hooks for an agent on daemon startup (from `[agents] enable`).
+/// Idempotent + best-effort: logs and moves on if the settings file can't be
+/// written. Only Claude is auto-wired today (Codex needs a global TOML edit).
+pub fn auto_install(agent: &str, gate: bool) {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "ruckus".into());
+    match agent {
+        "claude" => {
+            let Some(home) = std::env::var_os("HOME") else {
+                return;
+            };
+            let path = std::path::Path::new(&home).join(".claude/settings.json");
+            match merge_hooks_file(&path, &claude_hooks(&exe, gate)) {
+                Ok(true) => tracing::info!("agents: installed ruckus claude hooks in {}", path.display()),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("agents: claude hook auto-install failed: {e:#}"),
+            }
+        }
+        other => tracing::warn!("agents: no auto-install for `{other}` (run `ruckus agent-setup {other}`)"),
+    }
 }
 
 /// Does a hook group contain a `ruckus agent-hook` command (i.e. one we own)?

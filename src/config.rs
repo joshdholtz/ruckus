@@ -799,6 +799,32 @@ pub struct RelaySpec {
     pub secret_env: String,
 }
 
+/// Per-agent adapter config (`[agents]`). List agents to auto-wire on startup so
+/// you never run `agent-setup` by hand: the daemon idempotently installs each
+/// agent's hooks and (with `gate`) offers sidebar/mobile approvals.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentsConfig {
+    /// Agents to auto-install hooks for, e.g. `["claude"]`.
+    #[serde(default)]
+    pub enable: Vec<String>,
+    /// Install the approve-from-sidebar gate for risky tools (default true).
+    #[serde(default = "default_true")]
+    pub gate: bool,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            enable: Vec::new(),
+            gate: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_relay_account() -> String {
     "ruckus".into()
 }
@@ -835,6 +861,8 @@ pub struct Config {
     pub remotes: Vec<RemoteSpec>,
     /// Relay transport (`[relay]`), if configured.
     pub relay: Option<RelaySpec>,
+    /// Per-agent adapter auto-wiring (`[agents]`).
+    pub agents: AgentsConfig,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -1297,6 +1325,9 @@ struct RawConfig {
     /// Relay transport config.
     #[serde(default)]
     relay: Option<RelaySpec>,
+    /// Per-agent adapter auto-wiring.
+    #[serde(default)]
+    agents: AgentsConfig,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -1637,6 +1668,7 @@ impl Config {
             plugins: raw.plugins,
             remotes: raw.remote,
             relay: raw.relay,
+            agents: raw.agents,
             theme,
             ui,
             glyphs,

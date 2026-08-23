@@ -962,6 +962,12 @@ pub async fn run() -> Result<()> {
     info!("ruckus daemon listening on {}", sock.display());
 
     let cfg = crate::config::Config::load();
+    // Auto-wire per-agent adapters (`[agents] enable`), so users never run
+    // `agent-setup` by hand. Idempotent: only rewrites the settings file if it
+    // actually changed.
+    for agent in &cfg.agents.enable {
+        crate::agent_hook::auto_install(agent, cfg.agents.gate);
+    }
     // The single State-owning actor + its job channel; `state` is the handle
     // everyone uses. There is no mutex — see the actor infra at the top of file.
     let (job_tx, job_rx) = unbounded_channel::<Job>();
