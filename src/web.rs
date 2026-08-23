@@ -90,9 +90,10 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
                     // Read + parse this pane's transcript into normalized messages.
                     Some("session") => {
                         let pane = v.get("pane").and_then(Value::as_u64).unwrap_or(0);
-                        let msgs = load_session(&client, pane).await;
+                        let (msgs, model) = load_session(&client, pane).await;
                         let _ = tx.send(Message::Text(
-                            json!({ "t": "session", "pane": pane, "msgs": msgs }).to_string())).await;
+                            json!({ "t": "session", "pane": pane, "msgs": msgs, "model": model })
+                                .to_string())).await;
                     }
                     // Approve / deny a pending agent request.
                     Some("resolve") => {
@@ -193,26 +194,36 @@ async fn ws_session(socket: WebSocket) -> Result<()> {
 
 /// Resolve a pane's live agent session id (from the daemon snapshot), locate its
 /// provider transcript, and parse it into normalized messages.
-async fn load_session(client: &crate::client::Client, pane: u64) -> Vec<Value> {
+async fn load_session(client: &crate::client::Client, pane: u64) -> (Vec<Value>, Option<String>) {
     let snap = match client.snapshot().await {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(_) => return (vec![], None),
     };
     let Some(p) = snap.panes.iter().find(|p| p.id == pane) else {
-        return vec![];
+        return (vec![], None);
     };
-    let agent = p.agent.clone().unwrap_or_default();
     let session = p
         .agent_state
         .as_ref()
         .and_then(|s| s.session.clone())
         .unwrap_or_default();
-    if agent == "claude" || session.is_empty() {
+    if !session.is_empty() {
         if let Some(path) = find_claude_transcript(&session) {
             return parse_claude_transcript(&path);
         }
     }
-    vec![]
+    (vec![], None)
+}
+
+/// Short friendly model name from a full id (claude-opus-4-8 → "opus").
+fn friendly_model(id: &str) -> String {
+    let l = id.to_lowercase();
+    for tag in ["opus", "sonnet", "haiku", "fable"] {
+        if l.contains(tag) {
+            return tag.to_string();
+        }
+    }
+    id.to_string()
 }
 
 /// Find `~/.claude/projects/<any>/<session>.jsonl` for a Claude session id.
@@ -234,11 +245,12 @@ fn find_claude_transcript(session: &str) -> Option<PathBuf> {
 /// Parse a Claude transcript JSONL into normalized chat messages. Each record's
 /// `message.content` is a string (user) or a list of blocks (assistant):
 /// text / thinking / tool_use / tool_result.
-fn parse_claude_transcript(path: &PathBuf) -> Vec<Value> {
+fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return vec![];
+        return (vec![], None);
     };
     let mut out = Vec::new();
+    let mut model: Option<String> = None;
     for line in text.lines() {
         let Ok(rec) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -248,6 +260,15 @@ fn parse_claude_transcript(path: &PathBuf) -> Vec<Value> {
             Some("assistant") => "assistant",
             _ => continue,
         };
+        if role == "assistant" {
+            if let Some(m) = rec
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(Value::as_str)
+            {
+                model = Some(friendly_model(m));
+            }
+        }
         let content = rec.get("message").and_then(|m| m.get("content"));
         match content {
             Some(Value::String(s)) => {
@@ -287,7 +308,7 @@ fn parse_claude_transcript(path: &PathBuf) -> Vec<Value> {
             _ => {}
         }
     }
-    out
+    (out, model)
 }
 
 /// A one-line-ish summary of a tool call for the chat card.

@@ -22,7 +22,7 @@
   body{background:var(--bg);color:var(--text);
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     -webkit-font-smoothing:antialiased}
-  .wrap{max-width:720px;margin:0 auto;min-height:100%;display:flex;flex-direction:column}
+  .wrap{max-width:720px;margin:0 auto;height:100dvh;display:flex;flex-direction:column}
   header{position:sticky;top:0;z-index:5;background:var(--bg);
     padding:calc(env(safe-area-inset-top) + 14px) 16px 12px;border-bottom:1px solid var(--border);
     display:flex;align-items:center;gap:12px}
@@ -31,7 +31,7 @@
   header .dot.live{background:var(--ok)}
   .back{border:0;background:none;color:var(--accent);font-size:15px;padding:6px 2px;cursor:pointer}
   .sub{color:var(--muted);font-size:13px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
-  main{flex:1;padding:12px 12px 24px}
+  main{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:12px 12px 0}
   .empty{color:var(--muted);text-align:center;padding:48px 20px;font-size:14px}
 
   /* timeline cards */
@@ -172,7 +172,7 @@
 </div>
 <script>
 const $ = s => document.querySelector(s);
-let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, termbufs = {};
+let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, sessionModel = {}, termbufs = {};
 
 function connect(){
   ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
@@ -182,8 +182,8 @@ function connect(){
     const m = JSON.parse(e.data);
     if(m.t==='snapshot'){ snap = m.snapshot; render(); }
     else if(m.t==='event'){ onEvent(m.msg); }
-    else if(m.t==='session'){ const prev=sessionMsgs[m.pane]; sessionMsgs[m.pane]=m.msgs;
-      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length)) render(); }
+    else if(m.t==='session'){ const prev=sessionMsgs[m.pane], pm=sessionModel[m.pane]; sessionMsgs[m.pane]=m.msgs; sessionModel[m.pane]=m.model;
+      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length||pm!==m.model)) render(); }
     else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(view.name==='session'&&view.pane===m.pane&&view.mode==='terminal') paintTerm(); }
   };
 }
@@ -296,7 +296,8 @@ function renderSession(){
   $('#back').style.display=''; $('#add').style.display='none';
   $('#back').onclick=()=>{ leaveSession(); view={name:'timeline'}; render(); };
   $('#title').textContent = p?paneName(p):'session';
-  $('#sub').textContent = p?(loc(p)||stateLabel(p)):'';
+  const mdl=sessionModel[view.pane];
+  $('#sub').textContent = [mdl, p&&loc(p)].filter(Boolean).join(' · ') || (p?stateLabel(p):'');
   const main=$('#main'); main.innerHTML='';
 
   const row=document.createElement('div'); row.className='moderow';
@@ -349,12 +350,14 @@ function renderSession(){
   const go=()=>{ const t=inp.value; if(!t)return; send({t:'input',pane:view.pane,text:t}); inp.value=''; };
   bar.querySelector('#rsend').onclick=go;
   inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
-  if(view.mode==='terminal') paintTerm(); else window.scrollTo(0,document.body.scrollHeight);
+  const mn=$('#main');
+  if(view.mode==='terminal') paintTerm(); else mn.scrollTop=mn.scrollHeight;
 }
 function paintTerm(){
   const el=$('#term'); if(!el) return;
   el.textContent = termText(termbufs[view.pane]||'').split('\n').slice(-500).join('\n');
   el.scrollTop = el.scrollHeight;
+  const mn=$('#main'); if(mn) mn.scrollTop=mn.scrollHeight;
 }
 function termText(raw){
   return raw
