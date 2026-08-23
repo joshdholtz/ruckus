@@ -83,6 +83,17 @@
   .sendtag::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--accent);
     animation:pulse 1s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+  .qcard{border:1px solid color-mix(in srgb,var(--accent) 40%,var(--border));border-radius:12px;
+    padding:12px;background:color-mix(in srgb,var(--accent) 6%,transparent)}
+  .qq{font-weight:600;margin-bottom:10px}
+  .qopts{display:flex;flex-direction:column;gap:8px}
+  .qopt{text-align:left;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:10px;padding:11px 13px;font-size:14px;cursor:pointer;width:100%}
+  .qopt:active{border-color:var(--accent)}
+  .qnote{font-size:12px;color:var(--muted);margin-top:9px}
+  .thinking{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:7px;padding:3px 2px}
+  .thinking::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s ease-in-out infinite}
   .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
     padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
     white-space:pre-wrap;word-break:break-word}
@@ -375,6 +386,13 @@ function renderSession(){
     d.innerHTML=`<div class="who">you</div><div class="bubble">${md(pm.text)}</div><div class="sendtag">sending…</div>`;
     main.appendChild(d);
   }
+  // live "working…" indicator so you can tell the agent is thinking
+  if(view.mode==='chat'){
+    const wp=snap.panes.find(x=>x.id===view.pane);
+    if(wp && (wp.activity==='working' || (wp.agent_state&&wp.agent_state.phase==='working'))){
+      const d=document.createElement('div'); d.className='msg'; d.innerHTML='<div class="thinking">working…</div>'; main.appendChild(d);
+    }
+  }
 
   const bar=document.createElement('div'); bar.className='reply';
   bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
@@ -419,8 +437,20 @@ function renderMsg(m){
   } else if(m.kind==='tool_result'){
     d.className='msg';
     d.innerHTML=`<div class="tool res ${m.is_error?'err':''}">${esc(m.text||'(done)')}</div>`;
+  } else if(m.kind==='question'){
+    d.className='msg';
+    const opts=(m.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}">${esc(o)}</button>`).join('');
+    d.innerHTML=`<div class="qcard"><div class="qq">${esc(m.question)}</div><div class="qopts">${opts}</div>`+
+      `<div class="qnote">${m.multi?'multi-select — best done in Terminal':'tap an option to answer'}</div></div>`;
+    d.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, m.multi));
   }
   return d;
+}
+function answerQuestion(i, multi){
+  if(multi){ setMode('terminal'); return; }
+  // Drive a top-anchored TUI picker: ↓ i times then Enter. Best-effort — if it
+  // misfires, Terminal mode answers directly.
+  send({t:'input', pane:view.pane, text:'\x1b[B'.repeat(i)+'\r', enter:false});
 }
 function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
   const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }

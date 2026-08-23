@@ -314,10 +314,36 @@ fn parse_claude_transcript(path: &PathBuf) -> (Vec<Value>, Option<String>, Optio
                         "tool_use" => {
                             let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
                             let input = b.get("input").cloned().unwrap_or(json!({}));
-                            out.push(json!({
-                                "role": "tool", "kind": "tool_call",
-                                "tool": name, "input": tool_summary(name, &input),
-                            }));
+                            if name == "AskUserQuestion" {
+                                // Emit each question structured, so the UI can render
+                                // tappable options.
+                                if let Some(qs) = input.get("questions").and_then(Value::as_array) {
+                                    for q in qs {
+                                        let opts: Vec<String> = q
+                                            .get("options")
+                                            .and_then(Value::as_array)
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|o| {
+                                                        o.get("label").and_then(Value::as_str).map(String::from)
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        out.push(json!({
+                                            "role": "assistant", "kind": "question",
+                                            "question": q.get("question").and_then(Value::as_str).unwrap_or(""),
+                                            "options": opts,
+                                            "multi": q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                                        }));
+                                    }
+                                }
+                            } else {
+                                out.push(json!({
+                                    "role": "tool", "kind": "tool_call",
+                                    "tool": name, "input": tool_summary(name, &input),
+                                }));
+                            }
                         }
                         "tool_result" => {
                             let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
