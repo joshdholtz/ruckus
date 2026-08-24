@@ -157,6 +157,21 @@ pub async fn connect_remote_env(
     Ok((client, ev, child))
 }
 
+/// Connect to a remote daemon through a relay broker (no SSH). Dials the relay,
+/// asks for `device`, and speaks the protocol over the spliced stream once the
+/// relay says `SessionReady`. Mirror of `connect_remote_env` for the relay
+/// transport — the daemon runs this and feeds the result into the same remote
+/// hub. See docs/RELAY.md.
+pub async fn connect_via_relay(
+    url: &str,
+    account: &str,
+    secret: &str,
+    device: &str,
+) -> Result<(Client, UnboundedReceiver<ServerMsg>)> {
+    let (read, write) = crate::relay::open_client(url, account, secret, device).await?;
+    Ok(connect_io(read, write))
+}
+
 /// The remote side of `connect_remote`: relay this box's daemon socket over
 /// stdin/stdout (invoked as `ruckus __proxy` over SSH). Starts the daemon first.
 pub async fn proxy() -> Result<()> {

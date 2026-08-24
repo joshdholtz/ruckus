@@ -135,6 +135,37 @@ pub enum Request {
     DisconnectRemote {
         origin: u16,
     },
+    /// Relay remote mirror: ask THIS daemon to attach a remote `device` through a
+    /// relay broker (no SSH, works behind NAT). The client supplies the relay
+    /// coordinates from its own `[relay]` config. Deduped by device. Replies
+    /// `Done`. See docs/RELAY.md.
+    ConnectRelay {
+        device: String,
+        url: String,
+        account: String,
+        secret: String,
+    },
+    /// Per-agent adapter push: report a pane's exact structured agent state
+    /// (generalizes `ReportActivity`). Freezes the heuristic for the pane and
+    /// broadcasts `AgentState`. See docs/AGENT_ADAPTERS.md.
+    ReportAgentState {
+        pane: u64,
+        state: AgentState,
+    },
+    /// Block until the user resolves the approval `request_id` on `pane`. An
+    /// in-pane agent hook calls this and parks; the reply is a `Decided`. Falls
+    /// back to `Escalate` on timeout so the agent's own prompt still works.
+    AwaitDecision {
+        pane: u64,
+        request_id: String,
+    },
+    /// Resolve a pending approval (from the sidebar / any client). Fulfils the
+    /// matching `AwaitDecision`. Replies `Done`.
+    ResolveDecision {
+        pane: u64,
+        request_id: String,
+        decision: Decision,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +216,16 @@ pub enum ServerMsg {
     },
     /// Pushed to every client when config should be reloaded from disk.
     ConfigChanged,
+    /// Structured agent state for a pane changed (per-agent adapter). Broadcast
+    /// so a per-agent UI updates without diffing full snapshots.
+    AgentState {
+        pane: u64,
+        state: AgentState,
+    },
+    /// Reply to `AwaitDecision`: the user's resolution (or `Escalate` on timeout).
+    Decided {
+        decision: Decision,
+    },
 }
 
 /// Attention state of a pane, detected by the daemon.
@@ -211,6 +252,100 @@ impl Activity {
             Activity::Idle => 0,
         }
     }
+}
+
+/// Precise, agent-reported lifecycle phase — the structured truth an adapter
+/// pushes in (via `ReportAgentState`), replacing the heuristic guess. See
+/// docs/AGENT_ADAPTERS.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    /// A turn is in progress.
+    Working,
+    /// Blocked waiting for you to approve a tool/command (see `Approval`).
+    AwaitingApproval,
+    /// Turn ended; idle waiting for your next input.
+    AwaitingInput,
+    /// Finished.
+    Done,
+    /// Errored.
+    Error,
+}
+
+impl AgentPhase {
+    /// Map onto the heuristic 4-state model so existing dots/queue keep working.
+    pub fn activity(self) -> Activity {
+        match self {
+            AgentPhase::Working => Activity::Working,
+            AgentPhase::AwaitingApproval | AgentPhase::AwaitingInput => Activity::Waiting,
+            AgentPhase::Done | AgentPhase::Error => Activity::Done,
+        }
+    }
+}
+
+/// What kind of thing an agent is asking you to approve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    Command,
+    FileChange,
+    Tool,
+}
+
+/// A pending approval an agent is blocked on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Approval {
+    /// Correlates the eventual `ResolveDecision`.
+    pub request_id: String,
+    pub kind: ApprovalKind,
+    /// One-line label for the NEEDS-YOU queue, e.g. `Bash(rm -rf /tmp/*)`.
+    pub title: String,
+    /// Full command / diff summary / tool args.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Your answer to a pending approval. Maps to Claude allow/deny/escalate and
+/// Codex accept/decline/cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Allow,
+    Deny,
+    /// Fall back to the agent's own in-pane prompt (default on timeout).
+    Escalate,
+}
+
+/// A pending interactive question (e.g. Claude's AskUserQuestion). Surfaced live
+/// because the transcript omits an open question until it's answered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrompt {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub multi: bool,
+}
+
+/// Structured agent state for a pane — carried alongside the heuristic `Activity`
+/// so a per-agent UI can show exactly what's happening and what's blocked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentState {
+    /// Agent name, e.g. "claude" | "codex".
+    pub agent: String,
+    pub phase: AgentPhase,
+    /// The agent's own session/thread id (for dedup/telemetry).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// `Some` iff `phase == AwaitingApproval`.
+    #[serde(default)]
+    pub pending: Option<Approval>,
+    /// Last assistant line / "what it's doing".
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// A pending interactive question the user must answer.
+    #[serde(default)]
+    pub prompt: Option<AgentPrompt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +576,10 @@ pub struct PaneInfo {
     /// snapshot time for the compact "folder·branch" location display.
     #[serde(default)]
     pub git_branch: String,
+    /// Structured agent state reported by a per-agent adapter (exact phase +
+    /// pending approval). `None` when no adapter is reporting for this pane.
+    #[serde(default)]
+    pub agent_state: Option<AgentState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

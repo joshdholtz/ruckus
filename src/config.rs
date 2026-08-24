@@ -41,6 +41,15 @@ pub enum Action {
     DisconnectRemote,
     /// Open the theme picker (built-ins + ~/.ruckus/themes) with live preview.
     Theme,
+    /// Toggle mouse capture at runtime. Off hands the mouse back to your
+    /// terminal for native drag-select and cmd-click-to-open (which opens links
+    /// on your *local* machine when you're SSH'd in). On restores ruckus's own
+    /// click/select handling.
+    ToggleMouse,
+    /// Approve the focused pane's pending agent approval (per-agent adapter).
+    ApproveAgent,
+    /// Deny the focused pane's pending agent approval.
+    DenyAgent,
 }
 
 pub const ACTIONS: &[(Action, &str, &[&str])] = &[
@@ -70,6 +79,9 @@ pub const ACTIONS: &[(Action, &str, &[&str])] = &[
     (Action::ConnectRemote, "connect_remote", &[]),
     (Action::DisconnectRemote, "disconnect_remote", &[]),
     (Action::Theme, "theme", &[]),
+    (Action::ToggleMouse, "toggle_mouse", &["alt-k"]),
+    (Action::ApproveAgent, "approve_agent", &["alt-y"]),
+    (Action::DenyAgent, "deny_agent", &["alt-r"]),
 ];
 
 /// macOS terminals without "Option as Meta" type a special character instead of
@@ -452,6 +464,18 @@ pub enum ToastPos {
     BottomRight,
 }
 
+/// How a pane's PTY is sized when several clients view it at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachSize {
+    /// Size to the largest viewer — a small client (a phone, a `tail`) can't
+    /// shrink a big TUI. The default.
+    Largest,
+    /// Size to the smallest viewer (tmux-style): the pane's columns shrink to
+    /// the narrowest connected client, so a phone gets a readable, wrapped view
+    /// and every client shares it.
+    Smallest,
+}
+
 /// How a "working" pane is indicated in the dots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingStyle {
@@ -494,6 +518,8 @@ pub struct UiConfig {
     pub sidebar_pos: SidebarPos,
     pub sidebar_start_visible: bool,
     pub sidebar_width: u16,
+    /// Sidebar sections, top-to-bottom. Default ["spaces"]; add "needs_you"
+    /// for a pinned attention list of panes waiting on you.
     pub sidebar_sections: Vec<String>,
     /// 0 = sections stacked top-to-bottom. >0 splits the sidebar: the last
     /// section is pinned to the bottom `sidebar_split` fraction of the height,
@@ -505,8 +531,11 @@ pub struct UiConfig {
     pub sidebar_marker: bool,
     /// Show 1-based jump numbers (alt+1..9) on tabs — in the strip and sidebar.
     pub tab_numbers: bool,
-    /// List each space's tabs under it in the sidebar (false = spaces only).
+    /// List each space's tabs under it in the sidebar (default false, since the
+    /// tab strip already shows them). true = tabs nested under every space.
     pub sidebar_tabs: bool,
+    /// How a shared pane's PTY is sized across clients: largest | smallest.
+    pub attach_size: AttachSize,
     /// How a working pane is shown: spinner | pulse | dot.
     pub working_style: WorkingStyle,
     /// Milliseconds of output silence before a pane drops working -> idle/waiting.
@@ -570,6 +599,8 @@ pub struct UiConfig {
     pub mac_option_fallback: bool,
     /// What click fires a link handler: ctrl | shift | plain.
     pub link_click: LinkClick,
+    /// How matched links are drawn: none | underline | accent | both.
+    pub link_style: LinkStyle,
     pub space_row: String,
     pub tab_row: String,
     pub queue_row: String,
@@ -586,12 +617,13 @@ impl Default for UiConfig {
             sidebar_pos: SidebarPos::Left,
             sidebar_start_visible: true,
             sidebar_width: 26,
-            sidebar_sections: vec!["needs_you".to_string(), "spaces".to_string()],
+            sidebar_sections: vec!["spaces".to_string()],
             sidebar_split: 0.0,
             sidebar_row_gap: 1,
             sidebar_marker: true,
             tab_numbers: true,
-            sidebar_tabs: true,
+            sidebar_tabs: false,
+            attach_size: AttachSize::Largest,
             working_style: WorkingStyle::Spinner,
             activity_quiet_ms: 900,
             detect_osc133: false,
@@ -640,6 +672,7 @@ impl Default for UiConfig {
             mouse_select: true,
             mac_option_fallback: true,
             link_click: LinkClick::Plain,
+            link_style: LinkStyle::Underline,
             space_row: "{icon} {name}".to_string(),
             tab_row: "{icon} {title}".to_string(),
             queue_row: "{icon} {title}".to_string(),
@@ -719,6 +752,28 @@ pub enum LinkClick {
     Plain,
 }
 
+/// How matched links (regex rules + OSC 8 hyperlinks) are drawn in a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStyle {
+    /// No decoration — a link looks like plain text (still clickable).
+    None,
+    /// Underline the link text.
+    Underline,
+    /// Tint the link text with the theme accent color.
+    Accent,
+    /// Underline *and* accent-tint — the classic "this is a link" look.
+    Both,
+}
+
+impl LinkStyle {
+    pub fn underline(self) -> bool {
+        matches!(self, LinkStyle::Underline | LinkStyle::Both)
+    }
+    pub fn accent(self) -> bool {
+        matches!(self, LinkStyle::Accent | LinkStyle::Both)
+    }
+}
+
 /// A remote daemon to mirror into the sidebar (config `[[remote]]`), reached via
 /// `ssh [args] <host> ruckus __proxy`.
 #[derive(Debug, Clone, Deserialize)]
@@ -727,6 +782,65 @@ pub struct RemoteSpec {
     /// Extra ssh options (e.g. `["-p", "2222"]`).
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+/// Relay transport config (`[relay]`). Lets this daemon dial out to a broker and
+/// register as a device, and lets clients attach to remote devices through it
+/// (no SSH, works behind NAT). The secret is read from an env var, never the
+/// file. See docs/RELAY.md.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelaySpec {
+    /// Relay address, `host:port` (e.g. a tailnet host `mini-relay:9777`).
+    pub url: String,
+    /// Account name presented to the relay.
+    #[serde(default = "default_relay_account")]
+    pub account: String,
+    /// This daemon's advertised device name. Omit on a client-only machine.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Env var holding the shared secret.
+    #[serde(default = "default_relay_secret_env")]
+    pub secret_env: String,
+}
+
+/// Per-agent adapter config (`[agents]`). List agents to auto-wire on startup so
+/// you never run `agent-setup` by hand: the daemon idempotently installs each
+/// agent's hooks and (with `gate`) offers sidebar/mobile approvals.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentsConfig {
+    /// Agents to auto-install hooks for, e.g. `["claude"]`.
+    #[serde(default)]
+    pub enable: Vec<String>,
+    /// Install the approve-from-sidebar gate for risky tools (default true).
+    #[serde(default = "default_true")]
+    pub gate: bool,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            enable: Vec::new(),
+            gate: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_relay_account() -> String {
+    "ruckus".into()
+}
+fn default_relay_secret_env() -> String {
+    "RUCKUS_RELAY_SECRET".into()
+}
+
+impl RelaySpec {
+    /// Resolve the shared secret from `secret_env`.
+    pub fn secret(&self) -> Option<String> {
+        std::env::var(&self.secret_env).ok().filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -741,11 +855,18 @@ pub struct Config {
     pub commands: Vec<CommandBind>,
     /// Link handlers: pattern → command. Defaults to opening URLs.
     pub links: Vec<LinkRule>,
+    /// Activity-transition hooks (config + plugin `[[hook]]`): on a pane entering
+    /// a state, the daemon runs a command. The reactive/alerting layer.
+    pub hooks: Vec<Hook>,
     /// Declared plugin refs (`owner/repo[/subpath]`) — installed on startup so a
     /// copied config.toml reproduces your setup on a new machine.
     pub plugins: Vec<String>,
     /// Remote daemons to mirror into the sidebar over SSH.
     pub remotes: Vec<RemoteSpec>,
+    /// Relay transport (`[relay]`), if configured.
+    pub relay: Option<RelaySpec>,
+    /// Per-agent adapter auto-wiring (`[agents]`).
+    pub agents: AgentsConfig,
     pub theme: Theme,
     pub ui: UiConfig,
     pub glyphs: Glyphs,
@@ -814,6 +935,7 @@ struct RawUi {
     sidebar_marker: Option<bool>,
     tab_numbers: Option<bool>,
     sidebar_tabs: Option<bool>,
+    attach_size: Option<String>,
     working_style: Option<String>,
     activity_quiet_ms: Option<u64>,
     detect_osc133: Option<bool>,
@@ -844,6 +966,7 @@ struct RawUi {
     mouse_select: Option<bool>,
     mac_option_fallback: Option<bool>,
     link_click: Option<String>,
+    link_style: Option<String>,
     space_row: Option<String>,
     remote_label: Option<String>,
     tab_row: Option<String>,
@@ -967,8 +1090,34 @@ fn lower_links(raw: &[RawLink]) -> Vec<LinkRule> {
         .collect()
 }
 
-/// A plugin manifest (`ruckus-plugin.toml`). Reuses the `[[bind]]` / `[[link]]`
-/// shapes so a plugin adds command shortcuts and link handlers.
+/// A pane activity-transition hook: when a pane enters `on`, the daemon runs
+/// `run` (detached) with RUCKUS_PANE / RUCKUS_PANE_TITLE / RUCKUS_ACTIVITY set.
+/// The reactive layer — wire a sound, a push, a nudge to another agent.
+#[derive(Debug, Clone)]
+pub struct Hook {
+    /// "waiting" | "working" | "done" | "idle"
+    pub on: String,
+    pub run: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawHook {
+    on: String,
+    run: String,
+}
+
+fn lower_hooks(raw: &[RawHook]) -> Vec<Hook> {
+    raw.iter()
+        .filter(|h| !h.on.trim().is_empty() && !h.run.trim().is_empty())
+        .map(|h| Hook {
+            on: h.on.trim().to_lowercase(),
+            run: h.run.clone(),
+        })
+        .collect()
+}
+
+/// A plugin manifest (`ruckus-plugin.toml`). Reuses the `[[bind]]` / `[[link]]` /
+/// `[[hook]]` shapes so a plugin adds shortcuts, link handlers, and reactions.
 #[derive(Debug, Default, Deserialize)]
 struct RawManifest {
     plugin: Option<RawPluginMeta>,
@@ -978,6 +1127,8 @@ struct RawManifest {
     link: Vec<RawLink>,
     #[serde(default)]
     status: Vec<RawStatus>,
+    #[serde(default)]
+    hook: Vec<RawHook>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1167,12 +1318,21 @@ struct RawConfig {
     /// Link handlers: pattern → command.
     #[serde(default)]
     link: Vec<RawLink>,
+    /// Activity-transition hooks: on = state, run = command.
+    #[serde(default)]
+    hook: Vec<RawHook>,
     /// Declared plugin refs installed on startup.
     #[serde(default)]
     plugins: Vec<String>,
     /// Remote daemons to mirror over SSH.
     #[serde(default)]
     remote: Vec<RemoteSpec>,
+    /// Relay transport config.
+    #[serde(default)]
+    relay: Option<RelaySpec>,
+    /// Per-agent adapter auto-wiring.
+    #[serde(default)]
+    agents: AgentsConfig,
     /// tmux prefix key, e.g. "ctrl-b". "" or "off" disables it.
     prefix: Option<String>,
     #[serde(default)]
@@ -1242,6 +1402,7 @@ impl Config {
                 }
                 self.commands.extend(binds);
                 self.links.extend(lower_links(&m.link));
+                self.hooks.extend(lower_hooks(&m.hook));
                 // Plugin status segments. Each is a named token `#{<plugin>}` you
                 // place anywhere in status_left/right — the template stays the
                 // single source of truth for layout. If you haven't placed the
@@ -1314,8 +1475,9 @@ impl Config {
             None if keymap == Keymap::Alt => None,
             None => parse_binding("ctrl-b").ok(),
         };
-        // Command shortcuts + link handlers (shared with plugin manifests).
+        // Command shortcuts + link handlers + hooks (shared with plugin manifests).
         let commands = lower_binds(&raw.bind);
+        let hooks = lower_hooks(&raw.hook);
         let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
@@ -1381,6 +1543,10 @@ impl Config {
             sidebar_marker: raw.ui.sidebar_marker.unwrap_or(d.sidebar_marker),
             tab_numbers: raw.ui.tab_numbers.unwrap_or(d.tab_numbers),
             sidebar_tabs: raw.ui.sidebar_tabs.unwrap_or(d.sidebar_tabs),
+            attach_size: match raw.ui.attach_size.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("smallest") => AttachSize::Smallest,
+                _ => AttachSize::Largest,
+            },
             working_style: match raw
                 .ui
                 .working_style
@@ -1464,6 +1630,12 @@ impl Config {
                 Some("shift") => LinkClick::Shift,
                 _ => LinkClick::Plain,
             },
+            link_style: match raw.ui.link_style.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("none") | Some("off") => LinkStyle::None,
+                Some("accent") | Some("color") => LinkStyle::Accent,
+                Some("both") => LinkStyle::Both,
+                _ => LinkStyle::Underline,
+            },
             space_row: raw.ui.space_row.unwrap_or(d.space_row),
             remote_label: raw.ui.remote_label.unwrap_or(d.remote_label),
             tab_row: raw.ui.tab_row.unwrap_or(d.tab_row),
@@ -1498,8 +1670,11 @@ impl Config {
             prefix_keys,
             commands,
             links,
+            hooks,
             plugins: raw.plugins,
             remotes: raw.remote,
+            relay: raw.relay,
+            agents: raw.agents,
             theme,
             ui,
             glyphs,
@@ -1622,6 +1797,19 @@ last_space = "alt-l"      # jump back to the previously-active space
 # run = "htop"
 # where = "tab"
 
+# Hooks: run a command when a pane enters an activity state (waiting | working |
+# done | idle). Runs detached via `sh -c`, with RUCKUS_PANE, RUCKUS_PANE_TITLE,
+# RUCKUS_ACTIVITY (+ RUCKUS_SOCK / RUCKUS_DIR) in the environment. The reactive
+# layer — wire a sound, a push notification, or a nudge to another agent.
+# Plugins can ship the same `[[hook]]` blocks in their ruckus-plugin.toml.
+# [[hook]]
+# on = "waiting"                 # a pane (e.g. an agent) now needs you
+# run = "afplay /System/Library/Sounds/Glass.aiff"
+#
+# [[hook]]
+# on = "waiting"
+# run = 'terminal-notifier -message "$RUCKUS_PANE_TITLE needs you"'
+
 # Link handlers: text matching `pattern` (Rust regex) becomes clickable and
 # runs `run` — ${url}/${match} are replaced with the matched text as ONE
 # argument (never shell-interpreted). Defaults to opening URLs if none set.
@@ -1639,9 +1827,10 @@ last_space = "alt-l"      # jump back to the previously-active space
 
 [ui]
 link_click = "plain"         # plain | ctrl | shift — how a click fires a link
+link_style = "underline"     # none | underline | accent | both — how links are drawn
 sidebar = "left"            # left | right | off (off = hidden until toggled)
 sidebar_width = 26
-sidebar_sections = ["needs_you", "spaces"]  # order them, or drop one
+sidebar_sections = ["spaces"]  # add "needs_you" for a pinned "waiting on you" list at the top
 gutter = 1                  # cells between panes: 0 = dense, 2 = airy
 pane_padding = 0            # cells of breathing room inside each pane
 pane_titles = true          # false = pure grid, no per-pane title bars
@@ -1659,7 +1848,9 @@ spinner_ms = 120            # working-spinner speed
 toast = { position = "bottom-right", seconds = 4 }  # also: top-left/right, bottom-left
 header = "top"              # top | bottom | off
 footer = "bottom"           # bottom | top | off
-tab_strip = true            # false hides the tab row (tabs still in the sidebar)
+tab_strip = true            # false hides the top tab row
+sidebar_tabs = false        # true nests each space's tabs under it in the sidebar (the strip already shows them)
+attach_size = "largest"     # largest = a small viewer (phone/tail) can't shrink a big TUI; smallest = columns shrink to the narrowest client (tmux-style, readable on a phone)
 mouse = true                # false leaves the mouse to your terminal (select/copy)
 mac_option_fallback = true  # treat Option-typed characters (œ, ß, …) as alt bindings
 
@@ -1851,6 +2042,32 @@ run = "open https://linear.app/issue/${match}"
         let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
         assert_eq!(m.as_str(), "FIS-42");
         assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
+    }
+
+    #[test]
+    fn hooks_parse_and_normalize() {
+        let cfg = Config::from_toml_str("");
+        assert!(cfg.hooks.is_empty());
+        let cfg = Config::from_toml_str(
+            r#"
+[[hook]]
+on = "Waiting"
+run = "afplay glass.aiff"
+
+[[hook]]
+on = "done"
+run = "echo done"
+
+[[hook]]
+on = ""
+run = "ignored — no trigger"
+"#,
+        );
+        // Blank-trigger hook dropped; `on` lowercased.
+        assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.hooks[0].on, "waiting");
+        assert_eq!(cfg.hooks[0].run, "afplay glass.aiff");
+        assert_eq!(cfg.hooks[1].on, "done");
     }
 
     #[test]

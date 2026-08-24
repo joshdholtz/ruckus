@@ -1,11 +1,14 @@
+mod agent_hook;
 mod client;
 mod config;
 mod daemon;
 mod layout;
 mod protocol;
+mod relay;
 mod remote;
 mod render;
 mod tui;
+mod web;
 
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -33,6 +36,76 @@ enum Cmd {
     /// Internal: relay this box's daemon socket over stdio (used over SSH)
     #[command(name = "__proxy", hide = true)]
     Proxy,
+    /// Run a relay broker: bridges devices and clients that both dial out to it
+    /// (run one on an always-reachable box, e.g. a tailnet host). Secret comes
+    /// from `$RUCKUS_RELAY_SECRET`.
+    Relay {
+        /// Address to listen on (e.g. `0.0.0.0:9777`)
+        #[arg(long, default_value = "0.0.0.0:9777")]
+        listen: String,
+        /// Account name devices/clients must present
+        #[arg(long, default_value = "ruckus")]
+        account: String,
+    },
+    /// Serve the mobile-friendly web console (reach it over Tailscale or the
+    /// relay). A parallel front-end over the same daemon; the terminal is
+    /// untouched.
+    Web {
+        /// Address to listen on
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+    },
+    /// Attach a remote device through the configured relay (no SSH). Reads
+    /// `[relay]` from your config for the broker url/account/secret.
+    RelayAttach {
+        /// Device name registered on the relay
+        device: String,
+    },
+    /// Internal: per-agent hook callback. Reads the agent's hook JSON on stdin
+    /// and reports exact agent state into ruckus; `--gate` blocks for a sidebar
+    /// approval. Installed into the agent's own hook config.
+    #[command(name = "agent-hook", hide = true)]
+    AgentHook {
+        /// Agent name: claude | codex | …
+        agent: String,
+        /// Block on tool-use and answer allow/deny from the sidebar.
+        #[arg(long)]
+        gate: bool,
+    },
+    /// Print or install the hook config that wires an agent (claude/codex) to
+    /// ruckus so it reports exact state (and, with --gate, sidebar approvals).
+    AgentSetup {
+        /// Agent name: claude | codex
+        agent: String,
+        /// Also install a blocking approve-from-sidebar hook for risky tools.
+        #[arg(long)]
+        gate: bool,
+        /// Merge into this settings file instead of printing (e.g.
+        /// ~/.claude/settings.json or .claude/settings.json).
+        #[arg(long)]
+        write: Option<std::path::PathBuf>,
+    },
+    /// Run a read-only "briefing" agent for a space: it gathers status from your
+    /// connected sources (MGM/Linear/Sentry/Gmail/Grafana via MCP) and writes the
+    /// space's dashboard. It never sends or ships anything. See docs/AUTOPILOT.md.
+    Brief {
+        /// Space name (substring) or id
+        space: String,
+        /// Re-run on an interval headlessly (e.g. 30m, 1h). Omit for a one-shot
+        /// watchable session.
+        #[arg(long)]
+        every: Option<String>,
+    },
+    /// Resolve a pending agent approval (what the sidebar approve/deny does).
+    Resolve {
+        /// Pane id the approval is on
+        pane: u64,
+        /// Approval request id (from the pane's agent_state.pending)
+        request_id: String,
+        /// allow | deny | escalate
+        #[arg(value_parser = ["allow", "deny", "escalate"])]
+        decision: String,
+    },
     /// List spaces, tabs, and panes
     Ls,
     /// Create a new tab running CMD (defaults to your shell) and open the TUI on it
@@ -191,6 +264,37 @@ async fn main() -> Result<()> {
         None => tui::run(None).await,
         Some(Cmd::Daemon) => daemon::run().await,
         Some(Cmd::Proxy) => client::proxy().await,
+        Some(Cmd::Relay { listen, account }) => {
+            let secret = std::env::var("RUCKUS_RELAY_SECRET").map_err(|_| {
+                anyhow::anyhow!("set RUCKUS_RELAY_SECRET (the shared relay secret)")
+            })?;
+            relay::run_broker(&listen, account, secret).await
+        }
+        Some(Cmd::Web { listen }) => web::run(&listen).await,
+        Some(Cmd::RelayAttach { device }) => relay_attach(device).await,
+        Some(Cmd::AgentHook { agent, gate }) => agent_hook::run(agent, gate).await,
+        Some(Cmd::AgentSetup { agent, gate, write }) => agent_hook::setup(agent, gate, write).await,
+        Some(Cmd::Brief { space, every }) => brief(space, every).await,
+        Some(Cmd::Resolve {
+            pane,
+            request_id,
+            decision,
+        }) => {
+            let decision = match decision.as_str() {
+                "allow" => Decision::Allow,
+                "deny" => Decision::Deny,
+                _ => Decision::Escalate,
+            };
+            simple_req(
+                Request::ResolveDecision {
+                    pane,
+                    request_id,
+                    decision,
+                },
+                "resolved",
+            )
+            .await
+        }
         Some(Cmd::Ls) => ls().await,
         Some(Cmd::New { name, detach, cmd }) => new_tab(name, detach, cmd).await,
         Some(Cmd::NewSpace { name }) => new_space(name).await,
@@ -422,6 +526,199 @@ async fn reload() -> Result<()> {
     client.request(Request::Reload).await?;
     println!("config reloaded");
     Ok(())
+}
+
+/// Attach a remote device through the configured relay: reads `[relay]` from
+/// config for the broker coordinates and asks the local daemon to mirror it in.
+async fn relay_attach(device: String) -> Result<()> {
+    let relay = config::Config::load()
+        .relay
+        .ok_or_else(|| anyhow::anyhow!("no [relay] section in your config.toml"))?;
+    let secret = relay
+        .secret()
+        .ok_or_else(|| anyhow::anyhow!("relay secret env `{}` is unset", relay.secret_env))?;
+    simple_req(
+        Request::ConnectRelay {
+            device: device.clone(),
+            url: relay.url,
+            account: relay.account,
+            secret,
+        },
+        &format!("attaching `{device}` via relay"),
+    )
+    .await
+}
+
+/// Slug a space name to its dashboard filename (must match the web client).
+fn dash_slug(name: &str) -> String {
+    let mut s = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    s.trim_matches('-').to_string()
+}
+
+fn parse_dur(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    let i = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let n: u64 = s[..i].parse().map_err(|_| anyhow::anyhow!("bad duration '{s}'"))?;
+    let secs = match &s[i..] {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        u => anyhow::bail!("bad duration unit '{u}' (use s/m/h)"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Read-only capability for headless briefings: the data connectors + file
+/// read/write only. No Bash → no shell egress, so it can prepare but never ship.
+const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,mcp__claude_ai_Cooked_Books,mcp__fastmail,mcp__sentry,mcp__grafana,mcp__mgm,mcp__revenuecat,mcp__stripe,Read,Write,Glob,Grep";
+
+fn brief_prompt(space: &str, dash_path: &str) -> String {
+    format!(
+        r#"You are the ops briefing agent for the "{space}" space in ruckus. Your job is strictly READ-ONLY: gather current status and write ONE dashboard file. Do NOT send email, modify data, push code, merge, deploy, or take any action with an external effect. Only read, and write the single dashboard file below.
+
+1. Gather what you can from the available MCP connectors/tools; skip any that aren't connected, don't block:
+   - MGM (Mostly Good Metrics): headline metrics, funnels, retention, and per-user signals — who did their FIRST event recently, who's active/engaged, and who's gone quiet / dropped off (with name/email when available).
+   - Billing/subscription (Cooked Books, RevenueCat, or Stripe if connected): who is on a paid plan vs. free — used to spot convertible users. If none is connected, infer "could convert" from high engagement and note the assumption.
+   - Linear: open/assigned issues relevant to this project.
+   - Sentry: recent or spiking errors (if connected).
+   - Email (Fastmail or Gmail — whichever MCP is connected): triage the inbox — which need a reply vs. safe to archive.
+   - Grafana: current alerts/anomalies (only if you have API access).
+
+2. Write an HTML dashboard to EXACTLY this path, overwriting it:
+   {dash_path}
+
+   Start with: <!doctype html><html><head><meta charset="utf-8">
+   <meta name="viewport" content="width=device-width,initial-scale=1">
+   <link rel="stylesheet" href="/vendor/dash.css"></head><body> ... </body></html>
+
+   Use these component classes: .tile (with .n number, .l label, .d up|down delta);
+   .card (.title, .sub); .row (with .grow containing .t and .m); .pill (.ok|.warn|.err|.info);
+   .dot (.ok|.warn|.err|.info); table/th/td; pre.code; .btn (.primary|.ok|.danger);
+   .grid.two; h1/h2; and a trailing <div class="updated"> with the current time.
+
+   Sections (omit any with no data): a Snapshot row of stat tiles; "🔴 Alerts";
+   "📥 Inbox"; "📧 Outreach — people to email"; "🛠 Prepared" (Linear tasks).
+
+   The "📧 Outreach" section is the priority — three groups of people to email:
+     • New / first-timers — did their first event recently → welcome / onboard.
+     • Could convert — active & engaged but NOT on a paid plan → nudge to subscribe.
+     • Churn risk / churned — dropped off or trending down → win-back.
+   For each person: name/email if available, a one-line why, and a suggested angle.
+
+   STAGE these in Linear so they're trackable (this is allowed — filing tasks is
+   "prepare", not "ship"): in the MGM team, use or create a project called
+   "Outreach". For each person not already tracked — FIRST search that project's
+   open issues and skip anyone already there (match by name/email) — create one
+   issue titled "Email <name> — <bucket>", description = the why + suggested angle,
+   with a label for the bucket (new / convert / churn). Cap at the top ~5 per
+   bucket per run so it never spams. The dashboard's Outreach section then reflects
+   these staged issues (note they're filed in Linear).
+
+   More broadly: EVERY actionable item on the dashboard should be its own Linear
+   task in the MGM team's "Outreach" project (or a sibling project if clearer) —
+   each alert to fix (label "alert"), each email that needs a reply (label
+   "reply"), and each outreach person (label "new"/"convert"/"churn"). One task
+   per item. File them idempotently (search first, skip anything already tracked,
+   cap ~5 per category per run so it never spams). The dashboard is a VIEW over
+   these tasks — show each item and note it's filed in Linear.
+
+   Creating/updating Linear tasks is the ONLY write allowed. Do NOT send any email
+   or take any other external action.
+
+   Keep it scannable on a phone.
+
+3. Do NOT ship anything. When the file is written, report a one-line summary and stop."#
+    )
+}
+
+/// Run the read-only briefing agent for a space (writes its dashboard).
+async fn brief(space_query: String, every: Option<String>) -> Result<()> {
+    ensure_daemon().await?;
+    let (client, _events) = connect().await?;
+    let snap = client.snapshot().await?;
+    let q = space_query.to_lowercase();
+    let sp = snap
+        .spaces
+        .iter()
+        .find(|s| s.id.to_string() == space_query || s.name.to_lowercase().contains(&q))
+        .ok_or_else(|| anyhow::anyhow!("no space matching '{space_query}'"))?;
+    let (space_id, space_name) = (sp.id, sp.name.clone());
+    // Run from the space's own directory so claude picks up that project's
+    // MCP servers (e.g. a project-scoped `fastmail`) + its .env, not just the
+    // global connectors. This is why briefings must run in-directory.
+    let space_cwd = sp
+        .tabs
+        .iter()
+        .filter_map(|t| snap.panes.iter().find(|p| p.id == t.active_pane))
+        .map(|p| p.cwd.clone())
+        .find(|c| !c.is_empty());
+    let slug = dash_slug(&space_name);
+    let dir = ruckus_dir().join("dashboards");
+    std::fs::create_dir_all(&dir).ok();
+    let dash_path = dir.join(format!("{slug}.html"));
+    let prompt = brief_prompt(&space_name, &dash_path.display().to_string());
+
+    match every {
+        // Scheduled: run headless (claude -p), exits each time, no tab pile-up.
+        Some(spec) => {
+            let dur = parse_dur(&spec)?;
+            let lock = dir.join(format!("{slug}.lock"));
+            println!("briefing '{space_name}' every {spec} → {}", dash_path.display());
+            loop {
+                // Per-space lock: never let two briefings clobber the same
+                // dashboard. A lock older than 20m is treated as stale.
+                let busy = std::fs::metadata(&lock)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|e| e < std::time::Duration::from_secs(1200))
+                    .unwrap_or(false);
+                if busy {
+                    println!("  skip: a briefing for '{space_name}' is already running");
+                } else {
+                    let _ = std::fs::write(&lock, std::process::id().to_string());
+                    // Read-only capability: the data connectors + Read/Write only —
+                    // NO Bash / no egress, so it can prepare but never ship.
+                    let mut cmd = tokio::process::Command::new("claude");
+                    cmd.arg("-p")
+                        .arg(&prompt)
+                        .arg("--allowedTools")
+                        .arg(BRIEF_TOOLS);
+                    if let Some(d) = &space_cwd {
+                        cmd.current_dir(d);
+                    }
+                    let status = cmd.status().await;
+                    let _ = std::fs::remove_file(&lock);
+                    match status {
+                        Ok(s) => println!("  briefed ({s})"),
+                        Err(e) => eprintln!("  brief failed: {e}"),
+                    }
+                }
+                tokio::time::sleep(dur).await;
+            }
+        }
+        // One-shot: spawn a watchable claude tab in the space (approvals flow
+        // through the console). Great for the first run / building trust.
+        None => {
+            client
+                .request(Request::NewTab {
+                    space: space_id,
+                    name: Some("brief".into()),
+                    cmd: vec!["claude".into(), prompt],
+                    cwd: space_cwd.clone(),
+                })
+                .await?;
+            println!("briefing agent started in '{space_name}' → will write {}", dash_path.display());
+            Ok(())
+        }
+    }
 }
 
 /// Send a fire-and-forget request, print `ok_msg` on success or bail on error.

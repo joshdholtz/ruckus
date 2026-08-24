@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<title>ruckus</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --text:#16181d; --muted:#6b7280; --border:#e6e8ec;
+    --accent:#2563eb; --wait:#c2740b; --ok:#16a34a; --err:#dc2626; --idle:#9aa0aa;
+    --shadow:0 1px 2px rgba(16,18,29,.05);
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --bg:#0f1115; --card:#171a21; --text:#e7e8ec; --muted:#8b909b; --border:#242833;
+    --accent:#5b8cff; --wait:#e0952f; --ok:#3fbf6b; --err:#f0616b; --idle:#5c626e;
+    --shadow:none;
+  }}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow-x:hidden;overscroll-behavior:none}
+  body{background:var(--bg);color:var(--text);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;height:100dvh;display:flex;flex-direction:column}
+  header{position:sticky;top:0;z-index:5;background:var(--bg);
+    padding:calc(env(safe-area-inset-top) + 14px) 16px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:12px}
+  header .title{font-weight:600;font-size:16px;letter-spacing:.2px}
+  header .dot{width:8px;height:8px;border-radius:50%;background:var(--idle)}
+  header .dot.live{background:var(--ok)}
+  .back{border:0;background:none;color:var(--accent);font-size:15px;padding:6px 2px;cursor:pointer}
+  .sub{color:var(--muted);font-size:13px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
+  main{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0 12px 0}
+  .empty{color:var(--muted);text-align:center;padding:48px 20px;font-size:14px}
+
+  /* timeline cards */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
+    padding:14px;margin-bottom:10px;box-shadow:var(--shadow);cursor:pointer}
+  .card:active{transform:scale(.995)}
+  .card .row{display:flex;align-items:center;gap:8px}
+  .card .name{font-weight:600}
+  .card .pill{margin-left:auto;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;
+    background:color-mix(in srgb,var(--idle) 16%,transparent);color:var(--idle)}
+  .pill.working{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+  .pill.waiting{background:color-mix(in srgb,var(--wait) 18%,transparent);color:var(--wait)}
+  .pill.done{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .card .meta{color:var(--muted);font-size:13px;margin-top:4px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .card .preview{color:var(--muted);font-size:13px;margin-top:6px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+
+  /* home: needs-you + collapsible space groups */
+  .needhdr{font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--wait);
+    text-transform:uppercase;margin:2px 4px 6px}
+  .divider{height:1px;background:var(--border);margin:10px 2px 12px}
+  .grphdr{display:flex;align-items:center;gap:9px;padding:12px 6px;cursor:pointer;
+    font-weight:600;font-size:15px;border-radius:10px}
+  .grphdr:active{background:color-mix(in srgb,var(--idle) 12%,transparent)}
+  .grphdr .caret{color:var(--muted);width:12px;font-size:12px}
+  .grphdr .cnt{margin-left:auto;color:var(--muted);font-size:13px;font-weight:400}
+  .trow{display:flex;align-items:center;gap:11px;padding:11px 8px 11px 28px;cursor:pointer;border-radius:10px}
+  .trow:active{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+  .trow .sd{width:9px;height:9px;border-radius:50%;flex:none}
+  .sd.idle{background:var(--idle)} .sd.working{background:var(--accent)}
+  .sd.waiting{background:var(--wait)} .sd.done{background:var(--ok)}
+  .trow .tn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .trow .ts{color:var(--muted);font-size:12px;flex:none}
+  .dashbtn{border:0;background:none;font-size:16px;cursor:pointer;padding:0 4px;margin-left:8px;line-height:1}
+  .dashframe{flex:1;width:100%;border:0;background:var(--bg)}
+
+  /* approval */
+  .appr{margin-top:12px;border:1px solid color-mix(in srgb,var(--wait) 45%,var(--border));
+    border-radius:12px;padding:11px 12px;background:color-mix(in srgb,var(--wait) 8%,transparent)}
+  .appr .q{font-size:13px;color:var(--muted);margin-bottom:4px}
+  .appr .cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
+    word-break:break-word;margin-bottom:10px}
+  .appr .btns{display:flex;gap:8px}
+  .btn{flex:1;border:0;border-radius:10px;padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+  .btn.allow{background:var(--ok);color:#fff}
+  .btn.deny{background:color-mix(in srgb,var(--err) 14%,transparent);color:var(--err)}
+  .btn:active{filter:brightness(.95)}
+
+  /* chat */
+  .msg{margin-bottom:14px;display:flex;flex-direction:column}
+  .msg .who{font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--muted);margin-bottom:4px}
+  .msg.user .who{color:var(--accent)}
+  .bubble{background:var(--card);border:1px solid var(--border);border-radius:12px;
+    padding:11px 13px;white-space:pre-wrap;word-break:break-word}
+  .msg.user .bubble{background:color-mix(in srgb,var(--accent) 9%,var(--card))}
+  .bubble code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;
+    background:color-mix(in srgb,var(--muted) 20%,transparent);padding:1px 5px;border-radius:5px}
+  .bubble pre.code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#0b0d12;
+    color:#cdd3de;padding:10px 11px;border-radius:8px;overflow-x:auto;white-space:pre;margin:7px 0}
+  .bubble a{color:var(--accent)}
+  .bubble b{font-weight:650}
+  .msg.sending .bubble{opacity:.5}
+  .sendtag{font-size:11px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:5px}
+  .sendtag::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+  .qcard{border:1px solid color-mix(in srgb,var(--accent) 40%,var(--border));border-radius:12px;
+    padding:12px;background:color-mix(in srgb,var(--accent) 6%,transparent)}
+  .qq{font-weight:600;margin-bottom:10px}
+  .qopts{display:flex;flex-direction:column;gap:8px}
+  .qopt{text-align:left;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:10px;padding:11px 13px;font-size:14px;cursor:pointer;width:100%;display:flex;gap:8px}
+  .qopt:active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}
+  .qopt .qnum{color:var(--muted);font-weight:600}
+  .qopt-ro{border:1px solid var(--border);border-radius:10px;padding:10px 13px;font-size:14px;color:var(--muted)}
+  .qterm{width:100%;margin-top:11px;border:0;background:var(--accent);color:#fff;border-radius:10px;
+    padding:12px;font-weight:600;font-size:14px;cursor:pointer}
+  .qnote{font-size:12px;color:var(--muted);margin-top:9px}
+  .thinking{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:7px;padding:3px 2px}
+  .thinking::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s ease-in-out infinite}
+  .tool{border:1px solid var(--border);border-radius:10px;background:transparent;
+    padding:8px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+    white-space:pre-wrap;word-break:break-word}
+  .tool .t{color:var(--muted);font-weight:700;margin-right:6px;text-transform:none}
+  .tool.err{border-color:color-mix(in srgb,var(--err) 40%,var(--border))}
+  .tool.res{color:var(--muted);white-space:pre-wrap}
+
+  /* reply bar */
+  .reply{position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--border);
+    padding:10px 12px calc(env(safe-area-inset-bottom) + 10px);display:flex;gap:8px}
+  .reply input{flex:1;min-width:0;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:12px;padding:11px 13px;font-size:16px;outline:none}
+  .reply input:focus{border-color:var(--accent)}
+  .reply button{border:0;background:var(--accent);color:#fff;border-radius:12px;
+    padding:0 15px;font-weight:600;font-size:15px;cursor:pointer;flex:none}
+
+  /* composer */
+  .add{margin-left:auto;border:1px solid var(--border);background:var(--card);color:var(--text);
+    border-radius:10px;padding:7px 12px;font-size:14px;font-weight:600;cursor:pointer}
+  .sheet-bg{position:fixed;inset:0;background:rgba(0,0,0,.4);opacity:0;pointer-events:none;
+    transition:opacity .18s;z-index:20}
+  .sheet-bg.open{opacity:1;pointer-events:auto}
+  .sheet{position:fixed;left:0;right:0;bottom:0;z-index:21;background:var(--card);
+    border-top:1px solid var(--border);border-radius:20px 20px 0 0;
+    padding:18px 16px calc(env(safe-area-inset-bottom) + 18px);max-width:720px;margin:0 auto;
+    transform:translateY(110%);transition:transform .2s ease}
+  .sheet.open{transform:none}
+  .sheet h3{margin:0;font-size:16px}
+  .sheet .lab{font-size:11px;color:var(--muted);margin:16px 0 8px;text-transform:uppercase;
+    letter-spacing:.5px;font-weight:700}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{border:1px solid var(--border);background:transparent;color:var(--text);border-radius:999px;
+    padding:8px 14px;font-size:14px;cursor:pointer}
+  .chip.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent)}
+  .sheet input{width:100%;border:1px solid var(--border);background:var(--bg);color:var(--text);
+    border-radius:10px;padding:12px 13px;font-size:16px;outline:none;margin-top:8px}
+  .sheet input:focus{border-color:var(--accent)}
+  .sheet .start{width:100%;margin-top:18px;border:0;background:var(--accent);color:#fff;
+    border-radius:12px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}
+
+  /* session mode row (chat/terminal toggle + actions) */
+  .moderow{display:flex;align-items:center;gap:6px;margin-bottom:12px;
+    position:sticky;top:0;z-index:3;background:var(--bg);padding:12px 0 8px}
+  .tabbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
+    border-radius:9px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
+  .tabbtn.sel{color:var(--accent);border-color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 10%,transparent)}
+  .iconbtn{border:1px solid var(--border);background:var(--card);color:var(--muted);
+    border-radius:9px;width:34px;height:32px;font-size:15px;cursor:pointer}
+  .iconbtn.danger{color:var(--err)}
+  #termhost{flex:1;min-height:220px;border:1px solid var(--border);border-radius:10px;
+    overflow:hidden;background:#0b0d12;padding:6px 8px;touch-action:none;overscroll-behavior:contain}
+  #termhost *{touch-action:none}
+  #termhost .xterm{height:100%}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <button class="back" id="back" style="display:none">‹ Sessions</button>
+    <span class="dot" id="live"></span>
+    <span class="title" id="title">ruckus</span>
+    <span class="sub" id="sub"></span>
+    <button class="add" id="add">+ New</button>
+  </header>
+  <main id="main"><div class="empty">Connecting…</div></main>
+</div>
+<div class="sheet-bg" id="sheetbg"></div>
+<div class="sheet" id="sheet">
+  <h3>New session</h3>
+  <div class="lab">Run</div>
+  <div class="chips" id="cmdchips">
+    <button class="chip sel" data-cmd="claude">claude</button>
+    <button class="chip" data-cmd="codex">codex</button>
+    <button class="chip" data-cmd="">shell</button>
+  </div>
+  <input id="cmdin" placeholder="or type a command…" value="claude" autocomplete="off" autocapitalize="off">
+  <div class="lab">Model <span style="text-transform:none;font-weight:400">(claude)</span></div>
+  <div class="chips" id="modelchips">
+    <button class="chip sel" data-v="">default</button>
+    <button class="chip" data-v="opus">opus</button>
+    <button class="chip" data-v="sonnet">sonnet</button>
+    <button class="chip" data-v="haiku">haiku</button>
+  </div>
+  <div class="lab">Effort</div>
+  <div class="chips" id="effortchips">
+    <button class="chip sel" data-v="">default</button>
+    <button class="chip" data-v="low">low</button>
+    <button class="chip" data-v="medium">medium</button>
+    <button class="chip" data-v="high">high</button>
+    <button class="chip" data-v="max">max</button>
+  </div>
+  <div class="lab">In</div>
+  <div class="chips" id="spacechips"></div>
+  <button class="start" id="startbtn">Start session</button>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+let ws, snap = {panes:[],spaces:[]}, view = {name:'timeline', pane:null, mode:'chat'}, sessionMsgs = {}, sessionModel = {}, sessionEffort = {}, termbufs = {}, pendingMsgs = {};
+let TERM=null, TERMFIT=null;
+function termLive(){ return view.name==='session' && view.mode==='terminal'; }
+
+function connect(){
+  ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  ws.onopen = () => { $('#live').classList.add('live'); refreshDashboards(); };
+  ws.onclose = () => { $('#live').classList.remove('live'); setTimeout(connect, 1500); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if(m.t==='snapshot'){ snap = m.snapshot; render(); }
+    else if(m.t==='event'){ onEvent(m.msg); }
+    else if(m.t==='session'){ const prev=sessionMsgs[m.pane], pm=sessionModel[m.pane], pe=sessionEffort[m.pane];
+      sessionMsgs[m.pane]=m.msgs; sessionModel[m.pane]=m.model; sessionEffort[m.pane]=m.effort;
+      // Drop optimistic "sending" bubbles once the message lands in the transcript
+      // (or after 45s, in case it never gets recorded).
+      const pnd=pendingMsgs[m.pane];
+      if(pnd&&pnd.length){ const ut=new Set((m.msgs||[]).filter(x=>x.role==='user'&&x.kind==='text').map(x=>(x.text||'').trim()));
+        pendingMsgs[m.pane]=pnd.filter(p=>!ut.has(p.text.trim()) && Date.now()-p.ts<45000); }
+      if(view.name==='session'&&view.pane===m.pane&&view.mode==='chat'&&(!prev||prev.length!==m.msgs.length||pm!==m.model||pe!==m.effort||(pnd&&pnd.length!==(pendingMsgs[m.pane]||[]).length))) render(); }
+    else if(m.t==='attached'){ termbufs[m.pane] = decodeB64(m.scrollback); if(TERM&&TERM._pane===m.pane){ try{TERM.clear();}catch(e){} TERM.write(termbufs[m.pane]); } }
+  };
+}
+function onEvent(msg){
+  if(!msg||!msg.type) return;
+  if(msg.type==='state'){ snap = msg.snapshot; if(termLive()) updateHeader(); else render(); }
+  else if(msg.type==='agent_state'){
+    const p = snap.panes.find(p=>p.id===msg.pane); if(p){ p.agent_state=msg.state; p.activity=phaseActivity(msg.state.phase); p.agent=p.agent||msg.state.agent; }
+    if(view.name==='session'&&view.pane===msg.pane){
+      // A just-opened agent session may have defaulted to Terminal before it was
+      // flagged; flip it to Chat once (unless the user chose Terminal themselves).
+      if(view.mode==='terminal'&&!view.userToggled&&msg.state.session){ disposeTerm(); send({t:'detach',pane:msg.pane}); view.mode='chat'; render(); return; }
+      if(view.mode==='chat') send({t:'session',pane:msg.pane});
+    }
+    if(termLive()) updateHeader(); else render();
+  }
+  else if(msg.type==='activity'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p) p.activity=msg.activity; if(termLive()) updateHeader(); else render(); }
+  else if(msg.type==='output'){
+    if(termLive()&&msg.pane===view.pane){
+      const dec=decodeB64(msg.data);
+      termbufs[msg.pane]=((termbufs[msg.pane]||'')+dec).slice(-400000);
+      if(TERM&&TERM._pane===msg.pane) TERM.write(dec);
+    }
+  }
+  else if(msg.type==='exited'){ const p=snap.panes.find(p=>p.id===msg.pane); if(p){p.status={state:'exited',code:msg.code};p.activity='done';} if(termLive()) updateHeader(); else render(); }
+}
+function updateHeader(){ const p=snap.panes.find(p=>p.id===view.pane); if(!p) return;
+  $('#title').textContent=paneName(p);
+  const mdl=sessionModel[view.pane], eff=sessionEffort[view.pane];
+  $('#sub').textContent=[mdl,eff,loc(p)].filter(Boolean).join(' · ')||stateLabel(p); }
+const phaseActivity = ph => ({working:'working',awaiting_approval:'waiting',awaiting_input:'waiting',done:'done',error:'done'}[ph]||'idle');
+const send = o => ws && ws.readyState===1 && ws.send(JSON.stringify(o));
+
+// ---- rendering ----
+// A "session" is a tab (which carries the name you gave it); agents run inside
+// its active pane. List every tab across every space.
+function sessions(){
+  const out=[];
+  for(const sp of (snap.spaces||[]))
+    for(const t of (sp.tabs||[])){
+      const pane = snap.panes.find(p=>p.id===t.active_pane);
+      if(pane) out.push({space:sp.name, tab:t.name, pane});
+    }
+  return out;
+}
+function paneName(p){
+  for(const sp of (snap.spaces||[])) for(const t of (sp.tabs||[])) if(t.active_pane===p.id) return t.name||p.title;
+  return (p.agent_state&&p.agent_state.agent)||p.title||'session';
+}
+function stateOf(p){ const a=p.activity; return a==='working'?'working':a==='waiting'?'waiting':a==='done'?'done':'idle'; }
+function stateLabel(p){
+  const ph=p.agent_state?.phase;
+  if(ph==='awaiting_approval') return 'needs approval';
+  if(ph==='awaiting_input') return 'your turn';
+  return {working:'working',waiting:'waiting',done:'done',idle:'idle'}[stateOf(p)];
+}
+
+let openState={}, dashSet=new Set();
+function dashSlug(name){ let s=''; for(const c of (name||'').toLowerCase()){ if(/[a-z0-9]/.test(c)) s+=c; else if(!s.endsWith('-')) s+='-'; } return s.replace(/^-+|-+$/g,''); }
+function refreshDashboards(){ fetch('/api/dashboards').then(r=>r.json()).then(a=>{ dashSet=new Set(a); if(view.name==='timeline') render(); }).catch(()=>{}); }
+function openDash(slug){ view={name:'dashboard',slug}; render(); }
+function renderDashboard(){
+  $('#back').style.display=''; $('#add').style.display='none';
+  $('#back').onclick=()=>{ view={name:'timeline'}; render(); };
+  $('#title').textContent='Dashboard'; $('#sub').textContent='';
+  const main=$('#main'); main.innerHTML=''; main.style.display='flex'; main.style.flexDirection='column'; main.style.overflow='hidden'; main.style.paddingTop='0';
+  const f=document.createElement('iframe'); f.className='dashframe'; f.setAttribute('sandbox','allow-scripts');
+  f.src='/dash/'+encodeURIComponent(view.slug)+'?t='+Date.now();
+  main.appendChild(f);
+}
+function needsYou(p){ return !!(p.agent_state&&p.agent_state.pending) || p.activity==='waiting' || p.activity==='done'; }
+function isOpen(sp){
+  if(sp.id in openState) return openState[sp.id];
+  // default: expand a space that has anything needing you
+  return (sp.tabs||[]).some(t=>{ const p=snap.panes.find(p=>p.id===t.active_pane); return p&&needsYou(p); });
+}
+const stDot=p=>`<span class="sd ${stateOf(p)}"></span>`;
+function tabRow(t,p){
+  const d=document.createElement('div'); d.className='trow';
+  d.innerHTML=`${stDot(p)}<span class="tn">${esc(t.name||p.title)}</span><span class="ts">${stateLabel(p)}</span>`;
+  d.onclick=()=>openSession(p.id);
+  return d;
+}
+function needRow(sp,t,p){
+  const wrap=document.createElement('div');
+  const d=document.createElement('div'); d.className='trow';
+  d.innerHTML=`${stDot(p)}<span class="tn">${esc(t.name||p.title)} <span class="ts">· ${esc(sp.name)}</span></span><span class="ts">${stateLabel(p)}</span>`;
+  d.onclick=()=>openSession(p.id);
+  wrap.appendChild(d);
+  const pend=p.agent_state&&p.agent_state.pending;
+  if(pend){
+    const a=document.createElement('div'); a.className='appr'; a.style.margin='0 6px 8px 28px';
+    a.innerHTML=`<div class="cmd">${esc(pend.title)}</div><div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
+    a.querySelector('.allow').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'allow');};
+    a.querySelector('.deny').onclick=ev=>{ev.stopPropagation();resolve(p.id,pend.request_id,'deny');};
+    wrap.appendChild(a);
+  }
+  return wrap;
+}
+function render(){
+  if(view.name==='session'){ renderSession(); return; }
+  if(view.name==='dashboard'){ renderDashboard(); return; }
+  $('#back').style.display='none'; $('#add').style.display=''; $('#title').textContent='ruckus'; $('#sub').textContent='';
+  const main=$('#main'); main.innerHTML=''; main.style.display='block'; main.style.overflowY='auto'; main.style.paddingTop='12px';
+  const paneOf=t=>snap.panes.find(p=>p.id===t.active_pane);
+  const groups=(snap.spaces||[]).map(sp=>({sp,tabs:(sp.tabs||[]).map(t=>({t,p:paneOf(t)})).filter(x=>x.p)})).filter(g=>g.tabs.length);
+  if(!groups.length){ main.innerHTML='<div class="empty">No sessions yet.<br>Tap + New.</div>'; return; }
+  // NEEDS YOU
+  const attn=[];
+  for(const g of groups) for(const {t,p} of g.tabs) if(needsYou(p)) attn.push({sp:g.sp,t,p});
+  attn.sort((a,b)=>rank(b.p)-rank(a.p));
+  if(attn.length){
+    const h=document.createElement('div'); h.className='needhdr'; h.textContent='Needs you'; main.appendChild(h);
+    for(const {sp,t,p} of attn) main.appendChild(needRow(sp,t,p));
+    const dv=document.createElement('div'); dv.className='divider'; main.appendChild(dv);
+  }
+  // collapsible space groups
+  for(const g of groups){
+    const open=isOpen(g.sp);
+    const hasDash=dashSet.has(dashSlug(g.sp.name));
+    const hdr=document.createElement('div'); hdr.className='grphdr';
+    hdr.innerHTML=`<span class="caret">${open?'▾':'▸'}</span><span>${esc(g.sp.name)}</span>`+
+      `<span class="cnt">${g.tabs.length}</span>${hasDash?'<button class="dashbtn" title="dashboard">📊</button>':''}`;
+    hdr.onclick=e=>{ if(e.target.closest('.dashbtn')) return; openState[g.sp.id]=!open; render(); };
+    if(hasDash) hdr.querySelector('.dashbtn').onclick=e=>{ e.stopPropagation(); openDash(dashSlug(g.sp.name)); };
+    main.appendChild(hdr);
+    if(open) for(const {t,p} of g.tabs) main.appendChild(tabRow(t,p));
+  }
+}
+const rank = p => (p.agent_state?.pending?4:0)+({waiting:3,done:2,working:1,idle:0}[stateOf(p)]);
+function loc(p){ const cwd=(p.cwd||'').split('/').pop(); const br=p.git_branch?'·'+p.git_branch:''; return cwd+br; }
+
+function isAgentSession(p){
+  if(!p) return false;
+  const nm=(paneName(p)||'').toLowerCase();
+  return !!(p.agent || p.agent_state || /claude|codex|aider|goose|opencode|gemini|cursor|amp|cody/.test(nm));
+}
+function defaultMode(p){ return isAgentSession(p) ? 'chat' : 'terminal'; }
+function answerQuestion(i, qp){
+  if(qp&&qp.multi){ setMode('terminal'); return; }
+  // Number-key selection (1-based) + Enter — coordinate-free; exact if the picker
+  // takes number keys. If it misfires, "Answer in Terminal" is the sure path.
+  send({t:'input',pane:view.pane,text:(i+1)+'\r',enter:false});
+}
+function openSession(pane){
+  const p=snap.panes.find(x=>x.id===pane);
+  view={name:'session',pane,mode:defaultMode(p)};
+  sessionMsgs[pane]=sessionMsgs[pane]||null;
+  send({t:'session',pane});
+  if(view.mode==='terminal') attach(pane);
+  render();
+}
+function attach(pane){ if(!(pane in termbufs)) termbufs[pane]=''; send({t:'attach',pane}); }
+function leaveSession(){ if(view.name==='session'&&view.mode==='terminal'){ send({t:'detach',pane:view.pane}); disposeTerm(); } }
+function setMode(m){
+  if(m===view.mode) return;
+  view.userToggled=true;
+  if(view.mode==='terminal'){ send({t:'detach',pane:view.pane}); disposeTerm(); }
+  view.mode=m;
+  if(m==='terminal') attach(view.pane); else send({t:'session',pane:view.pane});
+  render();
+}
+function renderSession(){
+  const p=snap.panes.find(p=>p.id===view.pane);
+  $('#back').style.display=''; $('#add').style.display='none';
+  $('#back').onclick=()=>{ leaveSession(); view={name:'timeline'}; render(); };
+  $('#title').textContent = p?paneName(p):'session';
+  const mdl=sessionModel[view.pane], eff=sessionEffort[view.pane];
+  $('#sub').textContent = [mdl, eff, p&&loc(p)].filter(Boolean).join(' · ') || (p?stateLabel(p):'');
+  const main=$('#main'); main.innerHTML=''; main.style.paddingTop='0';
+
+  // Chat + model/effort only make sense for agent sessions (they have a
+  // transcript). A plain shell is Terminal-only.
+  const agentSess = isAgentSession(p);
+  if(!agentSess && view.mode==='chat'){ view.mode='terminal'; }
+
+  const row=document.createElement('div'); row.className='moderow';
+  row.innerHTML=`${agentSess?`<button class="tabbtn ${view.mode==='chat'?'sel':''}" data-m="chat">Chat</button>
+    <button class="tabbtn ${view.mode==='terminal'?'sel':''}" data-m="terminal">Terminal</button>`:''}
+    <span style="margin-left:auto"></span>
+    ${agentSess?`<button class="iconbtn" id="cfg" title="model / effort">⚙</button>`:''}
+    <button class="iconbtn" id="restart" title="restart">↻</button>
+    <button class="iconbtn danger" id="close" title="close">✕</button>`;
+  row.querySelectorAll('.tabbtn').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+  row.querySelector('#restart').onclick=()=>{ if(confirm('Restart this session?')) send({t:'restart',pane:view.pane}); };
+  row.querySelector('#close').onclick=()=>{ if(confirm('Close (kill) this session?')){ send({t:'close',pane:view.pane}); leaveSession(); view={name:'timeline'}; render(); } };
+  main.appendChild(row);
+
+  if(agentSess){
+    // model / effort change panel (sends /model & /effort into the session);
+    // current model + effort come from the transcript and are highlighted.
+    const curModel = sessionModel[view.pane], curEffort = sessionEffort[view.pane];
+    const cfg=document.createElement('div'); cfg.id='cfgpanel'; cfg.style.display='none'; cfg.style.marginBottom='12px';
+    cfg.innerHTML=`<div class="lab" style="margin-top:0">Model</div>
+      <div class="chips">${['opus','sonnet','haiku'].map(m=>`<button class="chip ${m===curModel?'sel':''}" data-c="/model ${m}">${m}</button>`).join('')}</div>
+      <div class="lab">Effort</div>
+      <div class="chips">${['low','medium','high','max'].map(e=>`<button class="chip ${e===curEffort?'sel':''}" data-c="/effort ${e}">${e}</button>`).join('')}</div>`;
+    cfg.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
+      send({t:'input',pane:view.pane,text:b.dataset.c});
+      const group=b.parentElement; group.querySelectorAll('.chip').forEach(x=>x.classList.remove('sel')); b.classList.add('sel');
+    });
+    main.appendChild(cfg);
+    row.querySelector('#cfg').onclick=()=>{ cfg.style.display = cfg.style.display==='none' ? '' : 'none'; };
+  }
+
+  const pend=p&&p.agent_state?.pending;
+  if(pend){
+    const a=document.createElement('div'); a.className='appr';
+    a.innerHTML=`<div class="q">Approve this?</div><div class="cmd">${esc(pend.title)}${pend.detail&&pend.detail!==pend.title?'\n'+esc(pend.detail):''}</div>
+      <div class="btns"><button class="btn allow">Approve</button><button class="btn deny">Deny</button></div>`;
+    a.querySelector('.allow').onclick=()=>resolve(p.id,pend.request_id,'allow');
+    a.querySelector('.deny').onclick=()=>resolve(p.id,pend.request_id,'deny');
+    main.appendChild(a);
+  }
+
+  if(view.mode==='terminal'){
+    main.style.display='flex'; main.style.flexDirection='column'; main.style.overflow='hidden';
+    const host=document.createElement('div'); host.id='termhost'; main.appendChild(host);
+  } else {
+    main.style.display='block'; main.style.overflowY='auto';
+    const msgs=sessionMsgs[view.pane];
+    if(msgs===null||msgs===undefined){ main.insertAdjacentHTML('beforeend','<div class="empty">Loading…</div>'); }
+    else if(!msgs.length){ main.insertAdjacentHTML('beforeend','<div class="empty">No transcript yet — try Terminal.</div>'); }
+    else for(const m of msgs) main.appendChild(renderMsg(m));
+  }
+
+  // optimistic "sending…" bubbles (chat only) — cleared once the transcript lands
+  if(view.mode==='chat') for(const pm of (pendingMsgs[view.pane]||[])){
+    const d=document.createElement('div'); d.className='msg user sending';
+    d.innerHTML=`<div class="who">you</div><div class="bubble">${md(pm.text)}</div><div class="sendtag">sending…</div>`;
+    main.appendChild(d);
+  }
+  // live "working…" indicator so you can tell the agent is thinking
+  if(view.mode==='chat'){
+    const wp=snap.panes.find(x=>x.id===view.pane);
+    if(wp && (wp.activity==='working' || (wp.agent_state&&wp.agent_state.phase==='working'))){
+      const d=document.createElement('div'); d.className='msg'; d.innerHTML='<div class="thinking">working…</div>'; main.appendChild(d);
+    }
+  }
+  // live pending question (from agent_state — the transcript omits an open one)
+  if(view.mode==='chat'){
+    const qp = p && p.agent_state && p.agent_state.prompt;
+    if(qp){
+      const q=document.createElement('div'); q.className='msg';
+      const opts=(qp.options||[]).map((o,i)=>`<button class="qopt" data-i="${i}"><span class="qnum">${i+1}</span><span>${esc(o)}</span></button>`).join('');
+      q.innerHTML=`<div class="qcard"><div class="qq">${esc(qp.question)}</div><div class="qopts">${opts}</div>`+
+        `<button class="qterm">Answer in Terminal →</button></div>`;
+      q.querySelectorAll('.qopt').forEach(b=>b.onclick=()=>answerQuestion(+b.dataset.i, qp));
+      q.querySelector('.qterm').onclick=()=>setMode('terminal');
+      main.appendChild(q);
+    }
+  }
+
+  // Reply bar only in Chat — Terminal has its own (xterm) input.
+  if(view.mode==='chat'){
+    const bar=document.createElement('div'); bar.className='reply';
+    bar.innerHTML=`<input id="rin" placeholder="Type into this session…" autocomplete="off" autocapitalize="off"><button id="rsend">Send</button>`;
+    main.appendChild(bar);
+    const inp=bar.querySelector('#rin');
+    const go=()=>{ const t=inp.value; if(!t)return;
+      (pendingMsgs[view.pane]=pendingMsgs[view.pane]||[]).push({text:t,ts:Date.now()});
+      send({t:'input',pane:view.pane,text:t}); inp.value='';
+      render(); const ni=$('#rin'); if(ni) ni.focus();
+    };
+    bar.querySelector('#rsend').onclick=go;
+    inp.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+  }
+  if(view.mode==='terminal') createTerm(view.pane); else main.scrollTop=main.scrollHeight;
+}
+function createTerm(pane){
+  disposeTerm();
+  const host=$('#termhost'); if(!host||typeof Terminal==='undefined') return;
+  const t=new Terminal({fontSize:12,fontFamily:'ui-monospace,Menlo,monospace',cursorBlink:false,scrollback:8000,
+    theme:{background:'#0b0d12',foreground:'#cdd3de',cursor:'#cdd3de',selectionBackground:'#33415580'}});
+  const fit=new FitAddon.FitAddon(); t.loadAddon(fit); t.open(host);
+  try{fit.fit();}catch(e){}
+  t._pane=pane; TERM=t; TERMFIT=fit;
+  // Swipe to scroll the scrollback (xterm has no native touch scroll on mobile).
+  let ty=null;
+  host.addEventListener('touchstart',e=>{ ty=e.touches[0].clientY; },{passive:false,capture:true});
+  host.addEventListener('touchmove',e=>{
+    if(ty==null) return;
+    e.preventDefault();   // consume the gesture so the page doesn't pull-to-refresh
+    const y=e.touches[0].clientY, lineH=Math.max(8, host.clientHeight/(t.rows||24));
+    const n=Math.trunc((ty-y)/lineH);
+    if(Math.abs(n)>=1){
+      const mm=(t.modes&&t.modes.mouseTrackingMode)||'none';
+      const alt=t.buffer&&t.buffer.active&&t.buffer.active.type==='alternate';
+      const steps=Math.min(Math.abs(n),6);
+      if(mm!=='none'){
+        // App captures the mouse (e.g. Claude/Codex TUI): forward wheel events so
+        // the app scrolls its own view. swipe up → wheel down (newer); down → up.
+        const btn=n>0?65:64; let seq='';
+        for(let i=0;i<steps;i++) seq+=`\x1b[<${btn};2;2M`;
+        send({t:'input',pane,text:seq,enter:false});
+      } else if(alt){
+        // alt-screen without mouse: arrow keys as a fallback
+        send({t:'input',pane,text:(n>0?'\x1b[B':'\x1b[A').repeat(steps),enter:false});
+      } else {
+        t.scrollLines(n);   // normal buffer (shell): real scrollback
+      }
+      ty=y;
+    }
+  },{passive:false,capture:true});
+  host.addEventListener('touchend',()=>{ ty=null; },{passive:false,capture:true});
+  if(termbufs[pane]) t.write(termbufs[pane]);
+  sendResize(pane);
+  t.onData(d=>send({t:'input',pane,text:d,enter:false}));
+  window.__tr=()=>{ try{fit.fit(); sendResize(pane);}catch(e){} };
+  window.addEventListener('resize', window.__tr);
+  // one more fit after layout settles (mobile)
+  setTimeout(()=>{ try{fit.fit(); sendResize(pane);}catch(e){} }, 60);
+}
+function sendResize(pane){ if(TERM) send({t:'resize',pane,rows:TERM.rows||24,cols:TERM.cols||80}); }
+function disposeTerm(){ if(window.__tr){window.removeEventListener('resize',window.__tr); window.__tr=null;} if(TERM){try{TERM.dispose();}catch(e){}} TERM=null; TERMFIT=null; }
+function decodeB64(b64){ try{ return new TextDecoder().decode(Uint8Array.from(atob(b64),c=>c.charCodeAt(0))); }catch(e){ return ''; } }
+function renderMsg(m){
+  const d=document.createElement('div');
+  if(m.kind==='text'){
+    d.className='msg '+(m.role==='user'?'user':'assistant');
+    d.innerHTML=`<div class="who">${m.role==='user'?'you':'assistant'}</div><div class="bubble">${md(m.text)}</div>`;
+  } else if(m.kind==='tool_call'){
+    d.className='msg';
+    d.innerHTML=`<div class="tool"><span class="t">${esc(m.tool)}</span>${esc(m.input||'')}</div>`;
+  } else if(m.kind==='tool_result'){
+    d.className='msg';
+    d.innerHTML=`<div class="tool res ${m.is_error?'err':''}">${esc(m.text||'(done)')}</div>`;
+  } else if(m.kind==='question'){
+    // Historical (answered) question — read-only; the answer follows in the result.
+    d.className='msg';
+    const opts=(m.options||[]).map(o=>`<div class="qopt-ro">${esc(o)}</div>`).join('');
+    d.innerHTML=`<div class="qcard"><div class="qq">${esc(m.question)}</div><div class="qopts">${opts}</div></div>`;
+  }
+  return d;
+}
+function resolve(pane,request_id,decision){ send({t:'resolve',pane,request_id,decision});
+  const p=snap.panes.find(p=>p.id===pane); if(p&&p.agent_state) p.agent_state.pending=null; render(); }
+function esc(s){ return (s==null?'':''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+// Tiny, safe markdown: escape first, then apply formatting.
+function md(s){
+  s=esc(s);
+  s=s.replace(/```([\s\S]*?)```/g,(m,c)=>`<pre class="code">${c.replace(/^\n/,'')}</pre>`);
+  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  s=s.replace(/^\s*#{1,6}\s+(.*)$/gm,'<b>$1</b>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+  s=s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g,'$1<i>$2</i>');
+  s=s.replace(/^\s*[-*]\s+(.*)$/gm,'• $1');
+  s=s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+
+// ---- composer: start a new session (tab), optionally in a new space ----
+let startTarget=0;
+function openSheet(){
+  const sb=$('#spacechips'); sb.innerHTML=''; startTarget=0;
+  const mk=(id,label)=>{
+    const b=document.createElement('button'); b.className='chip'+(id===0?' sel':''); b.textContent=label;
+    b.onclick=()=>{ startTarget=id; [...sb.children].forEach(c=>c.classList.remove('sel')); b.classList.add('sel'); };
+    return b;
+  };
+  sb.appendChild(mk(0,'＋ New space'));
+  for(const s of (snap.spaces||[])) sb.appendChild(mk(s.id, s.name));
+  $('#sheetbg').classList.add('open'); $('#sheet').classList.add('open');
+  setTimeout(()=>$('#cmdin').focus(),60);
+}
+function closeSheet(){ $('#sheetbg').classList.remove('open'); $('#sheet').classList.remove('open'); }
+$('#add').onclick=openSheet;
+$('#sheetbg').onclick=closeSheet;
+document.querySelectorAll('#cmdchips .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('#cmdchips .chip').forEach(x=>x.classList.remove('sel')); c.classList.add('sel');
+  $('#cmdin').value=c.dataset.cmd;
+});
+let selModel='', selEffort='';
+function pickGroup(sel, set){ document.querySelectorAll(sel+' .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll(sel+' .chip').forEach(x=>x.classList.remove('sel')); c.classList.add('sel'); set(c.dataset.v); }); }
+pickGroup('#modelchips', v=>selModel=v);
+pickGroup('#effortchips', v=>selEffort=v);
+$('#startbtn').onclick=()=>{
+  let cmd=$('#cmdin').value.trim();
+  if(/^claude\b/.test(cmd)){
+    if(selModel && !/--model\b/.test(cmd)) cmd+=' --model '+selModel;
+    if(selEffort && !/--effort\b/.test(cmd)) cmd+=' --effort '+selEffort;
+  }
+  send({t:'new_tab',space:startTarget,cmd}); closeSheet(); view={name:'timeline'};
+};
+
+// Poll the open chat transcript so new messages appear without a refresh.
+setInterval(()=>{ if(ws&&ws.readyState===1&&view.name==='session'&&view.mode==='chat') send({t:'session',pane:view.pane}); }, 2000);
+
+connect();
+</script>
+</body>
+</html>

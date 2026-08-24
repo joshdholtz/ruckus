@@ -9,10 +9,10 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::protocol::*;
 use crate::remote::{self, Origin};
@@ -142,9 +142,20 @@ fn persisted_bytes(st: &mut State) -> Option<Vec<u8>> {
 /// `remote_specs` so a dropped connection can be auto-reconnected without a client.
 #[derive(Clone)]
 struct RemoteSpecEnv {
+    /// SSH host, or — for a relay remote — the device name (used as the row tag).
     host: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    /// `Some` → reach this remote through a relay instead of SSH.
+    relay: Option<RelayTarget>,
+}
+
+/// Relay coordinates for a relay-transport remote.
+#[derive(Clone)]
+struct RelayTarget {
+    url: String,
+    account: String,
+    secret: String,
 }
 
 /// A LIVE mirrored remote daemon reached over `ssh … ruckus __proxy`. The daemon
@@ -153,8 +164,10 @@ struct RemoteSpecEnv {
 struct RemoteConn {
     host: String,
     client: Arc<crate::client::Client>,
-    /// kill_on_drop child; kept alive so the SSH survives client disconnects.
-    _child: tokio::process::Child,
+    /// kill_on_drop SSH child, kept alive so the link survives client
+    /// disconnects. `None` for a relay remote (the relay conn has no child; the
+    /// `Client`'s tasks + event stream keep it alive).
+    _child: Option<tokio::process::Child>,
     snapshot: Snapshot,
 }
 
@@ -269,7 +282,14 @@ struct PaneSession {
     /// and its cached result. Heavy output (Claude Code redraws) would otherwise
     /// scan the whole screen thousands of times/sec under the state lock.
     last_prompt_scan: std::time::Instant,
-    prompt_cached: bool,
+    /// Cached classification of the visible screen (from `classify_tail`). Lets a
+    /// "waiting on you" prompt win even while the agent footer keeps animating —
+    /// otherwise any repaint pinned the pane on Working forever.
+    scan_cached: Activity,
+    /// Sticky: set once we ever see a coding-agent marker in this pane's output.
+    /// Survives a raw `ssh host` command whose program name is `ssh`, not
+    /// `claude` — so an ssh'd agent still gets the "quiet → needs you" inference.
+    looks_like_agent: bool,
     /// Scrollback changed since the last disk flush.
     dirty: bool,
     /// Rendered screen state — activity classification reads what a user would
@@ -321,13 +341,24 @@ fn kill_pane_session(p: &mut PaneSession) {
     p.pty.kill();
 }
 
-/// Resize the PTY to the max dimensions requested by any attached subscriber.
-/// No-op when nobody is attached (keeps the last size).
-fn apply_max_attach_size(p: &mut PaneSession) {
-    let (rows, cols) = p
-        .subs
-        .values()
-        .fold((0u16, 0u16), |(r, c), s| (r.max(s.rows), c.max(s.cols)));
+/// Resize the PTY to fit its attached subscribers: the largest by default (a
+/// tiny client can't shrink a big TUI), or the smallest when `smallest` is set
+/// (tmux-style — columns shrink to the narrowest client so a phone gets a
+/// readable, wrapped view). No-op when nobody is attached (keeps the last size).
+fn apply_attach_size(p: &mut PaneSession, smallest: bool) {
+    let dims: Vec<(u16, u16)> = p.subs.values().map(|s| (s.rows, s.cols)).collect();
+    if dims.is_empty() {
+        return;
+    }
+    let (rows, cols) = if smallest {
+        dims.iter()
+            .copied()
+            .reduce(|(r, c), (r2, c2)| (r.min(r2), c.min(c2)))
+            .unwrap()
+    } else {
+        dims.iter()
+            .fold((0u16, 0u16), |(r, c), &(r2, c2)| (r.max(r2), c.max(c2)))
+    };
     if rows == 0 || cols == 0 {
         return;
     }
@@ -568,11 +599,84 @@ fn notify_system(title: &str, msg: &str) {
     }
 }
 
+/// Strong coding-agent markers. Seeing any of these means the pane is running an
+/// agent even if its command is `ssh` — used to latch `looks_like_agent`.
+fn has_agent_marker(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("esc to interrupt")
+        || t.contains("ctrl+c to interrupt")
+        || t.contains("esc to cancel")
+        || t.contains("do you want to proceed")
+        || t.contains("tab to amend")
+}
+
+/// The program name to classify against. A raw `ssh host` running claude/codex
+/// reports its command as `ssh`, so once we've latched `looks_like_agent` we
+/// classify as an agent — that's what restores "quiet → needs you" over SSH.
+fn effective_prog(p: &PaneSession) -> String {
+    if p.looks_like_agent {
+        return "claude".to_string();
+    }
+    basename(p.info.cmd.first().map(String::as_str).unwrap_or(""))
+}
+
 /// Classify a pane that has gone quiet: is it blocked on you, or just idle?
 fn classify_quiet(p: &PaneSession) -> Activity {
     let text = p.screen.screen().contents();
-    let prog = basename(p.info.cmd.first().map(String::as_str).unwrap_or(""));
-    classify_tail(&prog, &text)
+    classify_tail(&effective_prog(p), &text)
+}
+
+fn activity_name(a: Activity) -> &'static str {
+    match a {
+        Activity::Working => "working",
+        Activity::Waiting => "waiting",
+        Activity::Done => "done",
+        Activity::Idle => "idle",
+    }
+}
+
+/// Run a plugin/config hook command detached, with the pane's context in env
+/// (RUCKUS_PANE / RUCKUS_PANE_TITLE / RUCKUS_ACTIVITY plus the usual SOCK/DIR).
+fn spawn_hook(run: &str, pane: u64, title: &str, activity: &str) {
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(run)
+        .env("RUCKUS_SOCK", socket_path().display().to_string())
+        .env("RUCKUS_DIR", ruckus_dir().display().to_string())
+        .env("RUCKUS_PANE", pane.to_string())
+        .env("RUCKUS_PANE_TITLE", title)
+        .env("RUCKUS_ACTIVITY", activity)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Collect the hook commands to run for a set of `(pane, new activity)` changes.
+/// Returns `(run, pane, title, activity)` tuples to spawn *after* the state lock
+/// is released — never spawn a subprocess while holding the actor.
+fn collect_hook_fires(
+    hooks: &[crate::config::Hook],
+    panes: &HashMap<u64, PaneSession>,
+    changes: &[(u64, Activity)],
+) -> Vec<(String, u64, String, &'static str)> {
+    if hooks.is_empty() {
+        return Vec::new();
+    }
+    let mut fires = Vec::new();
+    for (pane, activity) in changes {
+        let name = activity_name(*activity);
+        let title = panes
+            .get(pane)
+            .map(|p| p.info.title.clone())
+            .unwrap_or_default();
+        for h in hooks {
+            if h.on == name {
+                fires.push((h.run.clone(), *pane, title.clone(), name));
+            }
+        }
+    }
+    fires
 }
 
 /// True when a single line looks like an interactive input prompt, not a log
@@ -711,6 +815,12 @@ struct State {
     detect_osc133: bool,
     detect_foreground: bool,
     agent_commands: Vec<String>,
+    /// true = size a shared pane to its smallest viewer (tmux-style); false
+    /// (default) = size to the largest so a phone/tail can't shrink a TUI.
+    attach_smallest: bool,
+    /// Activity-transition hooks (config + plugin `[[hook]]`): fired when a pane
+    /// enters a matching state.
+    hooks: Vec<crate::config::Hook>,
     /// Listening socket fd, handed off (un-CLOEXEC'd) across a self-exec upgrade.
     listener_fd: RawFd,
     /// Hybrid remote mirror: LIVE connections by origin; the known specs (persist
@@ -721,6 +831,9 @@ struct State {
     remote_origins: BTreeMap<String, Origin>,
     connecting: std::collections::HashSet<Origin>,
     next_origin: Origin,
+    /// Pending per-agent approvals: (pane, request_id) → the parked `AwaitDecision`
+    /// reply sink. Fulfilled by `ResolveDecision` from any client. Never persisted.
+    decisions: HashMap<(u64, String), tokio::sync::oneshot::Sender<Decision>>,
     /// Set by any job that changes the persisted tree; the actor drains it to nudge
     /// the debounced saver. Never serialized.
     dirty: bool,
@@ -853,6 +966,12 @@ pub async fn run() -> Result<()> {
     info!("ruckus daemon listening on {}", sock.display());
 
     let cfg = crate::config::Config::load();
+    // Auto-wire per-agent adapters (`[agents] enable`), so users never run
+    // `agent-setup` by hand. Idempotent: only rewrites the settings file if it
+    // actually changed.
+    for agent in &cfg.agents.enable {
+        crate::agent_hook::auto_install(agent, cfg.agents.gate);
+    }
     // The single State-owning actor + its job channel; `state` is the handle
     // everyone uses. There is no mutex — see the actor infra at the top of file.
     let (job_tx, job_rx) = unbounded_channel::<Job>();
@@ -873,12 +992,15 @@ pub async fn run() -> Result<()> {
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
         agent_commands: cfg.ui.agent_commands.clone(),
+        attach_smallest: matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest),
+        hooks: cfg.hooks.clone(),
         listener_fd,
         remotes: BTreeMap::new(),
         remote_specs: BTreeMap::new(),
         remote_origins: BTreeMap::new(),
         connecting: std::collections::HashSet::new(),
         next_origin: 0,
+        decisions: HashMap::new(),
         dirty: false,
     };
 
@@ -953,7 +1075,7 @@ pub async fn run() -> Result<()> {
                 // (broadcast frames, desktop notifications, scrollback writes) and
                 // run it AFTER releasing — holding the mutex across a subprocess
                 // spawn or 38 disk writes is what made the contention window huge.
-                let (frames, txs, notify_titles, flushes) = state
+                let (frames, txs, notify_titles, flushes, hook_fires) = state
                     .with(move |st| {
                         let quiet_after = st.quiet_after;
                         let notify_waiting = st.notify_waiting;
@@ -1029,7 +1151,8 @@ pub async fn run() -> Result<()> {
                         } else {
                             Vec::new()
                         };
-                        (frames, txs, notify_titles, flushes)
+                        let hook_fires = collect_hook_fires(&st.hooks, &st.panes, &changes);
+                        (frames, txs, notify_titles, flushes, hook_fires)
                     })
                     .await; // actor released before any I/O below
 
@@ -1043,6 +1166,9 @@ pub async fn run() -> Result<()> {
                 }
                 for (id, bytes) in flushes {
                     let _ = std::fs::write(scrollback_path(id), &bytes);
+                }
+                for (run, pane, title, activity) in hook_fires {
+                    spawn_hook(&run, pane, &title, activity);
                 }
             }
         });
@@ -1152,15 +1278,28 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    let mut next_conn: u64 = 1;
+    // Shared connection-id allocator: the unix accept loop and any relay-dialed
+    // sessions draw from the same counter so ids never collide in `st.conns`.
+    let conn_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    // Relay device registration: dial out to the broker and serve incoming
+    // sessions with the same `handle_conn` engine as local unix connections.
+    if let Some(relay) = cfg.relay.clone() {
+        if relay.device.is_some() {
+            let state = state.clone();
+            let conn_seq = conn_seq.clone();
+            tokio::spawn(relay_dial_loop(state, relay, conn_seq));
+        }
+    }
+
     loop {
         let (stream, _) = listener.accept().await?;
-        let conn_id = next_conn;
-        next_conn += 1;
+        let conn_id = conn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!("conn {conn_id}: accepted");
         let st = state.clone();
+        let (read_half, write_half) = stream.into_split();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(st, conn_id, stream).await {
+            if let Err(e) = handle_conn(st, conn_id, read_half, write_half).await {
                 error!("conn {conn_id}: {e:#}");
             }
             info!("conn {conn_id}: closed");
@@ -1168,8 +1307,19 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn handle_conn(state: StateHandle, conn_id: u64, stream: UnixStream) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+/// Speak the JSON-RPC protocol over any framed reader + writer. The unix socket
+/// accept loop splits its `UnixStream` and calls this; a relay-dialed stream
+/// drives the exact same per-connection engine (see docs/RELAY.md).
+async fn handle_conn<R, W>(
+    state: StateHandle,
+    conn_id: u64,
+    read_half: R,
+    mut write_half: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, mut rx) = unbounded_channel::<String>();
     {
         let tx = tx.clone();
@@ -1292,6 +1442,66 @@ async fn handle_conn(state: StateHandle, conn_id: u64, stream: UnixStream) -> Re
         .await;
     writer_task.abort();
     Ok(())
+}
+
+/// Device side of the relay: keep a control connection to the broker registered
+/// as `spec.device`; for every `NewSession` the broker pushes, dial a fresh data
+/// connection and serve it through `handle_conn` — an incoming relay session is
+/// indistinguishable from an accepted unix connection. Backoff-reconnects the
+/// control channel, mirroring the SSH remote reconnect ticker. See docs/RELAY.md.
+async fn relay_dial_loop(
+    state: StateHandle,
+    spec: crate::config::RelaySpec,
+    conn_seq: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use crate::relay::{self, RelayMsg};
+    let Some(device) = spec.device.clone() else {
+        return;
+    };
+    let Some(secret) = spec.secret() else {
+        error!(
+            "relay: device `{device}` configured but {} is unset",
+            spec.secret_env
+        );
+        return;
+    };
+    let (addr, account) = (spec.url.clone(), spec.account.clone());
+    loop {
+        match relay::open_control(&addr, &account, &secret, &device).await {
+            Ok((mut r, mut w)) => {
+                info!("relay: registered as device `{device}` at {addr}");
+                loop {
+                    match relay::read_frame::<_, RelayMsg>(&mut r).await {
+                        Ok(Some(RelayMsg::NewSession { session })) => {
+                            let st = state.clone();
+                            let conn_id = conn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let (addr, account, secret) =
+                                (addr.clone(), account.clone(), secret.clone());
+                            tokio::spawn(async move {
+                                match relay::open_data(&addr, &account, &secret, session).await {
+                                    Ok((dr, dw)) => {
+                                        info!("relay: serving session {session} (conn {conn_id})");
+                                        if let Err(e) = handle_conn(st, conn_id, dr, dw).await {
+                                            warn!("relay session {session}: {e:#}");
+                                        }
+                                    }
+                                    Err(e) => warn!("relay: open_data {session}: {e:#}"),
+                                }
+                            });
+                        }
+                        Ok(Some(RelayMsg::Ping)) => {
+                            let _ = relay::write_frame(&mut w, &RelayMsg::Pong).await;
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break, // control channel dropped
+                    }
+                }
+                warn!("relay: control channel to {addr} dropped; reconnecting");
+            }
+            Err(e) => warn!("relay: connect {addr} failed: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Log a request without dumping payloads — Input carries keystrokes/pastes we
@@ -1617,14 +1827,15 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     let Some(tx) = st.conns.get(&conn_id).cloned() else {
                         return err("connection not registered");
                     };
+                    let smallest = st.attach_smallest;
                     let Some(p) = st.panes.get_mut(&pane) else {
                         return err(format!("no pane {pane}"));
                     };
                     let rows = rows.max(1);
                     let cols = cols.max(1);
                     p.subs.insert(conn_id, Sub { tx, rows, cols });
-                    // Max-of-subscribers size: small clients cannot shrink a large TUI.
-                    apply_max_attach_size(p);
+                    // Size to subscribers (largest by default, or smallest per config).
+                    apply_attach_size(p, smallest);
                     let scrollback = B64.encode(p.scrollback.make_contiguous());
                     ServerMsg::Attached { pane, scrollback }
                 })
@@ -1633,10 +1844,11 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         Request::Detach { pane } => {
             state
                 .with(move |st| {
+                    let smallest = st.attach_smallest;
                     if let Some(p) = st.panes.get_mut(&pane) {
                         p.subs.remove(&conn_id);
                         // Recompute size from remaining subscribers (if any).
-                        apply_max_attach_size(p);
+                        apply_attach_size(p, smallest);
                     }
                     ServerMsg::Done
                 })
@@ -1661,6 +1873,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         Request::Resize { pane, rows, cols } => {
             state
                 .with(move |st| {
+                    let smallest = st.attach_smallest;
                     let Some(p) = st.panes.get_mut(&pane) else {
                         return err(format!("no pane {pane}"));
                     };
@@ -1669,7 +1882,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     if let Some(sub) = p.subs.get_mut(&conn_id) {
                         sub.rows = rows;
                         sub.cols = cols;
-                        apply_max_attach_size(p);
+                        apply_attach_size(p, smallest);
                     } else {
                         // No active attach for this conn — apply size directly.
                         p.pty.resize(rows, cols);
@@ -1714,6 +1927,92 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 })
                 .await
         }
+        Request::ReportAgentState {
+            pane,
+            state: mut agent_state,
+        } => {
+            state
+                .with(move |st| {
+                    let Some(p) = st.panes.get_mut(&pane) else {
+                        return err(format!("no pane {pane}"));
+                    };
+                    // Keep an open question alive across intermediate awaiting-state
+                    // reports (a Notification firing mid-question would otherwise
+                    // clear it). It only clears when the agent moves on (Working/Done)
+                    // or a new prompt arrives.
+                    if agent_state.prompt.is_none()
+                        && matches!(
+                            agent_state.phase,
+                            AgentPhase::AwaitingInput | AgentPhase::AwaitingApproval
+                        )
+                    {
+                        if let Some(old) = p.info.agent_state.as_ref().and_then(|s| s.prompt.clone())
+                        {
+                            agent_state.prompt = Some(old);
+                        }
+                    }
+                    // Exact phase overrides the heuristic (freeze), like report-activity.
+                    let activity = agent_state.phase.activity();
+                    p.reported = Some(activity);
+                    let changed =
+                        p.info.status == PaneStatus::Running && p.info.activity != activity;
+                    if changed {
+                        p.info.activity = activity;
+                        p.info.activity_since = unix_now();
+                    }
+                    p.info.agent = Some(agent_state.agent.clone());
+                    p.info.agent_state = Some(agent_state.clone());
+                    broadcast(st, ServerMsg::AgentState { pane, state: agent_state });
+                    if changed {
+                        broadcast(st, ServerMsg::Activity { pane, activity });
+                    }
+                    broadcast_state(st);
+                    ServerMsg::Done
+                })
+                .await
+        }
+        Request::ResolveDecision {
+            pane,
+            request_id,
+            decision,
+        } => {
+            state
+                .with(move |st| match st.decisions.remove(&(pane, request_id.clone())) {
+                    Some(tx) => {
+                        let _ = tx.send(decision);
+                        ServerMsg::Done
+                    }
+                    None => err(format!("no pending approval `{request_id}` on pane {pane}")),
+                })
+                .await
+        }
+        Request::AwaitDecision { pane, request_id } => {
+            // Park a reply sink under the actor, then await OUTSIDE it so the
+            // actor is never blocked. Times out to Escalate so the agent's own
+            // in-pane prompt still works if nobody answers.
+            let key = (pane, request_id);
+            let key2 = key.clone();
+            let rx = state
+                .with(move |st| {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    st.decisions.insert(key2, tx);
+                    rx
+                })
+                .await;
+            let decision = match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await
+            {
+                Ok(Ok(d)) => d,
+                _ => {
+                    state
+                        .with(move |st| {
+                            st.decisions.remove(&key);
+                        })
+                        .await;
+                    Decision::Escalate
+                }
+            };
+            ServerMsg::Decided { decision }
+        }
         Request::Reload => {
             state
                 .with(move |st| {
@@ -1727,6 +2026,14 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     st.detect_osc133 = cfg.ui.detect_osc133;
                     st.detect_foreground = cfg.ui.detect_foreground;
                     st.agent_commands = cfg.ui.agent_commands.clone();
+                    st.attach_smallest =
+                        matches!(cfg.ui.attach_size, crate::config::AttachSize::Smallest);
+                    st.hooks = cfg.hooks.clone();
+                    // Re-apply sizing to every pane so a policy change takes effect now.
+                    let smallest = st.attach_smallest;
+                    for p in st.panes.values_mut() {
+                        apply_attach_size(p, smallest);
+                    }
                     info!("config reloaded; notifying {} clients", st.conns.len());
                     broadcast(st, ServerMsg::ConfigChanged);
                     ServerMsg::Done
@@ -1750,6 +2057,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 host: host.clone(),
                 args,
                 env,
+                relay: None,
             };
             let spec2 = spec.clone();
             // Under the actor: assign/refresh the origin; decide whether to dial.
@@ -1776,6 +2084,50 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                 })
                 .await;
             // Spawn the connector OUTSIDE the actor (it does ssh + I/O).
+            if let Some(origin) = dial {
+                spawn_remote_connect(state.clone(), origin, spec);
+            }
+            ServerMsg::Done
+        }
+        Request::ConnectRelay {
+            device,
+            url,
+            account,
+            secret,
+        } => {
+            let spec = RemoteSpecEnv {
+                host: device.clone(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                relay: Some(RelayTarget {
+                    url,
+                    account,
+                    secret,
+                }),
+            };
+            let spec2 = spec.clone();
+            let dial = state
+                .with(move |st| {
+                    let origin = match st.remote_origins.get(&device) {
+                        Some(o) => *o,
+                        None => {
+                            st.next_origin += 1;
+                            let o = st.next_origin;
+                            st.remote_origins.insert(device.clone(), o);
+                            o
+                        }
+                    };
+                    st.remote_specs.insert(origin, spec2);
+                    if st.remotes.contains_key(&origin) {
+                        return None;
+                    }
+                    if st.connecting.insert(origin) {
+                        Some(origin)
+                    } else {
+                        None
+                    }
+                })
+                .await;
             if let Some(origin) = dial {
                 spawn_remote_connect(state.clone(), origin, spec);
             }
@@ -1809,14 +2161,6 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
 /// it in, then pump its events until the link drops. Never stalls the main loop.
 fn spawn_remote_connect(state: StateHandle, origin: Origin, spec: RemoteSpecEnv) {
     tokio::spawn(async move {
-        let mut ssh_args = vec![
-            "-o".to_string(),
-            "ConnectTimeout=6".to_string(),
-            // Detached daemon can't answer a prompt — fail fast to agent/pubkey.
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-        ];
-        ssh_args.extend(spec.args.iter().cloned());
         info!("connect remote {} (origin {origin})", spec.host);
         async fn clear(state: &StateHandle, origin: Origin) {
             state
@@ -1825,14 +2169,36 @@ fn spawn_remote_connect(state: StateHandle, origin: Origin, spec: RemoteSpecEnv)
                 })
                 .await;
         }
-        let (client, events, child) =
+        // Relay transport dials the broker; SSH transport spawns `ssh … __proxy`.
+        // Both yield a `Client` + event stream feeding the same remote hub; only
+        // SSH has a child process to keep alive.
+        let (client, events, child) = if let Some(rt) = &spec.relay {
+            match crate::client::connect_via_relay(&rt.url, &rt.account, &rt.secret, &spec.host)
+                .await
+            {
+                Ok((c, ev)) => (c, ev, None),
+                Err(e) => {
+                    error!("connect relay {}: {e:#}", spec.host);
+                    return clear(&state, origin).await;
+                }
+            }
+        } else {
+            let mut ssh_args = vec![
+                "-o".to_string(),
+                "ConnectTimeout=6".to_string(),
+                // Detached daemon can't answer a prompt — fail fast to agent/pubkey.
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+            ];
+            ssh_args.extend(spec.args.iter().cloned());
             match crate::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
-                Ok(t) => t,
+                Ok((c, ev, ch)) => (c, ev, Some(ch)),
                 Err(e) => {
                     error!("connect remote {}: ssh failed: {e:#}", spec.host);
                     return clear(&state, origin).await;
                 }
-            };
+            }
+        };
         let client = Arc::new(client);
         let mut snap = match client.snapshot().await {
             Ok(s) => s,
@@ -2076,6 +2442,7 @@ fn spawn_pane_with_id(
         preview: String::new(),
         activity_since: unix_now(),
         git_branch: String::new(),
+        agent_state: None,
     };
     install_pane(
         state,
@@ -2139,7 +2506,8 @@ fn install_pane(
             resized_at: now,
             reported: None,
             last_prompt_scan: now,
-            prompt_cached: false,
+            scan_cached: Activity::Idle,
+            looks_like_agent: false,
             dirty: false,
             screen,
         },
@@ -2332,25 +2700,31 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                             p.last_output = std::time::Instant::now();
                             p.dirty = true;
                             p.screen.process(&bytes);
-                            // Throttle full-screen agent-prompt scans — Claude redraws
-                            // would otherwise peg the daemon under the lock.
+                            // Throttle the full-screen scan — Claude redraws would
+                            // otherwise peg the daemon under the lock. Classify with the
+                            // same rich matcher the quiet ticker uses (not a 3-phrase
+                            // subset) so "waiting on you" is caught immediately and both
+                            // paths agree. Also latch a sticky agent flag so a raw
+                            // `ssh host` running claude/codex is still treated as an agent.
                             if p.last_prompt_scan.elapsed() >= std::time::Duration::from_millis(250)
                             {
-                                let text = p.screen.screen().contents().to_lowercase();
-                                p.prompt_cached = text.contains("esc to cancel")
-                                    || text.contains("do you want to proceed")
-                                    || text.contains("tab to amend");
+                                let text = p.screen.screen().contents();
+                                if has_agent_marker(&text) {
+                                    p.looks_like_agent = true;
+                                }
+                                p.scan_cached = classify_tail(&effective_prog(p), &text);
                                 p.last_prompt_scan = std::time::Instant::now();
                             }
-                            let waiting_prompt = p.prompt_cached;
                             // Ignore repaint bursts after resize (view switch).
                             let repaint = p.resized_at.elapsed() < RESIZE_GRACE;
-                            let target = if waiting_prompt {
-                                Some(Activity::Waiting)
-                            } else if !repaint {
-                                Some(Activity::Working)
-                            } else {
-                                None
+                            // A "waiting on you" prompt wins even while the footer keeps
+                            // animating — otherwise continuous repaints pinned the pane on
+                            // Working. "esc to interrupt" is an explicit Working signal.
+                            let target = match p.scan_cached {
+                                Activity::Waiting => Some(Activity::Waiting),
+                                Activity::Working => Some(Activity::Working),
+                                _ if !repaint => Some(Activity::Working),
+                                _ => None,
                             };
                             // Detector owns this pane — don't let raw output override it.
                             let changed = match target {
@@ -2399,14 +2773,29 @@ async fn pump(state: StateHandle, id: u64, mut rx: UnboundedReceiver<SessionEven
                         } else {
                             None
                         };
-                        Some((changed, notify_title, osc_change, sub_txs))
+                        // Fire activity hooks for whichever transition happened (the
+                        // output heuristic or an OSC 133 report). Collected here, run
+                        // after the lock releases.
+                        let mut act_changes: Vec<(u64, Activity)> = Vec::new();
+                        if let Some(a) = changed {
+                            act_changes.push((id, a));
+                        }
+                        if let Some(a) = osc_change {
+                            act_changes.push((id, a));
+                        }
+                        let hook_fires = collect_hook_fires(&st.hooks, &st.panes, &act_changes);
+                        Some((changed, notify_title, osc_change, sub_txs, hook_fires))
                     })
                     .await;
-                let Some((changed, notify_waiting_title, osc_change, sub_txs)) = result else {
+                let Some((changed, notify_waiting_title, osc_change, sub_txs, hook_fires)) = result
+                else {
                     continue; // pane gone
                 };
                 for tx in &sub_txs {
                     let _ = tx.send(out_frame.clone());
+                }
+                for (run, pane, title, activity) in hook_fires {
+                    spawn_hook(&run, pane, &title, activity);
                 }
                 if changed.is_some() || osc_change.is_some() {
                     state
@@ -2754,5 +3143,27 @@ mod tests {
         assert!(!looks_like_input_prompt("Error: boom"));
         assert!(!looks_like_input_prompt("Compiling foo:"));
         assert!(!looks_like_input_prompt("https://x.com:"));
+    }
+
+    #[test]
+    fn agent_markers_latch_over_ssh() {
+        // A raw `ssh box` running claude shows an agent footer — we must recognize
+        // it so the pane (whose program is `ssh`) still classifies as an agent.
+        assert!(has_agent_marker("... esc to interrupt\n"));
+        assert!(has_agent_marker("Do you want to proceed?\n❯ 1. Yes"));
+        assert!(!has_agent_marker("just some log output\ncompiling..."));
+
+        // Latched agent + a quiet screen (no explicit marker) => "needs you",
+        // even though the command name is `ssh`. classify_tail keys off the
+        // effective program name, which effective_prog() maps to an agent.
+        assert_eq!(
+            classify_tail("claude", "here is my summary of the changes"),
+            Activity::Waiting
+        );
+        // Without the latch, the same quiet screen under `ssh` is just idle.
+        assert_eq!(
+            classify_tail("ssh", "here is my summary of the changes"),
+            Activity::Idle
+        );
     }
 }

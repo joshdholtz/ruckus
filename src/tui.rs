@@ -65,7 +65,13 @@ const PALETTE_ITEMS: &[(Action, &str)] = &[
         "disconnect remote (the space you're on)",
     ),
     (Action::Theme, "change theme (pick + live preview)"),
+    (
+        Action::ToggleMouse,
+        "toggle mouse (off = native select + local cmd-click over SSH)",
+    ),
     (Action::ToggleSidebar, "toggle sidebar"),
+    (Action::ApproveAgent, "approve agent request (focused pane)"),
+    (Action::DenyAgent, "deny agent request (focused pane)"),
     (Action::ShowHelp, "keyboard help"),
     (Action::Quit, "quit (daemon keeps running)"),
 ];
@@ -591,6 +597,9 @@ struct ThemePick {
 enum ChipAction {
     /// Bytes to type into the focused pane (usually includes trailing newline).
     Send(Vec<u8>),
+    /// Approve / deny the focused pane's pending agent approval (mobile tap).
+    ApproveAgent,
+    DenyAgent,
     Restart,
     Close,
     JumpWaiting,
@@ -800,6 +809,14 @@ fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// True when this ruckus is running inside an SSH session, so "open a URL"
+/// can't reach a local browser — the controlling terminal is on another machine.
+fn in_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
 }
 
 fn agg_activity<I: Iterator<Item = Activity>>(iter: I) -> Activity {
@@ -1359,6 +1376,36 @@ impl App {
         }
     }
 
+    /// Resolve the focused pane's pending agent approval (the sidebar
+    /// approve/deny). No-op with a hint if nothing is pending. Routes through the
+    /// hub, so this works on a relay/SSH-remote pane too.
+    async fn resolve_focused_agent(&mut self, decision: Decision) {
+        let pane = self.focused;
+        let pending = self
+            .snap
+            .pane(pane)
+            .and_then(|p| p.agent_state.as_ref())
+            .and_then(|s| s.pending.as_ref())
+            .map(|a| (a.request_id.clone(), a.title.clone()));
+        let Some((request_id, title)) = pending else {
+            self.toast("no agent request pending on this pane");
+            return;
+        };
+        let verb = match decision {
+            Decision::Allow => "approved",
+            Decision::Deny => "denied",
+            Decision::Escalate => "escalated",
+        };
+        self.notify(format!("{verb} {title}"));
+        let _ = self
+            .route(Request::ResolveDecision {
+                pane,
+                request_id,
+                decision,
+            })
+            .await;
+    }
+
     /// The client's live SSH env, handed to the daemon so its detached `ssh` can
     /// authenticate as the user (agent auth / hardware-key touch are agent-side).
     fn ssh_env() -> std::collections::BTreeMap<String, String> {
@@ -1619,6 +1666,16 @@ impl App {
         let Some((prog, args)) = argv.split_first() else {
             return;
         };
+        // Over SSH, `open`/`xdg-open` would run on the *remote* box — the wrong
+        // machine, usually with no browser at all. Copy the URL to the LOCAL
+        // terminal's clipboard (OSC 52 rides the SSH stream) so it's one ⌘V from
+        // the local browser instead of silently doing nothing.
+        if in_ssh() && matches!(prog.as_str(), "open" | "xdg-open" | "start") {
+            let url = args.last().map(String::as_str).unwrap_or(matched);
+            copy_to_clipboard(url);
+            self.notify(format!("🔗 copied (remote) — ⌘V to open: {matched}"));
+            return;
+        }
         let _ = std::process::Command::new(prog)
             .args(args)
             .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
@@ -1904,6 +1961,8 @@ impl App {
     async fn run_chip(&mut self, chip: ChipAction) {
         match chip {
             ChipAction::Send(bytes) => self.send_bytes(&bytes).await,
+            ChipAction::ApproveAgent => self.resolve_focused_agent(Decision::Allow).await,
+            ChipAction::DenyAgent => self.resolve_focused_agent(Decision::Deny).await,
             ChipAction::Restart => self.restart_action(self.focused).await,
             ChipAction::Close => self.close_pane_action(self.focused).await,
             ChipAction::JumpWaiting => self.do_action(Action::JumpWaiting).await,
@@ -2057,7 +2116,23 @@ impl App {
                     let _ = self.route(Request::DisconnectRemote { origin }).await;
                 }
             }
+            Action::ApproveAgent => self.resolve_focused_agent(Decision::Allow).await,
+            Action::DenyAgent => self.resolve_focused_agent(Decision::Deny).await,
             Action::Theme => self.open_theme_pick(),
+            Action::ToggleMouse => {
+                self.cfg.ui.mouse = !self.cfg.ui.mouse;
+                let mut out = std::io::stdout();
+                if self.cfg.ui.mouse {
+                    let _ = crossterm::execute!(out, EnableMouseCapture);
+                    self.toast("🖱 mouse on — ruckus handles clicks");
+                } else {
+                    let _ = crossterm::execute!(out, DisableMouseCapture);
+                    // Drop any in-flight ruckus selection so the terminal owns the mouse.
+                    self.select = None;
+                    self.selecting = false;
+                    self.toast("🖱 mouse off — native drag-select, ⌘-click opens locally");
+                }
+            }
         }
     }
 
@@ -3391,10 +3466,12 @@ impl App {
                 false,
             ),
         };
-        let bytes = if mode != vt100::MouseProtocolMode::None {
+        let bytes = if altscreen && mode != vt100::MouseProtocolMode::None {
+            // Full-screen app that grabbed the mouse (vim, htop): forward the wheel
+            // so the app scrolls its own viewport.
             Some(encode_mouse_wheel(up, ccol, crow, enc))
         } else if altscreen {
-            // Alternate-scroll: most terminals send arrow keys here.
+            // Full-screen app without mouse: alternate-scroll sends arrow keys.
             let seq: &[u8] = match (up, appcursor) {
                 (true, true) => b"\x1bOA",
                 (true, false) => b"\x1b[A",
@@ -3403,6 +3480,10 @@ impl App {
             };
             Some(seq.repeat(3))
         } else {
+            // Main screen (shells, Claude Code, Codex, an ssh'd agent): the wheel
+            // scrolls OUR pane scrollback so history is visible — even if the app
+            // enabled mouse reporting. A normal terminal treats wheel-on-main-screen
+            // this way too; forwarding it to the app is what ate the scrollback.
             None
         };
         match bytes {
@@ -3479,6 +3560,24 @@ impl App {
                 if pane == self.focused {
                     self.seen.insert(pane);
                 } else {
+                    self.unread.insert(pane);
+                }
+            }
+            ServerMsg::AgentState { pane, state } => {
+                let phase = state.phase;
+                if let Some(p) = self.snap.pane_mut(pane) {
+                    p.activity = phase.activity();
+                    p.agent = Some(state.agent.clone());
+                    p.agent_state = Some(state);
+                }
+                self.flash.insert(pane, Instant::now());
+                // A remote/unfocused pane asking for approval or input is notable.
+                if pane != self.focused
+                    && matches!(
+                        phase,
+                        AgentPhase::AwaitingApproval | AgentPhase::AwaitingInput | AgentPhase::Done
+                    )
+                {
                     self.unread.insert(pane);
                 }
             }
@@ -3922,7 +4021,18 @@ impl App {
     }
 
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
-        let sections = self.cfg.ui.sidebar_sections.clone();
+        let mut sections = self.cfg.ui.sidebar_sections.clone();
+        // Auto-surface the NEEDS-YOU queue when an agent is blocked on an approval,
+        // even if the user hasn't added it to sidebar_sections — so approvals are
+        // never hidden behind config.
+        let approval_pending = self
+            .snap
+            .panes
+            .iter()
+            .any(|p| p.agent_state.as_ref().is_some_and(|s| s.pending.is_some()));
+        if approval_pending && !sections.iter().any(|s| s == "needs_you") {
+            sections.insert(0, "needs_you".to_string());
+        }
         let split = self.cfg.ui.sidebar_split;
         self.sidebar_rows.clear();
         self.sidebar_buttons.clear();
@@ -4071,6 +4181,31 @@ impl App {
                         let pad = w.saturating_sub(spans_width(&spans));
                         spans.push(Span::styled(" ".repeat(pad), row_style));
                         push!(Line::from(spans), Some(Target::Pane(id)));
+                        // Per-agent adapter: if this pane is blocked on an approval,
+                        // show what it wants + how to answer (⌥y/⌥r by default).
+                        if let Some(appr) = self
+                            .snap
+                            .pane(id)
+                            .and_then(|p| p.agent_state.as_ref())
+                            .and_then(|s| s.pending.as_ref())
+                        {
+                            let cap = w.saturating_sub(6).max(8);
+                            let title: String = appr.title.chars().take(cap).collect();
+                            push!(
+                                Line::from(Span::styled(
+                                    format!("   ⚠ {title}"),
+                                    Style::default().fg(th.accent).bg(th.sidebar_bg),
+                                )),
+                                Some(Target::Pane(id))
+                            );
+                            push!(
+                                Line::from(Span::styled(
+                                    "     ⌥y approve · ⌥r deny".to_string(),
+                                    Style::default().fg(th.bar_fg).bg(th.sidebar_bg),
+                                )),
+                                None::<Target>
+                            );
+                        }
                     }
                     push!(Line::raw(""), None::<Target>);
                 }
@@ -5398,6 +5533,24 @@ impl App {
         let th = self.cfg.theme.clone();
         // label → chip action
         let chips: Vec<(&str, ChipAction)> = match kind {
+            // When the focused pane is blocked on an agent approval, offer
+            // approve/deny taps that resolve it (works on relay/remote panes too);
+            // otherwise the normal y/n/enter reply chips.
+            "waiting"
+                if self
+                    .snap
+                    .pane(self.focused)
+                    .and_then(|p| p.agent_state.as_ref())
+                    .and_then(|s| s.pending.as_ref())
+                    .is_some() =>
+            {
+                vec![
+                    ("approve", ChipAction::ApproveAgent),
+                    ("deny", ChipAction::DenyAgent),
+                    ("type…", ChipAction::Reply),
+                    ("next", ChipAction::JumpWaiting),
+                ]
+            }
             "waiting" => vec![
                 ("y", ChipAction::Send(b"y\n".to_vec())),
                 ("n", ChipAction::Send(b"n\n".to_vec())),
@@ -5829,6 +5982,69 @@ impl App {
             for cc in cs..=ce.min(last_col) {
                 if let Some(cell) = buf.cell_mut((c.x + cc, c.y + r)) {
                     cell.set_bg(bg);
+                }
+            }
+        }
+    }
+
+    /// Decorate matched links (regex rules + OSC 8 hyperlinks) so they read as
+    /// links. Mirrors `link_at`'s matching exactly — same regex rules, same
+    /// hyperlink cells, same live-screen-only scope — so what's underlined is
+    /// precisely what a click will open.
+    fn draw_links(&self, f: &mut Frame) {
+        let style = self.cfg.ui.link_style;
+        if style == crate::config::LinkStyle::None {
+            return;
+        }
+        let mut link_style = Style::default();
+        if style.underline() {
+            link_style = link_style.add_modifier(Modifier::UNDERLINED);
+        }
+        if style.accent() {
+            link_style = link_style.fg(self.cfg.theme.accent);
+        }
+        for (pid, rect) in &self.pane_rects {
+            let c = self.pane_content_rect(*rect);
+            if c.width == 0 || c.height == 0 {
+                continue;
+            }
+            let Some(view) = self.views.get(pid) else {
+                continue;
+            };
+            // Only the live screen is matched — link_at ignores scrollback too,
+            // so decorating a scrolled-back view would disagree with clicks.
+            if view.scroll != 0 {
+                continue;
+            }
+            let screen = view.parser.screen();
+            let contents = screen.contents();
+            let rows: Vec<&str> = contents.lines().collect();
+            let buf = f.buffer_mut();
+            for r in 0..c.height {
+                // Char-column ranges matched by the regex link rules on this row.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                if let Some(line) = rows.get(r as usize) {
+                    for rule in &self.cfg.links {
+                        for m in rule.pattern.find_iter(line) {
+                            let start = line[..m.start()].chars().count();
+                            let end = start + m.as_str().chars().count();
+                            ranges.push((start, end));
+                        }
+                    }
+                }
+                for col in 0..c.width {
+                    let osc8 = screen
+                        .cell(r, col)
+                        .and_then(|cell| cell.hyperlink())
+                        .is_some();
+                    let matched =
+                        ranges.iter().any(|&(s, e)| (col as usize) >= s && (col as usize) < e);
+                    if !(osc8 || matched) {
+                        continue;
+                    }
+                    if let Some(cell) = buf.cell_mut((c.x + col, c.y + r)) {
+                        cell.set_style(link_style);
+                    }
                 }
             }
         }
@@ -6270,6 +6486,7 @@ impl App {
             }
         }
         self.draw_panes(f);
+        self.draw_links(f);
         self.draw_dividers(f);
         self.draw_selection(f);
         if let Some(r) = self.frame.action {
@@ -6300,6 +6517,36 @@ impl App {
         self.draw_prefix_indicator(f);
         self.draw_toast(f);
         self.draw_popup(f);
+    }
+}
+
+/// True while a `guarded_draw` is in flight, so the panic hook recovers a
+/// transient render panic (a resize race from a mobile SSH client backgrounding)
+/// instead of tearing the terminal down.
+static RENDER_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw one frame, swallowing a panic from inside the render so a single bad
+/// frame — e.g. a rect that briefly exceeds the buffer mid-resize — can't kill
+/// the session. Nothing is flushed on panic (ratatui flushes after the closure),
+/// so the next frame redraws cleanly at the settled size. The panic is logged to
+/// `~/.ruckus/client.log` for root-causing.
+fn guarded_draw(
+    terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    RENDER_GUARD.store(true, Ordering::Relaxed);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        terminal.draw(|f| app.draw(f)).map(|_| ())
+    }));
+    RENDER_GUARD.store(false, Ordering::Relaxed);
+    // On a recovered panic, force a full repaint next frame so no stale cells linger.
+    match out {
+        Ok(res) => res,
+        Err(_) => {
+            let _ = terminal.clear();
+            Ok(())
+        }
     }
 }
 
@@ -6444,6 +6691,14 @@ pub async fn run(initial: Option<String>) -> Result<()> {
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a guarded draw is a transient render glitch (mobile
+        // resize race) — log it and let catch_unwind recover; DON'T tear the
+        // terminal down or we'd drop out of the alt screen mid-session.
+        if RENDER_GUARD.load(std::sync::atomic::Ordering::Relaxed) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            tracing::error!("recovered render panic: {info}\n{bt}");
+            return;
+        }
         let _ = disable_raw_mode();
         // Restore ALL modes we set (incl. bracketed paste) so a crash never leaves
         // the terminal unable to paste/select/click.
@@ -6491,7 +6746,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
     app.refresh_status_cmds().await; // populate #(command) segments up front
     app.refresh_pane_status_cmds().await;
     while app.running {
-        terminal.draw(|f| app.draw(f))?;
+        guarded_draw(&mut terminal, &mut app)?;
         tokio::select! {
             ev = in_rx.recv() => match ev {
                 Some(e) => app.on_term_event(e).await,
@@ -6504,7 +6759,7 @@ pub async fn run(initial: Option<String>) -> Result<()> {
                     // reattach instead of exiting. Panes persist across daemon
                     // restarts under the same ids, so the view comes right back.
                     app.toast("reconnecting…");
-                    terminal.draw(|f| app.draw(f))?;
+                    guarded_draw(&mut terminal, &mut app)?;
                     if !reconnect(&mut app, &mut in_rx, &mev_tx).await {
                         app.running = false;
                     }
@@ -6740,6 +6995,7 @@ mod palette_tests {
             preview: String::new(),
             activity_since: 0,
             git_branch: String::new(),
+            agent_state: None,
         }
     }
     fn tab(id: u64, name: &str, pane_id: u64) -> TabInfo {
