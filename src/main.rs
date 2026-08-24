@@ -606,12 +606,31 @@ fn brief_prompt(space: &str, dash_path: &str) -> String {
    Sections (omit any with no data): a Snapshot row of stat tiles; "🔴 Alerts";
    "📥 Inbox"; "📧 Outreach — people to email"; "🛠 Prepared" (Linear tasks).
 
-   The "📧 Outreach" section is the priority — three groups, each a list of people
-   (name/email if available, a one-line why, and a suggested angle):
+   The "📧 Outreach" section is the priority — three groups of people to email:
      • New / first-timers — did their first event recently → welcome / onboard.
      • Could convert — active & engaged but NOT on a paid plan → nudge to subscribe.
      • Churn risk / churned — dropped off or trending down → win-back.
-   This is READ-ONLY: identify and suggest; do NOT send or draft-send anything.
+   For each person: name/email if available, a one-line why, and a suggested angle.
+
+   STAGE these in Linear so they're trackable (this is allowed — filing tasks is
+   "prepare", not "ship"): in the MGM team, use or create a project called
+   "Outreach". For each person not already tracked — FIRST search that project's
+   open issues and skip anyone already there (match by name/email) — create one
+   issue titled "Email <name> — <bucket>", description = the why + suggested angle,
+   with a label for the bucket (new / convert / churn). Cap at the top ~5 per
+   bucket per run so it never spams. The dashboard's Outreach section then reflects
+   these staged issues (note they're filed in Linear).
+
+   More broadly: EVERY actionable item on the dashboard should be its own Linear
+   task in the MGM team's "Outreach" project (or a sibling project if clearer) —
+   each alert to fix (label "alert"), each email that needs a reply (label
+   "reply"), and each outreach person (label "new"/"convert"/"churn"). One task
+   per item. File them idempotently (search first, skip anything already tracked,
+   cap ~5 per category per run so it never spams). The dashboard is a VIEW over
+   these tasks — show each item and note it's filed in Linear.
+
+   Creating/updating Linear tasks is the ONLY write allowed. Do NOT send any email
+   or take any other external action.
 
    Keep it scannable on a phone.
 
