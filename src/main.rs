@@ -575,6 +575,10 @@ fn parse_dur(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
+/// Read-only capability for headless briefings: the data connectors + file
+/// read/write only. No Bash → no shell egress, so it can prepare but never ship.
+const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,Read,Write,Glob,Grep";
+
 fn brief_prompt(space: &str, dash_path: &str) -> String {
     format!(
         r#"You are the ops briefing agent for the "{space}" space in ruckus. Your job is strictly READ-ONLY: gather current status and write ONE dashboard file. Do NOT send email, modify data, push code, merge, deploy, or take any action with an external effect. Only read, and write the single dashboard file below.
@@ -628,18 +632,35 @@ async fn brief(space_query: String, every: Option<String>) -> Result<()> {
         // Scheduled: run headless (claude -p), exits each time, no tab pile-up.
         Some(spec) => {
             let dur = parse_dur(&spec)?;
+            let lock = dir.join(format!("{slug}.lock"));
             println!("briefing '{space_name}' every {spec} → {}", dash_path.display());
             loop {
-                let status = tokio::process::Command::new("claude")
-                    .arg("-p")
-                    .arg(&prompt)
-                    .arg("--permission-mode")
-                    .arg("acceptEdits")
-                    .status()
-                    .await;
-                match status {
-                    Ok(s) => println!("  briefed ({s})"),
-                    Err(e) => eprintln!("  brief failed: {e}"),
+                // Per-space lock: never let two briefings clobber the same
+                // dashboard. A lock older than 20m is treated as stale.
+                let busy = std::fs::metadata(&lock)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|e| e < std::time::Duration::from_secs(1200))
+                    .unwrap_or(false);
+                if busy {
+                    println!("  skip: a briefing for '{space_name}' is already running");
+                } else {
+                    let _ = std::fs::write(&lock, std::process::id().to_string());
+                    // Read-only capability: the data connectors + Read/Write only —
+                    // NO Bash / no egress, so it can prepare but never ship.
+                    let status = tokio::process::Command::new("claude")
+                        .arg("-p")
+                        .arg(&prompt)
+                        .arg("--allowedTools")
+                        .arg(BRIEF_TOOLS)
+                        .status()
+                        .await;
+                    let _ = std::fs::remove_file(&lock);
+                    match status {
+                        Ok(s) => println!("  briefed ({s})"),
+                        Err(e) => eprintln!("  brief failed: {e}"),
+                    }
                 }
                 tokio::time::sleep(dur).await;
             }
