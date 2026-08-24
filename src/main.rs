@@ -577,14 +577,15 @@ fn parse_dur(s: &str) -> Result<std::time::Duration> {
 
 /// Read-only capability for headless briefings: the data connectors + file
 /// read/write only. No Bash → no shell egress, so it can prepare but never ship.
-const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,mcp__fastmail,mcp__sentry,mcp__grafana,mcp__mgm,Read,Write,Glob,Grep";
+const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,mcp__claude_ai_Cooked_Books,mcp__fastmail,mcp__sentry,mcp__grafana,mcp__mgm,mcp__revenuecat,mcp__stripe,Read,Write,Glob,Grep";
 
 fn brief_prompt(space: &str, dash_path: &str) -> String {
     format!(
         r#"You are the ops briefing agent for the "{space}" space in ruckus. Your job is strictly READ-ONLY: gather current status and write ONE dashboard file. Do NOT send email, modify data, push code, merge, deploy, or take any action with an external effect. Only read, and write the single dashboard file below.
 
 1. Gather what you can from the available MCP connectors/tools; skip any that aren't connected, don't block:
-   - MGM (Mostly Good Metrics): headline metrics, funnels, retention, recent signups, churn-risk users.
+   - MGM (Mostly Good Metrics): headline metrics, funnels, retention, and per-user signals — who did their FIRST event recently, who's active/engaged, and who's gone quiet / dropped off (with name/email when available).
+   - Billing/subscription (Cooked Books, RevenueCat, or Stripe if connected): who is on a paid plan vs. free — used to spot convertible users. If none is connected, infer "could convert" from high engagement and note the assumption.
    - Linear: open/assigned issues relevant to this project.
    - Sentry: recent or spiking errors (if connected).
    - Email (Fastmail or Gmail — whichever MCP is connected): triage the inbox — which need a reply vs. safe to archive.
@@ -603,7 +604,15 @@ fn brief_prompt(space: &str, dash_path: &str) -> String {
    .grid.two; h1/h2; and a trailing <div class="updated"> with the current time.
 
    Sections (omit any with no data): a Snapshot row of stat tiles; "🔴 Alerts";
-   "📥 Inbox"; "📈 Retention" (churn-risk + new signups); "🛠 Prepared" (Linear tasks).
+   "📥 Inbox"; "📧 Outreach — people to email"; "🛠 Prepared" (Linear tasks).
+
+   The "📧 Outreach" section is the priority — three groups, each a list of people
+   (name/email if available, a one-line why, and a suggested angle):
+     • New / first-timers — did their first event recently → welcome / onboard.
+     • Could convert — active & engaged but NOT on a paid plan → nudge to subscribe.
+     • Churn risk / churned — dropped off or trending down → win-back.
+   This is READ-ONLY: identify and suggest; do NOT send or draft-send anything.
+
    Keep it scannable on a phone.
 
 3. Do NOT ship anything. When the file is written, report a one-line summary and stop."#
