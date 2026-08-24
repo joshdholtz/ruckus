@@ -577,7 +577,7 @@ fn parse_dur(s: &str) -> Result<std::time::Duration> {
 
 /// Read-only capability for headless briefings: the data connectors + file
 /// read/write only. No Bash → no shell egress, so it can prepare but never ship.
-const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,Read,Write,Glob,Grep";
+const BRIEF_TOOLS: &str = "mcp__claude_ai_MGM,mcp__claude_ai_Linear,mcp__claude_ai_Sentry,mcp__claude_ai_Gmail,mcp__fastmail,mcp__sentry,mcp__grafana,mcp__mgm,Read,Write,Glob,Grep";
 
 fn brief_prompt(space: &str, dash_path: &str) -> String {
     format!(
@@ -587,7 +587,7 @@ fn brief_prompt(space: &str, dash_path: &str) -> String {
    - MGM (Mostly Good Metrics): headline metrics, funnels, retention, recent signups, churn-risk users.
    - Linear: open/assigned issues relevant to this project.
    - Sentry: recent or spiking errors (if connected).
-   - Gmail: triage the inbox — which need a reply vs. safe to archive (if connected).
+   - Email (Fastmail or Gmail — whichever MCP is connected): triage the inbox — which need a reply vs. safe to archive.
    - Grafana: current alerts/anomalies (only if you have API access).
 
 2. Write an HTML dashboard to EXACTLY this path, overwriting it:
@@ -622,6 +622,15 @@ async fn brief(space_query: String, every: Option<String>) -> Result<()> {
         .find(|s| s.id.to_string() == space_query || s.name.to_lowercase().contains(&q))
         .ok_or_else(|| anyhow::anyhow!("no space matching '{space_query}'"))?;
     let (space_id, space_name) = (sp.id, sp.name.clone());
+    // Run from the space's own directory so claude picks up that project's
+    // MCP servers (e.g. a project-scoped `fastmail`) + its .env, not just the
+    // global connectors. This is why briefings must run in-directory.
+    let space_cwd = sp
+        .tabs
+        .iter()
+        .filter_map(|t| snap.panes.iter().find(|p| p.id == t.active_pane))
+        .map(|p| p.cwd.clone())
+        .find(|c| !c.is_empty());
     let slug = dash_slug(&space_name);
     let dir = ruckus_dir().join("dashboards");
     std::fs::create_dir_all(&dir).ok();
@@ -649,13 +658,15 @@ async fn brief(space_query: String, every: Option<String>) -> Result<()> {
                     let _ = std::fs::write(&lock, std::process::id().to_string());
                     // Read-only capability: the data connectors + Read/Write only —
                     // NO Bash / no egress, so it can prepare but never ship.
-                    let status = tokio::process::Command::new("claude")
-                        .arg("-p")
+                    let mut cmd = tokio::process::Command::new("claude");
+                    cmd.arg("-p")
                         .arg(&prompt)
                         .arg("--allowedTools")
-                        .arg(BRIEF_TOOLS)
-                        .status()
-                        .await;
+                        .arg(BRIEF_TOOLS);
+                    if let Some(d) = &space_cwd {
+                        cmd.current_dir(d);
+                    }
+                    let status = cmd.status().await;
                     let _ = std::fs::remove_file(&lock);
                     match status {
                         Ok(s) => println!("  briefed ({s})"),
@@ -673,7 +684,7 @@ async fn brief(space_query: String, every: Option<String>) -> Result<()> {
                     space: space_id,
                     name: Some("brief".into()),
                     cmd: vec!["claude".into(), prompt],
-                    cwd: None,
+                    cwd: space_cwd.clone(),
                 })
                 .await?;
             println!("briefing agent started in '{space_name}' → will write {}", dash_path.display());
