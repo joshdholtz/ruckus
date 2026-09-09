@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 pub const SCROLLBACK_MAX: usize = 2 * 1024 * 1024;
 
+/// Wire-protocol version. v1 is frozen: existing request/response shapes only
+/// change additively (new variants, new optional fields). Anything that would
+/// break an existing client bumps this.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub fn ruckus_dir() -> PathBuf {
     let dir = match std::env::var("RUCKUS_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -20,6 +25,13 @@ pub fn socket_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Optional handshake: ask the daemon what protocol it speaks. Replies
+    /// `HelloOk`. A pre-v1 daemon replies `Error` (unknown request) — treat
+    /// that as "version 0".
+    Hello {
+        #[serde(default)]
+        version: u32,
+    },
     Snapshot,
     NewSpace {
         name: Option<String>,
@@ -140,6 +152,11 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// Handshake reply: the daemon's protocol version and package version.
+    HelloOk {
+        version: u32,
+        daemon_version: String,
+    },
     State {
         snapshot: Snapshot,
     },
@@ -643,5 +660,24 @@ mod tests {
             Node::Split { weights, .. } => assert!(weights.is_empty()),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn hello_handshake_round_trips() {
+        // version defaults to 0 when omitted (older v1 clients)
+        let req: Request = serde_json::from_str(r#"{"type":"hello"}"#).unwrap();
+        assert!(matches!(req, Request::Hello { version: 0 }));
+
+        let req: Request = serde_json::from_str(r#"{"type":"hello","version":1}"#).unwrap();
+        assert!(matches!(req, Request::Hello { version: 1 }));
+
+        let msg = ServerMsg::HelloOk {
+            version: PROTOCOL_VERSION,
+            daemon_version: "0.3.2".into(),
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""type":"hello_ok""#));
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ServerMsg::HelloOk { version, .. } if version == PROTOCOL_VERSION));
     }
 }

@@ -87,7 +87,10 @@ pub fn prefix_servermsg(msg: &mut ServerMsg, origin: Origin) {
             g(tab);
             g(pane);
         }
-        ServerMsg::Done | ServerMsg::Error { .. } | ServerMsg::ConfigChanged => {}
+        ServerMsg::Done
+        | ServerMsg::Error { .. }
+        | ServerMsg::ConfigChanged
+        | ServerMsg::HelloOk { .. } => {}
     }
 }
 
@@ -139,7 +142,8 @@ pub fn route_request(req: &mut Request) -> Origin {
         Request::Resize { pane, .. } => strip1(pane),
         Request::ReportActivity { pane, .. } => strip1(pane),
         Request::ReportAgent { pane, .. } => strip1(pane),
-        Request::Snapshot
+        Request::Hello { .. }
+        | Request::Snapshot
         | Request::NewSpace { .. }
         | Request::Reload
         | Request::Upgrade

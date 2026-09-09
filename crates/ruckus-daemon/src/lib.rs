@@ -1464,6 +1464,15 @@ fn err(message: impl Into<String>) -> ServerMsg {
 
 async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> ServerMsg {
     match req {
+        Request::Hello { version } => {
+            if version > PROTOCOL_VERSION {
+                info!("conn {conn_id}: client speaks protocol v{version}, daemon is v{PROTOCOL_VERSION}");
+            }
+            ServerMsg::HelloOk {
+                version: PROTOCOL_VERSION,
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            }
+        }
         Request::Snapshot => {
             state
                 .with(|st| ServerMsg::State {

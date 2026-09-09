@@ -21,6 +21,7 @@ Daemon → client:
 
 | type | fields | response msg |
 |---|---|---|
+| `hello` | `version?` | `hello_ok` (`version`, `daemon_version`) — optional handshake; a pre-v1 daemon replies `error`, treat as version 0 |
 | `snapshot` | — | `state` (full tree + pane infos) |
 | `new_space` | `name?`, `cwd?` | `created` |
 | `new_tab` | `space`, `name?`, `cmd: []`, `cwd?` | `created` |
@@ -186,4 +187,9 @@ rpc(s, 1, {"type": "report_activity", "pane": 4, "state": "waiting"})
 
 ## Stability
 
-v0: shapes may change until 1.0; the `type` discriminant scheme and framing will not.
+**v1 (frozen).** `hello` reports the daemon's protocol version. The contract:
+
+- Existing request and message shapes only change **additively**: new request/message `type`s, new *optional* fields (with serde defaults). Clients must ignore fields and message types they don't recognize.
+- Anything that would break an existing client — removing/renaming a field, changing a type or the framing — bumps `PROTOCOL_VERSION`.
+- An unknown request `type` gets an `error` reply; the connection stays usable.
+- Clients that care about compatibility send `hello` first and compare versions; an `error` reply means a pre-v1 daemon (version 0). Note: a pre-v1 daemon can't parse the frame at all, so its `error` carries no `seq` — match it by position, not seq.
