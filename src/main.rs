@@ -1,11 +1,6 @@
-mod client;
-mod config;
-mod daemon;
-mod layout;
-mod protocol;
-mod remote;
-mod render;
-mod tui;
+use ruckus_core::{client, config, protocol};
+use ruckus_daemon as daemon;
+use ruckus_tui::tui;
 
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -963,7 +958,7 @@ async fn tail(target: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::parse_plugin_ref;
+    use ruckus_core::config::parse_plugin_ref;
 
     #[test]
     fn plugin_ref_parses_owner_repo_and_subpath() {

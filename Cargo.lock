@@ -811,9 +811,29 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
+ "ruckus-core",
+ "ruckus-daemon",
+ "ruckus-tui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ruckus-core"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "crossterm",
  "dirs",
  "libc",
- "portable-pty",
  "ratatui",
  "regex",
  "serde",
@@ -823,6 +843,49 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ruckus-daemon"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "dirs",
+ "libc",
+ "portable-pty",
+ "regex",
+ "ruckus-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vt100",
+]
+
+[[package]]
+name = "ruckus-tui"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "regex",
+ "ruckus-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
  "vt100",
 ]
 

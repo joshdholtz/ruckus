@@ -21,16 +21,16 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use crate::client::{connect, ensure_daemon, resolve_pane, Client};
-use crate::config::{
+use ruckus_core::client::{connect, ensure_daemon, resolve_pane, Client};
+use ruckus_core::config::{
     normalize_key, Action, BarPos, CommandBind, Config, FooterMode, LinkClick, Placement,
     SidebarPos, Theme, ToastPos, WorkingStyle,
 };
-use crate::layout::{
+use ruckus_core::layout::{
     area_at_path, find_border, node_at_path_mut, node_dividers, node_rects, split_chunks,
 };
-use crate::protocol::*;
-use crate::remote;
+use ruckus_core::protocol::*;
+use ruckus_core::remote;
 use crate::render::{encode_key, encode_mouse_wheel, is_light, screen_to_lines};
 
 /// Below this width the footer switches to compact tap-first chips.
@@ -215,7 +215,7 @@ fn spawn_popup(
     use anyhow::anyhow;
     use std::io::Read;
     let cmdline = if cmd.is_empty() {
-        vec![crate::protocol::default_shell()]
+        vec![ruckus_core::protocol::default_shell()]
     } else {
         cmd
     };
@@ -230,11 +230,11 @@ fn spawn_popup(
     builder.env("TERM", "xterm-256color");
     builder.env(
         "RUCKUS_SOCK",
-        crate::protocol::socket_path().display().to_string(),
+        ruckus_core::protocol::socket_path().display().to_string(),
     );
     builder.env(
         "RUCKUS_DIR",
-        crate::protocol::ruckus_dir().display().to_string(),
+        ruckus_core::protocol::ruckus_dir().display().to_string(),
     );
     builder.cwd(&cwd);
     let child = pair
@@ -1453,7 +1453,7 @@ impl App {
     /// (comment-preserving, like `ruckus config`).
     fn persist_sidebar_width(&self) {
         let Some(w) = self.sidebar_w else { return };
-        let path = crate::config::ensure_config_file();
+        let path = ruckus_core::config::ensure_config_file();
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
         };
@@ -1622,8 +1622,8 @@ impl App {
         let _ = std::process::Command::new(prog)
             .args(args)
             .current_dir(self.seed_cwd(self.focused)) // so `gh` etc. see the right repo
-            .env("RUCKUS_SOCK", crate::protocol::socket_path())
-            .env("RUCKUS_DIR", crate::protocol::ruckus_dir())
+            .env("RUCKUS_SOCK", ruckus_core::protocol::socket_path())
+            .env("RUCKUS_DIR", ruckus_core::protocol::ruckus_dir())
             .env("RUCKUS_MATCH", matched)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -2068,13 +2068,13 @@ impl App {
     /// Open the theme picker: built-ins + user themes, cursor on the active theme,
     /// remembering the live palette so Esc can revert.
     fn open_theme_pick(&mut self) {
-        let mut names: Vec<String> = crate::config::THEME_NAMES
+        let mut names: Vec<String> = ruckus_core::config::THEME_NAMES
             .iter()
             .map(|s| s.to_string())
             .collect();
-        names.extend(crate::config::list_user_themes());
+        names.extend(ruckus_core::config::list_user_themes());
         // Current preset from config.toml so the cursor lands on the active theme.
-        let current = std::fs::read_to_string(crate::config::ensure_config_file())
+        let current = std::fs::read_to_string(ruckus_core::config::ensure_config_file())
             .ok()
             .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
             .and_then(|d| {
@@ -2098,7 +2098,7 @@ impl App {
     fn preview_theme(&mut self) {
         let Some(tp) = &self.theme_pick else { return };
         if let Some(name) = tp.names.get(tp.sel) {
-            if let Some(t) = crate::config::resolve_theme(name) {
+            if let Some(t) = ruckus_core::config::resolve_theme(name) {
                 self.cfg.theme = t;
             }
         }
@@ -2123,10 +2123,10 @@ impl App {
         let Some(name) = tp.names.get(tp.sel).cloned() else {
             return;
         };
-        if let Some(t) = crate::config::resolve_theme(&name) {
+        if let Some(t) = ruckus_core::config::resolve_theme(&name) {
             self.cfg.theme = t;
         }
-        let path = crate::config::ensure_config_file();
+        let path = ruckus_core::config::ensure_config_file();
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() {
                 if !doc.contains_key("theme") {
@@ -3495,7 +3495,7 @@ impl App {
         self.cfg = Config::load();
         // Pick up any newly-declared plugins (cheap when all are already present).
         if !self.cfg.plugins.is_empty()
-            && !crate::config::ensure_declared(&self.cfg.plugins).is_empty()
+            && !ruckus_core::config::ensure_declared(&self.cfg.plugins).is_empty()
         {
             self.cfg = Config::load();
         }
@@ -3509,7 +3509,7 @@ impl App {
         }
         // Pick up newly config-declared remotes — ask the daemon to connect them
         // (already-connected hosts are a no-op on the daemon side).
-        let specs: Vec<crate::config::RemoteSpec> = self.cfg.remotes.clone();
+        let specs: Vec<ruckus_core::config::RemoteSpec> = self.cfg.remotes.clone();
         for spec in specs {
             self.connect_remote(spec.host, spec.args).await;
         }
@@ -5050,7 +5050,7 @@ impl App {
                     && content.height >= 1
                     && screen.contents().trim().is_empty()
                     && info
-                        .map(|i| crate::protocol::unix_now().saturating_sub(i.created) < 20)
+                        .map(|i| ruckus_core::protocol::unix_now().saturating_sub(i.created) < 20)
                         .unwrap_or(false);
                 if starting {
                     let cmd = info
@@ -6037,7 +6037,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (i, name) in tp.names.iter().enumerate() {
             let selected = i == tp.sel;
-            let sw = crate::config::resolve_theme(name).unwrap_or_default();
+            let sw = ruckus_core::config::resolve_theme(name).unwrap_or_default();
             let mut spans = vec![
                 Span::styled(
                     if selected { " › " } else { "   " },
@@ -6304,13 +6304,13 @@ impl App {
 }
 
 pub async fn run(initial: Option<String>) -> Result<()> {
-    crate::client::init_client_log();
+    ruckus_core::client::init_client_log();
     tracing::info!("ruckus tui starting");
     ensure_daemon().await?;
     let mut cfg = Config::load();
     // Install any config-declared plugins that aren't present yet (fresh machine),
     // then reload so their binds/links merge in. Cheap when nothing's missing.
-    if !cfg.plugins.is_empty() && !crate::config::ensure_declared(&cfg.plugins).is_empty() {
+    if !cfg.plugins.is_empty() && !ruckus_core::config::ensure_declared(&cfg.plugins).is_empty() {
         cfg = Config::load();
     }
     let (client, events) = connect().await?;

@@ -14,8 +14,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
-use crate::protocol::*;
-use crate::remote::{self, Origin};
+use ruckus_core::protocol::*;
+use ruckus_core::remote::{self, Origin};
 
 type Tx = UnboundedSender<String>;
 
@@ -152,7 +152,7 @@ struct RemoteSpecEnv {
 /// the cached `snapshot` is origin-prefixed and merged into `State::snapshot`.
 struct RemoteConn {
     host: String,
-    client: Arc<crate::client::Client>,
+    client: Arc<ruckus_core::client::Client>,
     /// kill_on_drop child; kept alive so the SSH survives client disconnects.
     _child: tokio::process::Child,
     snapshot: Snapshot,
@@ -852,7 +852,7 @@ pub async fn run() -> Result<()> {
     let listener_fd = listener.as_raw_fd();
     info!("ruckus daemon listening on {}", sock.display());
 
-    let cfg = crate::config::Config::load();
+    let cfg = ruckus_core::config::Config::load();
     // The single State-owning actor + its job channel; `state` is the handle
     // everyone uses. There is no mutex — see the actor infra at the top of file.
     let (job_tx, job_rx) = unbounded_channel::<Job>();
@@ -1717,7 +1717,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
         Request::Reload => {
             state
                 .with(move |st| {
-                    let cfg = crate::config::Config::load();
+                    let cfg = ruckus_core::config::Config::load();
                     st.notify_waiting =
                         cfg.notify.system && cfg.notify.events.iter().any(|e| e == "waiting");
                     st.notify_done =
@@ -1826,7 +1826,7 @@ fn spawn_remote_connect(state: StateHandle, origin: Origin, spec: RemoteSpecEnv)
                 .await;
         }
         let (client, events, child) =
-            match crate::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
+            match ruckus_core::client::connect_remote_env(&spec.host, &ssh_args, &spec.env).await {
                 Ok(t) => t,
                 Err(e) => {
                     error!("connect remote {}: ssh failed: {e:#}", spec.host);
