@@ -1,0 +1,13 @@
+[package]
+name = "ruckus-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ruckus web client: serves the PWA deck and proxies WebSocket <-> the daemon socket"
+
+[dependencies]
+ruckus-core = { path = "../ruckus-core" }
+anyhow.workspace = true
+axum = { workspace = true }
+tokio.workspace = true
+tracing.workspace = true

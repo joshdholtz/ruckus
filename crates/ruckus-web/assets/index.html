@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1017">
+<link rel="manifest" href="/manifest.json">
+<title>ruckus</title>
+<style>
+  /* The TUI's look, translated: borderless layers, one accent, semantic state
+     colors. Theme tokens here mirror [theme] names so a later pass can render
+     the user's own theme into CSS vars server-side. */
+  :root {
+    --bg: #0d1017;          /* root layer */
+    --surface: #151a23;     /* pane layer */
+    --raised: #1c2330;      /* title bars */
+    --text: #d6dae3;
+    --dim: #8a93a5;
+    --faint: #545d6e;
+    --accent: #7aa2f7;
+    --waiting: #e0af68;
+    --working: #7aa2f7;
+    --done-ok: #9ece6a;
+    --done-err: #f7768e;
+    --idle: #545d6e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+    padding: max(10px, env(safe-area-inset-top)) 10px max(16px, env(safe-area-inset-bottom));
+  }
+  header {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 6px 4px 12px;
+  }
+  header h1 { font-size: 17px; letter-spacing: .5px; }
+  header h1 b { color: var(--accent); }
+  #conn { font-size: 12px; color: var(--faint); margin-left: auto; }
+  #conn.down { color: var(--done-err); }
+  #counts { font-size: 12px; color: var(--dim); }
+  #counts .w { color: var(--waiting); }
+
+  #deck { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+  .card {
+    background: var(--surface); border-radius: 10px; overflow: hidden;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  .card .bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--raised); padding: 7px 10px; font-size: 13px;
+  }
+  .card .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .waiting .dot { background: var(--waiting); animation: pulse 1.6s ease-in-out infinite; }
+  .working .dot { background: var(--working); animation: pulse 1s ease-in-out infinite; }
+  .idle    .dot { background: var(--idle); }
+  .done-ok .dot { background: var(--done-ok); }
+  .done-err.card .dot, .done-err .dot { background: var(--done-err); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .card .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .agent { color: var(--accent); font-size: 11px; border: 1px solid var(--faint); border-radius: 4px; padding: 0 5px; flex: none; }
+  .card .when { color: var(--faint); font-size: 11px; margin-left: auto; flex: none; }
+  .card .body { padding: 8px 10px 10px; }
+  .card .loc { color: var(--faint); font-size: 11px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .preview { color: var(--dim); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; max-height: 3.9em; overflow: hidden; }
+  .waiting .preview { color: var(--text); }
+
+  .card .actions { display: none; gap: 8px; padding: 0 10px 10px; }
+  .card.open .actions { display: flex; }
+  .card .actions input {
+    flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--faint); border-radius: 7px; padding: 7px 9px;
+    font: inherit; font-size: 13px;
+  }
+  .card .actions button {
+    background: var(--raised); color: var(--text); border: 0; border-radius: 7px;
+    padding: 7px 11px; font: inherit; font-size: 13px; cursor: pointer; flex: none;
+  }
+  .card .actions button.danger { color: var(--done-err); }
+  .card .actions button.go { color: var(--accent); }
+  #empty { color: var(--faint); padding: 30px 6px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>ruckus</b> deck</h1>
+  <span id="counts"></span>
+  <span id="conn">connecting…</span>
+</header>
+<div id="deck"></div>
+<div id="empty" hidden>nothing running — the daemon is quiet</div>
+
+<script>
+"use strict";
+// v1 protocol client. One WS == one daemon connection; frames are NDJSON 1:1.
+let ws, seq = 1, snap = null, openPane = null;
+const pending = new Map(); // seq -> resolve
+
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => {
+    setConn("live");
+    send({ type: "hello", version: 1 });
+    refresh();
+  };
+  ws.onclose = () => { setConn("down"); setTimeout(connect, 1500); };
+  ws.onmessage = (ev) => {
+    const f = JSON.parse(ev.data);
+    if (f.seq && pending.has(f.seq)) { pending.get(f.seq)(f.msg); pending.delete(f.seq); return; }
+    const t = f.msg && f.msg.type;
+    if (t === "state") { snap = f.msg.snapshot; render(); }
+    // any lifecycle push → pull a fresh tree (debounced)
+    else if (["activity", "pane_opened", "pane_closed", "exited", "focus"].includes(t)) refreshSoon();
+  };
+}
+function send(req) {
+  const s = seq++;
+  ws.send(JSON.stringify({ seq: s, req }));
+  return new Promise((res) => pending.set(s, res));
+}
+let timer = null;
+function refreshSoon() { clearTimeout(timer); timer = setTimeout(refresh, 150); }
+async function refresh() {
+  const msg = await send({ type: "snapshot" });
+  if (msg && msg.type === "state") { snap = msg.snapshot; render(); }
+}
+function setConn(s) {
+  const el = document.getElementById("conn");
+  el.textContent = s === "live" ? "● live" : "○ reconnecting…";
+  el.className = s === "live" ? "" : "down";
+}
+
+const URGENCY = { waiting: 3, done: 2, working: 1, idle: 0 };
+function cards() {
+  if (!snap) return [];
+  const loc = {};
+  for (const s of snap.spaces) for (const t of s.tabs) for (const p of leaves(t.layout))
+    loc[p] = s.name + " › " + t.name;
+  return snap.panes
+    .map((p) => ({ ...p, loc: loc[p.id] || "" }))
+    .sort((a, b) => (URGENCY[b.activity] - URGENCY[a.activity]) || (b.activity_since - a.activity_since));
+}
+function leaves(n) { return n.kind === "leaf" ? [n.pane] : n.children.flatMap(leaves); }
+function ago(t) {
+  const d = Math.max(0, Date.now() / 1000 - t);
+  return d < 60 ? Math.round(d) + "s" : d < 3600 ? Math.round(d / 60) + "m" : Math.round(d / 3600) + "h";
+}
+function stateClass(p) {
+  if (p.activity !== "done") return p.activity;
+  return p.status.state === "exited" && p.status.code !== 0 ? "done-err" : "done-ok";
+}
+
+function render() {
+  const list = cards();
+  document.getElementById("empty").hidden = list.length > 0;
+  const counts = { waiting: 0, working: 0, idle: 0, done: 0 };
+  for (const p of list) counts[p.activity]++;
+  document.getElementById("counts").innerHTML =
+    (counts.waiting ? `<span class="w">● ${counts.waiting} waiting</span>  ` : "") +
+    `● ${counts.working} working`;
+
+  const deck = document.getElementById("deck");
+  deck.replaceChildren(...list.map((p) => {
+    const el = document.createElement("div");
+    el.className = "card " + stateClass(p) + (openPane === p.id ? " open" : "");
+    el.innerHTML = `
+      <div class="bar">
+        <span class="dot"></span>
+        <span class="title"></span>
+        ${p.agent ? '<span class="agent"></span>' : ""}
+        <span class="when">${p.activity} ${ago(p.activity_since)}</span>
+      </div>
+      <div class="body"><div class="loc"></div><div class="preview"></div></div>
+      <div class="actions">
+        <input placeholder="reply…" autocomplete="off">
+        <button class="go">send</button>
+        ${p.status.state === "exited" ? '<button class="re">restart</button>' : ""}
+        <button class="danger">close</button>
+      </div>`;
+    el.querySelector(".title").textContent = p.title || p.cmd.join(" ");
+    if (p.agent) el.querySelector(".agent").textContent = p.agent;
+    el.querySelector(".loc").textContent = p.loc + (p.git_branch ? " · " + p.git_branch : "");
+    el.querySelector(".preview").textContent = p.preview || "";
+    el.querySelector(".bar").onclick = () => { openPane = openPane === p.id ? null : p.id; render(); };
+    const input = el.querySelector("input");
+    const reply = () => {
+      if (!input.value) return;
+      send({ type: "input", pane: p.id, data: b64(input.value + "\r") });
+      input.value = "";
+    };
+    input.onkeydown = (e) => { if (e.key === "Enter") reply(); };
+    el.querySelector(".go").onclick = reply;
+    const re = el.querySelector(".re");
+    if (re) re.onclick = () => send({ type: "restart", pane: p.id }).then(refresh);
+    el.querySelector(".danger").onclick = () => {
+      if (confirm("close pane " + p.id + " (" + (p.title || "?") + ")?"))
+        send({ type: "close_pane", pane: p.id }).then(refresh);
+    };
+    return el;
+  }));
+}
+function b64(s) { return btoa(String.fromCharCode(...new TextEncoder().encode(s))); }
+connect();
+</script>
+</body>
+</html>

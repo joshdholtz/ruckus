@@ -36,6 +36,7 @@ ruckus send 4 "yes"     # type into a pane
 ruckus restart 4        # respawn an exited pane in place
 ruckus tail 4           # stream a pane's output (like tail -f)
 ruckus events           # stream lifecycle events as JSON (agents/plugins)
+ruckus web              # serve the deck as a PWA on 127.0.0.1:9787 (phone via Tailscale)
 ruckus attach 4         # open the TUI focused on pane 4
 ruckus kill 4           # kill + remove a pane
 ```
@@ -190,4 +191,6 @@ Capabilities are declared in the manifest and surfaced by `ruckus plugin list`, 
 - [x] `[[event]]` handlers: lifecycle event → run a command (daemon-side, config or plugin)
 - [ ] plugin capability enforcement (deny-by-default scopes)
 - [ ] plugin-rendered pane UI / native widgets
-- [ ] auto-reconnect dropped remotes; native phone / web clients
+- [x] web deck v0: `ruckus web` serves a PWA (attention-sorted cards, reply/restart/close) + a WebSocket↔socket bridge — a pure protocol client, daemon untouched
+- [ ] web deck v1: Web Push, theme parity from `[theme]`, full pane view (xterm.js)
+- [ ] auto-reconnect dropped remotes; native phone clients

@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/ruckus-core", "crates/ruckus-daemon", "crates/ruckus-tui"]
+members = [
+    "crates/ruckus-core",
+    "crates/ruckus-daemon",
+    "crates/ruckus-tui",
+    "crates/ruckus-web",
+]
 exclude = ["vendor/vt100"]
 
 [workspace.package]
@@ -9,6 +14,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
@@ -38,6 +44,7 @@ description = "a persistent runtime for your coding agents"
 ruckus-core = { path = "crates/ruckus-core" }
 ruckus-daemon = { path = "crates/ruckus-daemon" }
 ruckus-tui = { path = "crates/ruckus-tui" }
+ruckus-web = { path = "crates/ruckus-web" }
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true

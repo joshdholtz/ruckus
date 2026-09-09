@@ -1,0 +1,9 @@
+{
+  "name": "ruckus",
+  "short_name": "ruckus",
+  "description": "your coding agents, one deck",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1017",
+  "theme_color": "#0d1017"
+}
