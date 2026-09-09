@@ -707,6 +707,11 @@ struct State {
     notify_cooldown: u64,
     /// Pane id → unix secs of its last notification (cooldown bookkeeping).
     last_notified: HashMap<u64, u64>,
+    /// Config/plugin `[[event]]` handlers, fired from broadcast().
+    event_handlers: Vec<ruckus_core::config::EventHandler>,
+    /// (handler index, pane id) → unix secs of its last run (per-handler
+    /// cooldown bookkeeping; pane 0 for pane-less events).
+    event_last_run: HashMap<(usize, u64), u64>,
     quiet_after: std::time::Duration,
     detect_osc133: bool,
     detect_foreground: bool,
@@ -869,6 +874,8 @@ pub async fn run() -> Result<()> {
         notify_done: cfg.notify.system && cfg.notify.events.iter().any(|e| e == "done"),
         notify_cooldown: cfg.notify.cooldown,
         last_notified: HashMap::new(),
+        event_handlers: cfg.events.clone(),
+        event_last_run: HashMap::new(),
         quiet_after: std::time::Duration::from_millis(cfg.ui.activity_quiet_ms),
         detect_osc133: cfg.ui.detect_osc133,
         detect_foreground: cfg.ui.detect_foreground,
@@ -1314,7 +1321,8 @@ fn send(tx: &Tx, seq: Option<u64>, msg: ServerMsg) {
     }
 }
 
-fn broadcast(st: &State, msg: ServerMsg) {
+fn broadcast(st: &mut State, msg: ServerMsg) {
+    fire_events(st, &msg);
     match serde_json::to_string(&ServerFrame { seq: None, msg }) {
         Ok(s) => {
             for tx in st.conns.values() {
@@ -1322,6 +1330,101 @@ fn broadcast(st: &State, msg: ServerMsg) {
             }
         }
         Err(e) => error!("failed to serialize broadcast: {e}"),
+    }
+}
+
+/// Map a lifecycle broadcast to its `[[event]]` name (+ pane id, exit code).
+/// Non-lifecycle messages (State, Output, replies) are not events.
+fn event_of(msg: &ServerMsg) -> Option<(&'static str, Option<u64>, Option<u32>)> {
+    match msg {
+        ServerMsg::PaneOpened { pane, .. } => Some(("pane.opened", Some(*pane), None)),
+        ServerMsg::PaneClosed { pane } => Some(("pane.closed", Some(*pane), None)),
+        ServerMsg::Exited { pane, code } => Some(("pane.exited", Some(*pane), Some(*code))),
+        ServerMsg::Activity { pane, activity } => {
+            let name = match activity {
+                Activity::Working => "pane.working",
+                Activity::Waiting => "pane.waiting",
+                Activity::Idle => "pane.idle",
+                Activity::Done => "pane.done",
+            };
+            Some((name, Some(*pane), None))
+        }
+        ServerMsg::Focus { pane, .. } => Some(("focus", Some(*pane), None)),
+        ServerMsg::ConfigChanged => Some(("config.changed", None, None)),
+        _ => None,
+    }
+}
+
+/// Single-quote a value for safe embedding in a `sh -c` string.
+fn sh_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Fire matching `[[event]]` handlers for a lifecycle broadcast. Handlers run
+/// detached (`sh -c`, no inherited stdio) so they can never block the actor;
+/// per-(handler, pane) cooldowns stop flapping panes from spamming.
+fn fire_events(st: &mut State, msg: &ServerMsg) {
+    if st.event_handlers.is_empty() {
+        return;
+    }
+    let Some((name, pane, code)) = event_of(msg) else {
+        return;
+    };
+    let loc = pane.and_then(|id| locate(st, id));
+    let info = pane.and_then(|id| st.panes.get(&id)).map(|p| p.info.clone());
+    let now = unix_now();
+    for i in 0..st.event_handlers.len() {
+        let h = &st.event_handlers[i];
+        if !ruckus_core::config::event_matches(&h.on, name) {
+            continue;
+        }
+        let key = (i, pane.unwrap_or(0));
+        if h.cooldown > 0
+            && st
+                .event_last_run
+                .get(&key)
+                .is_some_and(|t| now.saturating_sub(*t) < h.cooldown)
+        {
+            continue;
+        }
+        st.event_last_run.insert(key, now);
+
+        let title = info.as_ref().map(|i| i.title.clone()).unwrap_or_default();
+        let cmd = info.as_ref().map(|i| i.cmd.join(" ")).unwrap_or_default();
+        let cwd = info.as_ref().map(|i| i.cwd.clone()).unwrap_or_default();
+        let vars: [(&str, String); 8] = [
+            ("event", name.to_string()),
+            ("pane", pane.map(|p| p.to_string()).unwrap_or_default()),
+            ("space", loc.map(|(s, _)| s.to_string()).unwrap_or_default()),
+            ("tab", loc.map(|(_, t)| t.to_string()).unwrap_or_default()),
+            ("title", title),
+            ("cmd", cmd),
+            ("cwd", cwd),
+            ("code", code.map(|c| c.to_string()).unwrap_or_default()),
+        ];
+        let mut run = st.event_handlers[i].run.clone();
+        for (tok, val) in &vars {
+            let tok = format!("{{{tok}}}");
+            if run.contains(&tok) {
+                run = run.replace(&tok, &sh_escape(val));
+            }
+        }
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c")
+            .arg(&run)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (tok, val) in &vars {
+            c.env(format!("RUCKUS_{}", tok.to_uppercase()), val);
+        }
+        if let Some(dir) = &st.event_handlers[i].dir {
+            c.current_dir(dir);
+        }
+        match c.spawn() {
+            Ok(_) => info!("event {name}: ran handler {i} ({})", st.event_handlers[i].on),
+            Err(e) => error!("event {name}: handler {i} failed to spawn: {e}"),
+        }
     }
 }
 
@@ -1736,6 +1839,7 @@ async fn handle_request(state: &StateHandle, conn_id: u64, req: Request) -> Serv
                     st.detect_osc133 = cfg.ui.detect_osc133;
                     st.detect_foreground = cfg.ui.detect_foreground;
                     st.agent_commands = cfg.ui.agent_commands.clone();
+                    st.event_handlers = cfg.events.clone();
                     info!("config reloaded; notifying {} clients", st.conns.len());
                     broadcast(st, ServerMsg::ConfigChanged);
                     ServerMsg::Done
@@ -2689,6 +2793,37 @@ fn locate(st: &State, pane: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_msgs_map_to_event_names() {
+        assert_eq!(
+            event_of(&ServerMsg::Exited { pane: 4, code: 1 }),
+            Some(("pane.exited", Some(4), Some(1)))
+        );
+        assert_eq!(
+            event_of(&ServerMsg::Activity {
+                pane: 7,
+                activity: Activity::Waiting
+            }),
+            Some(("pane.waiting", Some(7), None))
+        );
+        assert_eq!(event_of(&ServerMsg::ConfigChanged), Some(("config.changed", None, None)));
+        // replies and output are not events
+        assert_eq!(event_of(&ServerMsg::Done), None);
+        assert_eq!(
+            event_of(&ServerMsg::Output {
+                pane: 1,
+                data: String::new()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn sh_escape_survives_quotes() {
+        assert_eq!(sh_escape("plain"), "'plain'");
+        assert_eq!(sh_escape("it's"), r#"'it'\''s'"#);
+    }
 
     #[test]
     fn quiet_shell_prompt_is_idle() {

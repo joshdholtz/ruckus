@@ -22,6 +22,11 @@ where = "popup"           # right | down | tab | popup
 [[link]]
 pattern = '#([0-9]+)'     # Rust regex
 run = "open https://github.com/owner/repo/issues/${match}"
+
+[[event]]                 # react to lifecycle events, daemon-side
+on = "pane.waiting"       # exact name or glob: pane.* / focus / config.changed
+run = "bash notify.sh {title}"   # sh -c, run from the plugin dir; detached
+cooldown = 120            # min secs between runs for the same pane
 ```
 
 `${url}` / `${match}` (and regex captures `${1}`..) are substituted with the
@@ -75,9 +80,11 @@ Cheap when they're all present; only clones what's missing.
 
 ## Status & roadmap
 
-- **Now (v1):** manifests add `[[bind]]` + `[[link]]`; discovery/merge; the CLI
-  above. Capabilities are **declared and surfaced but not yet enforced** — a
+- **Now (v1):** manifests add `[[bind]]` + `[[link]]` + `[[event]]` (lifecycle
+  event → command: `pane.opened|closed|exited|working|waiting|idle|done`,
+  `focus`, `config.changed`, or globs like `pane.*`; `{event} {pane} {tab}
+  {space} {title} {cmd} {cwd} {code}` substituted shell-escaped, same values as
+  `RUCKUS_*` env vars; per-pane `cooldown` for anti-flap); discovery/merge; the
+  CLI above. Capabilities are **declared and surfaced but not yet enforced** — a
   plugin you install can run any command, so install ones you trust.
-- **Next (5b):** `[[event]]` handlers (run a command on `pane_opened` /
-  `activity` / … — the reactive half, consuming the `ruckus events` stream),
-  and capability **enforcement** (deny-by-default scopes).
+- **Next (5b):** capability **enforcement** (deny-by-default scopes).

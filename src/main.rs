@@ -598,8 +598,8 @@ async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
                     String::new()
                 };
                 println!(
-                    "• {}{alias}{ver}  — {} binds, {} links{caps}",
-                    p.id, p.binds, p.links
+                    "• {}{alias}{ver}  — {} binds, {} links, {} events{caps}",
+                    p.id, p.binds, p.links, p.events
                 );
                 if !p.description.is_empty() {
                     println!("    {}", p.description);

@@ -741,6 +741,8 @@ pub struct Config {
     pub commands: Vec<CommandBind>,
     /// Link handlers: pattern → command. Defaults to opening URLs.
     pub links: Vec<LinkRule>,
+    /// Daemon-side event handlers: lifecycle event → run a command.
+    pub events: Vec<EventHandler>,
     /// Declared plugin refs (`owner/repo[/subpath]`) — installed on startup so a
     /// copied config.toml reproduces your setup on a new machine.
     pub plugins: Vec<String>,
@@ -883,6 +885,13 @@ struct RawLink {
     place: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawEvent {
+    on: String,
+    run: String,
+    cooldown: Option<u64>,
+}
+
 /// A plugin `[[status]]` segment: a command whose first line is shown in the
 /// status bar (refreshed like any `#(command)`), so calendars/monitors/etc. can
 /// live in the bar as an installable, shareable plugin instead of a one-off.
@@ -953,6 +962,46 @@ fn lower_binds(raw: &[RawBind]) -> Vec<CommandBind> {
         .collect()
 }
 
+/// A daemon-side event handler (config or plugin `[[event]]`): when a lifecycle
+/// event matching `on` fires, `run` is executed via `sh -c`, detached from any
+/// client. `{event} {pane} {tab} {space} {title} {cmd} {cwd} {code}` tokens are
+/// substituted shell-escaped, and the same values arrive as `RUCKUS_EVENT`,
+/// `RUCKUS_PANE`, … env vars.
+#[derive(Debug, Clone)]
+pub struct EventHandler {
+    /// Event name to match: exact (`pane.waiting`) or a `*` glob (`pane.*`).
+    pub on: String,
+    /// Shell command (`sh -c`).
+    pub run: String,
+    /// Min seconds between runs of this handler for the *same* pane (anti-spam,
+    /// same idea as notify.cooldown). 0 = fire every time.
+    pub cooldown: u64,
+    /// Plugin dir to run from (bundled scripts resolve); None = default cwd.
+    pub dir: Option<std::path::PathBuf>,
+}
+
+/// Match an event name against a handler pattern. `*` matches any suffix:
+/// `pane.*` matches `pane.waiting`; bare `*` matches everything.
+pub fn event_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
+}
+
+/// Lower `[[event]]` entries (config or plugin manifest) into event handlers.
+fn lower_events(raw: &[RawEvent], dir: Option<&std::path::Path>) -> Vec<EventHandler> {
+    raw.iter()
+        .filter(|e| !e.on.is_empty() && !e.run.is_empty())
+        .map(|e| EventHandler {
+            on: e.on.clone(),
+            run: e.run.clone(),
+            cooldown: e.cooldown.unwrap_or(0),
+            dir: dir.map(|d| d.to_path_buf()),
+        })
+        .collect()
+}
+
 /// Lower `[[link]]` entries (config or plugin manifest) into link handlers.
 fn lower_links(raw: &[RawLink]) -> Vec<LinkRule> {
     raw.iter()
@@ -976,6 +1025,8 @@ struct RawManifest {
     bind: Vec<RawBind>,
     #[serde(default)]
     link: Vec<RawLink>,
+    #[serde(default)]
+    event: Vec<RawEvent>,
     #[serde(default)]
     status: Vec<RawStatus>,
 }
@@ -1003,6 +1054,7 @@ pub struct PluginInfo {
     pub path: std::path::PathBuf,
     pub binds: usize,
     pub links: usize,
+    pub events: usize,
 }
 
 /// Directory holding installed plugins (one subdirectory each).
@@ -1054,6 +1106,7 @@ pub fn list_plugins() -> Vec<PluginInfo> {
             path,
             binds: m.bind.len(),
             links: m.link.len(),
+            events: m.event.len(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1167,6 +1220,9 @@ struct RawConfig {
     /// Link handlers: pattern → command.
     #[serde(default)]
     link: Vec<RawLink>,
+    /// Event handlers: lifecycle event → command.
+    #[serde(default)]
+    event: Vec<RawEvent>,
     /// Declared plugin refs installed on startup.
     #[serde(default)]
     plugins: Vec<String>,
@@ -1242,6 +1298,7 @@ impl Config {
                 }
                 self.commands.extend(binds);
                 self.links.extend(lower_links(&m.link));
+                self.events.extend(lower_events(&m.event, Some(&dir)));
                 // Plugin status segments. Each is a named token `#{<plugin>}` you
                 // place anywhere in status_left/right — the template stays the
                 // single source of truth for layout. If you haven't placed the
@@ -1316,6 +1373,7 @@ impl Config {
         };
         // Command shortcuts + link handlers (shared with plugin manifests).
         let commands = lower_binds(&raw.bind);
+        let events = lower_events(&raw.event, None);
         let mut links = lower_links(&raw.link);
         if links.is_empty() {
             if let Ok(pattern) = regex::Regex::new(r#"https?://[^\s"'`)\]}>]+"#) {
@@ -1498,6 +1556,7 @@ impl Config {
             prefix_keys,
             commands,
             links,
+            events,
             plugins: raw.plugins,
             remotes: raw.remote,
             theme,
@@ -1636,6 +1695,22 @@ last_space = "alt-l"      # jump back to the previously-active space
 # pattern = 'https://github.com/[^/]+/[^/]+/pull/[0-9]+'
 # run = "gh pr view ${url}"
 # where = "right"
+
+# ── [[event]] handlers ─────────────────────────────────────────────────────
+# Run a command (daemon-side, detached) when a lifecycle event fires. `on` is
+# an event name — pane.opened / pane.closed / pane.exited / pane.working /
+# pane.waiting / pane.idle / pane.done / focus / config.changed — or a glob
+# like "pane.*". {event} {pane} {tab} {space} {title} {cmd} {cwd} {code} are
+# substituted shell-escaped; the same values arrive as RUCKUS_* env vars.
+# `cooldown` = min seconds between runs for the same pane (anti-flap).
+# [[event]]                      # push a phone notification when an agent blocks
+# on = "pane.waiting"
+# run = "ntfy pub my-topic \"ruckus: {title} needs you\""
+# cooldown = 120
+#
+# [[event]]                      # log every exit with its code
+# on = "pane.exited"
+# run = "echo \"$(date) pane {pane} ({title}) exited {code}\" >> ~/.ruckus/exits.log"
 
 [ui]
 link_click = "plain"         # plain | ctrl | shift — how a click fires a link
@@ -1851,6 +1926,37 @@ run = "open https://linear.app/issue/${match}"
         let m = cfg.links[0].pattern.find("fix FIS-42 today").unwrap();
         assert_eq!(m.as_str(), "FIS-42");
         assert_eq!(cfg.ui.link_click, LinkClick::Ctrl);
+    }
+
+    #[test]
+    fn event_handlers_parse_and_match() {
+        let cfg = Config::from_toml_str(
+            r#"
+[[event]]
+on = "pane.waiting"
+run = "ntfy pub me '{title}'"
+cooldown = 60
+
+[[event]]
+on = "pane.*"
+run = "log-it {event}"
+"#,
+        );
+        assert_eq!(cfg.events.len(), 2);
+        assert_eq!(cfg.events[0].on, "pane.waiting");
+        assert_eq!(cfg.events[0].cooldown, 60);
+        assert_eq!(cfg.events[1].cooldown, 0); // defaults to no cooldown
+        assert!(cfg.events[1].dir.is_none()); // user config: no plugin dir
+
+        // no [[event]] → none
+        assert!(Config::from_toml_str("").events.is_empty());
+
+        // glob matching: '*' matches any suffix
+        assert!(event_matches("pane.waiting", "pane.waiting"));
+        assert!(!event_matches("pane.waiting", "pane.working"));
+        assert!(event_matches("pane.*", "pane.exited"));
+        assert!(!event_matches("pane.*", "focus"));
+        assert!(event_matches("*", "config.changed"));
     }
 
     #[test]

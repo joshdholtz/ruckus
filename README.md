@@ -120,6 +120,7 @@ Mouse: click anything — sidebar rows, tabs, the `+` button, footer buttons, pa
 | `[keys]` / `[prefix_keys]` | Every action, multiple bindings each; the `keymap` preset (alt / tmux / both) |
 | `[[bind]]` | Key → run a command in a split / tab / popup (`where = "right\|down\|tab\|popup"`) |
 | `[[link]]` | Regex on pane text → run a command (`${url}`/`${1}`…); `link_click = plain\|ctrl\|shift` |
+| `[[event]]` | Lifecycle event → run a command daemon-side (`on = "pane.waiting"` or `"pane.*"`, `run`, optional per-pane `cooldown`); `{title}`/`{pane}`/… substituted shell-escaped + `RUCKUS_*` env |
 | `plugins` | Plugin refs installed on startup — portable across machines |
 | `[theme]` | All 15 colors — 4 background layers, accent, text tiers, state colors |
 | `[ui]` | Sidebar side/width/section order; gutter + pane padding; title bars; header/footer position; tab strip; narrow-collapse threshold; deck on/off; spinner speed; toast position; mouse |
@@ -186,6 +187,7 @@ Capabilities are declared in the manifest and surfaced by `ruckus plugin list`, 
 - [x] plugin system: `ruckus plugin install/link/sync`, manifests, config-declared portable setup
 - [x] agent CLI (status/send/split/config/events…), cwd-aware splits, bracketed paste, mouse forwarding
 - [x] remote mirror: `[[remote]]` daemons over SSH, merged into the sidebar, full read/write (docs/REMOTE.md)
-- [ ] `[[event]]` handlers (run a command on an event) + capability enforcement
+- [x] `[[event]]` handlers: lifecycle event → run a command (daemon-side, config or plugin)
+- [ ] plugin capability enforcement (deny-by-default scopes)
 - [ ] plugin-rendered pane UI / native widgets
 - [ ] auto-reconnect dropped remotes; native phone / web clients
